@@ -1,0 +1,26 @@
+# deny.patterns.example
+#
+# Patterns in this file are ALWAYS BLOCKED — no user prompt, just denied.
+# Copy this file to ~/.clawband/deny.patterns and edit to customise.
+#
+# Format:
+#   - One pattern per line
+#   - Case-insensitive extended regex (grep -iE)
+#   - Lines starting with # and blank lines are ignored
+#   - These patterns are ADDED to the built-in deny list, not a replacement
+#
+# To suppress a built-in block, add the pattern to allow.patterns instead.
+#
+# ── Examples ──────────────────────────────────────────────────────────────────
+
+# Block a project-specific destruction command
+# my-infra nuke --all
+
+# Block a custom deploy script from running without confirmation (use ask.patterns for prompt instead)
+# deploy-prod.sh
+
+# Block access to a sensitive directory
+# rm.*secrets/
+
+# Block any docker system prune
+# docker system prune

@@ -1,0 +1,27 @@
+# ask.patterns.example
+#
+# Patterns in this file trigger a CONFIRMATION PROMPT before the command runs.
+# Claude Code shows the user a review dialog; they can approve or deny.
+# Copy this file to ~/.clawband/ask.patterns and edit to customise.
+#
+# Format:
+#   - One pattern per line
+#   - Case-insensitive extended regex (grep -iE)
+#   - Lines starting with # and blank lines are ignored
+#   - These patterns are ADDED to the built-in ask list, not a replacement
+#
+# ── Examples ──────────────────────────────────────────────────────────────────
+
+# Prompt before any production deploy
+# deploy.*prod
+
+# Prompt before database migrations
+# prisma migrate deploy
+# alembic upgrade head
+
+# Prompt before stopping system services
+# systemctl stop
+
+# Prompt before any docker stop / rm
+# docker stop
+# docker rm
