@@ -244,13 +244,13 @@ while IFS= read -r segment; do
   _is_allowed "$segment" && continue
 
   for pattern in "${DENY_PATTERNS[@]}"; do
-    if echo "$segment" | grep -qiE "$pattern"; then
+    if echo "$segment" | grep -qi "$pattern"; then
       deny "Blocked: '$pattern' matched in: $segment"
     fi
   done
 
   for pattern in "${ASK_PATTERNS[@]}"; do
-    if echo "$segment" | grep -qiE "$pattern"; then
+    if echo "$segment" | grep -qi "$pattern"; then
       ask "Review before running — '$pattern' matched in: $segment"
     fi
   done
