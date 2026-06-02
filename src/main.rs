@@ -176,8 +176,8 @@ fn config_dir() -> PathBuf {
 // ─── RTK prefix stripping ─────────────────────────────────────────────────────
 
 fn strip_rtk(cmd: &str) -> String {
-    // Compiled inline — runs once per invocation, not in a hot loop
-    let rtk = Regex::new(r"^rtk\s+").unwrap();
+    // Strip "rtk " and "rtk proxy " prefixes, then the git -C <dir> wrapper RTK adds
+    let rtk = Regex::new(r"^rtk\s+(?:proxy\s+)?").unwrap();
     let git_c = Regex::new(r"^git\s+-C\s+\S+\s+").unwrap();
     let s = rtk.replace(cmd, "");
     git_c.replace(&s, "git ").into_owned()
