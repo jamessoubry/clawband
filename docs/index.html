@@ -285,6 +285,53 @@
     .code-block .path    { color: var(--blue); }
     .code-block .pattern { color: var(--orange); }
 
+    /* ── Problem section ── */
+    .problem-section {
+      background: linear-gradient(180deg, rgba(248,81,73,.06) 0%, transparent 100%);
+      border-top: 1px solid rgba(248,81,73,.3);
+      border-bottom: 1px solid var(--border);
+      padding: 4rem 0;
+    }
+    .problem-section h2 { color: var(--red); }
+    .problem-label {
+      display: inline-block;
+      font-size: .7rem;
+      font-weight: 700;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      padding: .25em .75em;
+      border-radius: 4px;
+      margin-bottom: .75rem;
+    }
+    .problem-label.bad  { background: rgba(248,81,73,.15); color: var(--red); border: 1px solid rgba(248,81,73,.3); }
+    .problem-label.good { background: rgba(63,185,80,.15);  color: var(--green); border: 1px solid rgba(63,185,80,.3); }
+    .compare-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+    @media (max-width: 640px) { .compare-grid { grid-template-columns: 1fr; } }
+    .compare-grid .terminal { height: 100%; }
+    .bypass-callout {
+      background: rgba(248,81,73,.08);
+      border: 1px solid rgba(248,81,73,.25);
+      border-radius: 8px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.5rem;
+      font-size: .95rem;
+      line-height: 1.7;
+    }
+    .bypass-callout strong { color: var(--red); }
+    .bypass-callout code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: .85rem;
+      background: var(--code-bg);
+      padding: .1em .4em;
+      border-radius: 4px;
+      color: #e6edf3;
+    }
+
     /* ── Footer ── */
     footer {
       border-top: 1px solid var(--border);
@@ -313,7 +360,7 @@
 <div class="hero">
   <img src="logo.png" alt="clawband logo — a lobster with a rubber band around its claw">
   <h1>A rubber band around<br><span>Claude's claws</span></h1>
-  <p>Guards Claude Code's Bash tool against destructive shell commands before they execute.</p>
+  <p>The built-in Bash deny list gives you a false sense of security.<br>clawband actually stops destructive commands.</p>
 
   <div class="install-wrap">
     <span class="prompt">$</span>
@@ -322,6 +369,72 @@
   </div>
   <p class="install-note">Requires <a href="https://rustup.rs" target="_blank">Rust</a> and <code style="font-size:.8rem">jq</code></p>
 </div>
+
+<!-- ── The problem ───────────────────────────────────────────────────────────── -->
+<section class="problem-section">
+  <div class="container">
+    <h2>The gap in Claude Code's built-in protection</h2>
+
+    <div class="bypass-callout">
+      Claude Code lets you add patterns to a deny list in <code>settings.json</code>. You add <code>rm -rf</code>.
+      You feel protected. <strong>You're not.</strong><br><br>
+      The built-in system matches the <em>entire command as a glob</em>. It never sees inside a compound command.
+      Claude can trivially bypass your deny list by chaining the dangerous command after a harmless one —
+      and this can happen through a hallucination or a prompt injection, not just a deliberate attack.
+    </div>
+
+    <div class="compare-grid">
+      <div>
+        <div class="problem-label bad">Without clawband</div>
+        <div class="terminal">
+          <div class="term-bar">
+            <div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div>
+            <span style="margin-left:.5rem;font-size:.75rem;color:var(--muted);font-family:inherit">settings.json deny: ["Bash(rm -rf *)"]</span>
+          </div>
+          <div class="term-body">
+            <div class="comment"># Compound command — safe part runs first</div>
+            <div class="cmd">echo "cleaning up" &amp;&amp; rm -rf /home/user/projects</div>
+            <div class="pass-out" style="color:var(--green)">✓ Allowed</div>
+            <div class="deny-out" style="margin-top:.25rem">💀 /home/user/projects deleted</div>
+            <br>
+            <div class="comment"># Env var prefix — glob doesn't match "rm -rf"</div>
+            <div class="cmd">FORCE=yes rm -rf /important-dir</div>
+            <div class="pass-out" style="color:var(--green)">✓ Allowed</div>
+            <div class="deny-out" style="margin-top:.25rem">💀 /important-dir deleted</div>
+            <br>
+            <div class="comment"># Semicolon separator — same bypass</div>
+            <div class="cmd">git status; rm -rf /</div>
+            <div class="pass-out" style="color:var(--green)">✓ Allowed</div>
+            <div class="deny-out" style="margin-top:.25rem">💀 Filesystem gone</div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="problem-label good">With clawband</div>
+        <div class="terminal">
+          <div class="term-bar">
+            <div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div>
+            <span style="margin-left:.5rem;font-size:.75rem;color:var(--muted);font-family:inherit">splits on &amp;&amp; || ; before checking each segment</span>
+          </div>
+          <div class="term-body">
+            <div class="comment"># Splits into: "echo ..." and "rm -rf ..."</div>
+            <div class="cmd">echo "cleaning up" &amp;&amp; rm -rf /home/user/projects</div>
+            <div class="deny-out">⛔ Blocked: 'rm -rf /' matched in:<br>&nbsp;&nbsp;rm -rf /home/user/projects</div>
+            <br>
+            <div class="comment"># Full segment checked — env var doesn't hide it</div>
+            <div class="cmd">FORCE=yes rm -rf /important-dir</div>
+            <div class="deny-out">⛔ Blocked: 'sudo rm -rf' / 'rm -rf /'<br>&nbsp;&nbsp;matched in: FORCE=yes rm -rf /important-dir</div>
+            <br>
+            <div class="comment"># Semicolon splits into two segments</div>
+            <div class="cmd">git status; rm -rf /</div>
+            <div class="deny-out">⛔ Blocked: 'rm -rf /' matched in: rm -rf /</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
 
 <!-- ── How it works ──────────────────────────────────────────────────────────── -->
 <section>
@@ -336,7 +449,7 @@
       <div class="step">
         <div class="num">02</div>
         <h3>Splits compound commands</h3>
-        <p>Splits at <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">&&</code>, <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">||</code>, and <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">;</code> so <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">safe_cmd && rm -rf /</code> is still caught.</p>
+        <p>The built-in deny list never sees inside <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">echo hi &amp;&amp; rm -rf /</code>. clawband splits first, checks every segment independently.</p>
       </div>
       <div class="step">
         <div class="num">03</div>
