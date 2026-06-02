@@ -285,6 +285,36 @@
     .code-block .path    { color: var(--blue); }
     .code-block .pattern { color: var(--orange); }
 
+    /* ── Stats bar ── */
+    .stats-bar {
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      padding: 2.5rem 2rem;
+    }
+    .stats-grid {
+      max-width: 860px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+      text-align: center;
+    }
+    @media (max-width: 600px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
+    .stat-num {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -.04em;
+      color: var(--orange);
+      line-height: 1;
+      margin-bottom: .35rem;
+    }
+    .stat-label {
+      font-size: .8rem;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
     /* ── Problem section ── */
     .problem-section {
       background: linear-gradient(180deg, rgba(248,81,73,.06) 0%, transparent 100%);
@@ -368,6 +398,28 @@
     <button class="copy-btn" id="copy-btn" onclick="copyInstall()">copy</button>
   </div>
   <p class="install-note">Requires <a href="https://rustup.rs" target="_blank">Rust</a> and <code style="font-size:.8rem">jq</code></p>
+</div>
+
+<!-- ── Stats bar ─────────────────────────────────────────────────────────────── -->
+<div class="stats-bar">
+  <div class="stats-grid">
+    <div>
+      <div class="stat-num">12×</div>
+      <div class="stat-label">faster than a bash equivalent<br><span style="font-size:.75rem">30ms vs 380ms per hook call</span></div>
+    </div>
+    <div>
+      <div class="stat-num">50+</div>
+      <div class="stat-label">built-in patterns across<br>8 categories</div>
+    </div>
+    <div>
+      <div class="stat-num">0</div>
+      <div class="stat-label">runtime dependencies<br>single static binary</div>
+    </div>
+    <div>
+      <div class="stat-num">3</div>
+      <div class="stat-label">decision tiers<br>deny · ask · pass</div>
+    </div>
+  </div>
 </div>
 
 <!-- ── The problem ───────────────────────────────────────────────────────────── -->
