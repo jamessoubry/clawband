@@ -66,11 +66,15 @@ impl Pattern {
 
 fn builtin_deny() -> Vec<Pattern> {
     let specs: &[(&str, &str)] = &[
-        // File system destruction
-        ("rm -rf /",          r"rm\s+-rf\s+/"),
-        ("rm -rf ~",          r"rm\s+-rf\s+~"),
-        ("rm -rf $HOME",      r"rm\s+-rf\s+\$HOME"),
-        ("sudo rm -rf",       r"\bsudo\s+rm\s+-rf\b"),
+        // File system destruction — handles any flag ordering: -rf, -fr, -r -f, -f -r
+        ("rm -rf /",
+         r"\brm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s+/"),
+        ("rm -rf ~",
+         r"\brm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s+~"),
+        ("rm -rf $HOME",
+         r"\brm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s+\$HOME"),
+        ("sudo rm -rf",
+         r"\bsudo\s+rm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)"),
         ("mkfs",              r"\bmkfs\b"),
         ("dd if=",            r"\bdd\s+if="),
         ("dd of=",            r"\bdd\s+of="),
