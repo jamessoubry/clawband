@@ -239,9 +239,104 @@ fn split_segments(cmd: &str) -> Vec<String> {
         .collect()
 }
 
+// ─── Stats command ────────────────────────────────────────────────────────────
+
+fn cmd_stats() {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    let cfg = config_dir();
+    let home = env::var("HOME").unwrap_or_default();
+
+    let builtin_deny_count = builtin_deny().len();
+    let builtin_ask_count  = builtin_ask().len();
+
+    let count_file = |name: &str| -> (usize, bool) {
+        let path = cfg.join(name);
+        let exists = path.exists();
+        let n = load_patterns(&path).len();
+        (n, exists)
+    };
+    let (user_deny,  deny_exists)  = count_file("deny.patterns");
+    let (user_ask,   ask_exists)   = count_file("ask.patterns");
+    let (user_allow, allow_exists) = count_file("allow.patterns");
+
+    let rtk = env::var("RTK_ENABLED").as_deref() == Ok("1");
+    let logging = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
+    let log_path = PathBuf::from(&home).join(".clawband.log");
+
+    // Parse audit log if present
+    let (log_deny, log_ask) = if log_path.exists() {
+        fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .lines()
+            .fold((0u64, 0u64), |(d, a), line| {
+                if line.contains("] DENY |") { (d + 1, a) }
+                else if line.contains("] ASK |") { (d, a + 1) }
+                else { (d, a) }
+            })
+            .into()
+    } else {
+        (0u64, 0u64)
+    };
+
+    let g = "\x1b[32m"; // green
+    let y = "\x1b[33m"; // yellow
+    let b = "\x1b[34m"; // blue
+    let d = "\x1b[2m";  // dim
+    let r = "\x1b[0m";  // reset
+    let bold = "\x1b[1m";
+
+    println!("\n{bold}clawband v{VERSION}{r}\n");
+
+    println!("{bold}Built-in patterns{r}");
+    println!("  {g}deny{r}   {bold}{builtin_deny_count}{r}");
+    println!("  {y}ask{r}    {bold}{builtin_ask_count}{r}");
+
+    println!("\n{bold}User patterns{r}  {d}(~/.clawband/){r}");
+    let file_status = |exists: bool, n: usize| -> String {
+        if !exists { format!("{d}file not found{r}") }
+        else if n == 0 { format!("{d}0 patterns{r}") }
+        else { format!("{bold}{n}{r} loaded") }
+    };
+    println!("  deny.patterns    {}", file_status(deny_exists, user_deny));
+    println!("  ask.patterns     {}", file_status(ask_exists, user_ask));
+    println!("  allow.patterns   {}", file_status(allow_exists, user_allow));
+
+    println!("\n{bold}Options{r}");
+    let flag = |on: bool| if on { format!("{g}on{r}") } else { format!("{d}off{r}") };
+    println!("  RTK_ENABLED    {}", flag(rtk));
+    println!("  CLAWBAND_LOG   {}", flag(logging));
+
+    println!("\n{bold}Audit log{r}");
+    if log_path.exists() {
+        let total = log_deny + log_ask;
+        println!("  {b}{}{r}  {d}({}){r}", log_path.display(), if total == 0 { "empty".to_string() } else { format!("{total} events") });
+        if total > 0 {
+            println!("  {g}deny{r}   {bold}{log_deny}{r}");
+            println!("  {y}ask{r}    {bold}{log_ask}{r}");
+        }
+    } else if logging {
+        println!("  {d}enabled — no events yet{r}");
+    } else {
+        println!("  {d}set CLAWBAND_LOG=1 in clawband to activate{r}");
+    }
+
+    println!();
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // CLI subcommands
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("stats") {
+        cmd_stats();
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("--version") || args.get(1).map(|s| s.as_str()) == Some("-v") {
+        println!("clawband v{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
 
