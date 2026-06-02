@@ -168,6 +168,10 @@ fn builtin_ask() -> Vec<Pattern> {
         ("git branch -D",    r"\bgit\s+branch\s+(?-i:-D)\b"),
         // docker rm -f — force-removes a running container
         ("docker rm -f",     r"\bdocker\s+(?:container\s+)?rm\b.*\s-f(\s|$)"),
+        // Compiled/bytecode runners — can't scan the binary/JAR/module for content
+        ("java -jar",        r"\bjava\b.*\s-jar\s"),
+        ("go run",           r"\bgo\s+run\b"),
+        ("cargo run",        r"\bcargo\s+run\b"),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -208,13 +212,13 @@ fn strip_sqz(cmd: &str) -> String {
 
 // ─── Script file scanning ────────────────────────────────────────────────────
 // When an interpreter runs a script file, read it and check each line against
-// deny/ask patterns. Handles shell, Python, and JS/TS files.
+// deny/ask patterns. Handles shell, Python, JS/TS, Perl, and Lua files.
 // Skips inline-execution flags (-c, -m, -e). Unreadable paths fail gracefully.
 
 fn extract_script_path(command: &str) -> Option<String> {
     // Match: (bash|sh|zsh|dash|python3?|node|deno) [optional-flags] <path>
     let re = Regex::new(
-        r"(?i)^\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|python3?|node|deno)\s+((?:-[a-zA-Z]+\s+)*)(.+)$"
+        r"(?i)^\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|python3?|node|deno|perl|lua[0-9.]*)\s+((?:-[a-zA-Z]+\s+)*)(.+)$"
     ).unwrap();
     let caps = re.captures(command)?;
     let flags = &caps[1];
@@ -239,6 +243,7 @@ fn scan_script_file(
     let content = fs::read_to_string(path).ok()?;
     let is_js = path.ends_with(".js") || path.ends_with(".mjs")
              || path.ends_with(".ts") || path.ends_with(".tsx");
+    let is_lua = path.ends_with(".lua");
     let mut in_block_comment = false;
 
     for (lineno, raw_line) in content.lines().enumerate() {
@@ -258,7 +263,20 @@ fn scan_script_file(
             if line.starts_with("//") || line.starts_with('*') { continue; }
         }
 
-        // Shell (#) and Python (#) line comments
+        // Lua comment state: --[[ ... ]] block comments and -- line comments
+        if is_lua {
+            if in_block_comment {
+                if line.contains("]]") { in_block_comment = false; }
+                continue;
+            }
+            if line.starts_with("--[[") {
+                in_block_comment = !line.contains("]]");
+                continue;
+            }
+            if line.starts_with("--") { continue; }
+        }
+
+        // Shell (#) and Python (#) and Perl (#) line comments
         if line.starts_with('#') { continue; }
 
         // Reuse compound-command splitting so `foo && rm -rf /` is caught
