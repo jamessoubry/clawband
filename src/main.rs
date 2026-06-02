@@ -206,6 +206,69 @@ fn strip_sqz(cmd: &str) -> String {
     sqz.replace(cmd, "").into_owned()
 }
 
+// ─── Script file scanning ────────────────────────────────────────────────────
+// When a shell interpreter runs a script file (bash ./foo.sh), read the file
+// and check each line against deny/ask patterns.
+// Skips -c invocations (inline commands, not files), skips unreadable paths.
+
+fn extract_script_path(command: &str) -> Option<String> {
+    // Match: (bash|sh|zsh|dash) [optional-flags-without-c] <path>
+    // Reject -c flag — that's inline execution, already scanned as a command string.
+    let re = Regex::new(
+        r"(?i)^\s*(?:sudo\s+)?(?:bash|sh|zsh|dash)\s+((?:-[a-z]+\s+)*)(.+)$"
+    ).unwrap();
+    let caps = re.captures(command)?;
+    let flags = &caps[1];
+    // If any flag group contains 'c', skip — it's -c "inline cmd"
+    if Regex::new(r"(?i)\bc\b|-c(\s|$)").unwrap().is_match(flags) {
+        return None;
+    }
+    let path_str = caps[2].trim().trim_matches('"').trim_matches('\'');
+    // First token only — ignore extra arguments after the script path
+    let path = path_str.split_whitespace().next()?;
+    Some(path.to_string())
+}
+
+fn scan_script_file(
+    path: &str,
+    deny_pats: &[Pattern],
+    ask_pats: &[Pattern],
+    allow_pats: &[Pattern],
+) -> Option<(String, String)> {
+    let content = fs::read_to_string(path).ok()?;
+    for (lineno, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        // Skip blank lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Reuse compound-command splitting so `foo && rm -rf /` is caught
+        let clean = strip_safe_pipes(line);
+        for segment in &split_segments(&clean) {
+            if allow_pats.iter().any(|p| p.matches(segment)) {
+                continue;
+            }
+            for pat in deny_pats {
+                if pat.matches(segment) {
+                    return Some((
+                        "deny".into(),
+                        format!("Blocked: '{}' in {}:{}: {}", pat.label, path, lineno + 1, segment),
+                    ));
+                }
+            }
+            for pat in ask_pats {
+                if pat.matches(segment) {
+                    return Some((
+                        "ask".into(),
+                        format!("Review before running — '{}' in {}:{}: {}", pat.label, path, lineno + 1, segment),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
 // ─── Git force push check ─────────────────────────────────────────────────────
 
 fn check_force_push(cmd: &str) -> Option<String> {
@@ -401,12 +464,6 @@ fn main() {
         output(decision, reason);
     };
 
-    // git force push operates on the full command before splitting
-    if let Some(reason) = check_force_push(&command) {
-        emit("deny", &reason);
-        return;
-    }
-
     // Strip safe inline pipes, then split into segments at &&, ||, ;, newline
     let clean = strip_safe_pipes(&command);
     let segments = split_segments(&clean);
@@ -415,6 +472,13 @@ fn main() {
         // Allow-list overrides everything
         if allow_pats.iter().any(|p| p.matches(segment)) {
             continue;
+        }
+
+        // Force-push check per segment so -F from `git commit -F file` in a
+        // compound command doesn't false-trigger on the adjacent `git push`.
+        if let Some(reason) = check_force_push(segment) {
+            emit("deny", &reason);
+            return;
         }
 
         for pat in &deny_pats {
@@ -429,6 +493,14 @@ fn main() {
                 emit("ask", &format!("Review before running — '{}' matched in: {}", pat.label, segment));
                 return;
             }
+        }
+    }
+
+    // Script file scanning: if command is `bash ./foo.sh`, read and check the file.
+    if let Some(script_path) = extract_script_path(&command) {
+        if let Some((decision, reason)) = scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats) {
+            emit(&decision, &reason);
+            return;
         }
     }
 
