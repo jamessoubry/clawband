@@ -97,6 +97,8 @@ fn builtin_deny() -> Vec<Pattern> {
         ("aws lambda delete-function",      r"\baws\s+lambda\s+delete-function\b"),
         // Database destruction
         ("dropdb", r"\bdropdb\b"),
+        // Docker destructive ops
+        ("docker system prune", r"\bdocker\s+system\s+prune\b"),
         // find -delete (anchored; avoids matching --delete-protection flags)
         ("find -delete", r"\bfind\b.*\s-delete(\s|$)"),
         // find / xargs execution escalation
@@ -158,6 +160,14 @@ fn builtin_ask() -> Vec<Pattern> {
         ("git clean",        r"\bgit\s+clean\s+-[fxd]"),
         // Remote branch deletion
         ("git push --delete",r"\bgit\s+push\b.*--delete\b"),
+        // git restore without --staged — discards working tree changes
+        // [^-] matches a path arg; skips flags so `git restore --staged` is not caught
+        ("git restore",      r"\bgit\s+restore\s+[^-]"),
+        // git branch -D — force-deletes branch regardless of merge status
+        // (?-i:-D) disables the outer (?i) for just -D so lowercase -d isn't caught
+        ("git branch -D",    r"\bgit\s+branch\s+(?-i:-D)\b"),
+        // docker rm -f — force-removes a running container
+        ("docker rm -f",     r"\bdocker\s+(?:container\s+)?rm\b.*\s-f(\s|$)"),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }

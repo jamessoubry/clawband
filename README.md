@@ -69,6 +69,7 @@ Add to `~/.claude/settings.json`:
 | Infrastructure destruction | `terraform destroy`, `terragrunt destroy`, `kubectl delete namespace` |
 | AWS destructive ops | `aws rds delete-db-instance`, `aws eks delete-cluster`, `aws s3 rm --recursive`, `aws cloudformation delete-stack`, `aws lambda delete-function` |
 | Database destruction | `dropdb` |
+| Docker destruction | `docker system prune` |
 | Pipe to interpreter | `\| bash`, `\| sh`, `\| python`, `\| node`, `\| ruby`, `\| perl` (with or without space) |
 | Pipe to interpreter via sudo | `\| sudo bash`, `\| sudo python`, etc. |
 | Heredoc to interpreter | `bash <<`, `python <<`, etc. |
@@ -85,6 +86,9 @@ Add to `~/.claude/settings.json`:
 | Destructive git (local) | `git reset --hard`, `git checkout -- `, `git stash drop`, `git stash clear` |
 | git clean | `git clean -f`, `git clean -x`, `git clean -d` — wipes untracked files irreversibly |
 | Remote branch deletion | `git push --delete` |
+| git restore (working tree) | `git restore <path>` — discards uncommitted changes (`git restore --staged` is safe and not prompted) |
+| git branch -D | `git branch -D <branch>` — force-deletes branch regardless of merge status |
+| docker rm -f | `docker rm -f`, `docker container rm -f` — force-removes running containers |
 
 ### Safe patterns preserved
 
