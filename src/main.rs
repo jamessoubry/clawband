@@ -207,24 +207,25 @@ fn strip_sqz(cmd: &str) -> String {
 }
 
 // ─── Script file scanning ────────────────────────────────────────────────────
-// When a shell interpreter runs a script file (bash ./foo.sh), read the file
-// and check each line against deny/ask patterns.
-// Skips -c invocations (inline commands, not files), skips unreadable paths.
+// When an interpreter runs a script file, read it and check each line against
+// deny/ask patterns. Handles shell, Python, and JS/TS files.
+// Skips inline-execution flags (-c, -m, -e). Unreadable paths fail gracefully.
 
 fn extract_script_path(command: &str) -> Option<String> {
-    // Match: (bash|sh|zsh|dash) [optional-flags-without-c] <path>
-    // Reject -c flag — that's inline execution, already scanned as a command string.
+    // Match: (bash|sh|zsh|dash|python3?|node|deno) [optional-flags] <path>
     let re = Regex::new(
-        r"(?i)^\s*(?:sudo\s+)?(?:bash|sh|zsh|dash)\s+((?:-[a-z]+\s+)*)(.+)$"
+        r"(?i)^\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|python3?|node|deno)\s+((?:-[a-zA-Z]+\s+)*)(.+)$"
     ).unwrap();
     let caps = re.captures(command)?;
     let flags = &caps[1];
-    // If any flag group contains 'c', skip — it's -c "inline cmd"
-    if Regex::new(r"(?i)\bc\b|-c(\s|$)").unwrap().is_match(flags) {
+    // -c  → shell/python inline command string
+    // -m  → python module (e.g. python3 -m pytest)
+    // -e / --eval → node inline eval
+    if Regex::new(r"(?:^|\s)-[a-zA-Z]*[cme][a-zA-Z]*(\s|$)").unwrap().is_match(flags) {
         return None;
     }
     let path_str = caps[2].trim().trim_matches('"').trim_matches('\'');
-    // First token only — ignore extra arguments after the script path
+    // First token only — ignore script arguments after the path
     let path = path_str.split_whitespace().next()?;
     Some(path.to_string())
 }
@@ -236,12 +237,30 @@ fn scan_script_file(
     allow_pats: &[Pattern],
 ) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
+    let is_js = path.ends_with(".js") || path.ends_with(".mjs")
+             || path.ends_with(".ts") || path.ends_with(".tsx");
+    let mut in_block_comment = false;
+
     for (lineno, raw_line) in content.lines().enumerate() {
         let line = raw_line.trim();
-        // Skip blank lines and comments
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+        if line.is_empty() { continue; }
+
+        // JS/TS block comment state: /* ... */
+        if is_js {
+            if in_block_comment {
+                if line.contains("*/") { in_block_comment = false; }
+                continue;
+            }
+            if line.starts_with("/*") {
+                in_block_comment = !line.contains("*/");
+                continue;
+            }
+            if line.starts_with("//") || line.starts_with('*') { continue; }
         }
+
+        // Shell (#) and Python (#) line comments
+        if line.starts_with('#') { continue; }
+
         // Reuse compound-command splitting so `foo && rm -rf /` is caught
         let clean = strip_safe_pipes(line);
         for segment in &split_segments(&clean) {
