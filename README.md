@@ -123,6 +123,7 @@ Set as environment variables (in your shell profile, or prefixed on the hook com
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `RTK_ENABLED` | `0` | Strip `rtk` prefix before matching ([RTK](https://github.com/rtk-ai/rtk) users) |
+| `SQZ_ENABLED` | `0` | Strip `sqz compress` suffix before matching ([sqz](https://github.com/ojuschugh1/sqz) users) |
 | `CLAWBAND_LOG` | `0` | Append every block/prompt to `~/.clawband.log` |
 | `CLAWBAND_SKIP` | `0` | Bypass all checks (for trusted wrapper scripts) |
 

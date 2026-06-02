@@ -187,6 +187,15 @@ fn strip_rtk(cmd: &str) -> String {
     git_c.replace(&s, "git ").into_owned()
 }
 
+// ─── sqz suffix stripping ─────────────────────────────────────────────────────
+
+fn strip_sqz(cmd: &str) -> String {
+    // sqz rewrites "git status" → "git status 2>&1 | sqz compress --cmd git"
+    // Strip the appended sqz pipeline so patterns match the original command.
+    let sqz = Regex::new(r"\s*2>&1\s*\|\s*sqz\s+compress\b.*$").unwrap();
+    sqz.replace(cmd, "").into_owned()
+}
+
 // ─── Git force push check ─────────────────────────────────────────────────────
 
 fn check_force_push(cmd: &str) -> Option<String> {
@@ -264,6 +273,7 @@ fn cmd_stats() {
     let (user_allow, allow_exists) = count_file("allow.patterns");
 
     let rtk = env::var("RTK_ENABLED").as_deref() == Ok("1");
+    let sqz = env::var("SQZ_ENABLED").as_deref() == Ok("1");
     let logging = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
     let log_path = PathBuf::from(&home).join(".clawband.log");
 
@@ -308,6 +318,7 @@ fn cmd_stats() {
     println!("\n{bold}Options{r}");
     let flag = |on: bool| if on { format!("{g}on{r}") } else { format!("{d}off{r}") };
     println!("  RTK_ENABLED    {}", flag(rtk));
+    println!("  SQZ_ENABLED    {}", flag(sqz));
     println!("  CLAWBAND_LOG   {}", flag(logging));
 
     println!("\n{bold}Audit log{r}");
@@ -359,9 +370,11 @@ fn main() {
     }
 
     let rtk_enabled = env::var("RTK_ENABLED").as_deref() == Ok("1");
+    let sqz_enabled = env::var("SQZ_ENABLED").as_deref() == Ok("1");
     let log_enabled = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
 
     let command = if rtk_enabled { strip_rtk(&command) } else { command };
+    let command = if sqz_enabled { strip_sqz(&command) } else { command };
 
     // Load all patterns
     let cfg = config_dir();
