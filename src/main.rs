@@ -449,7 +449,17 @@ fn cmd_add_pattern(file: &str, args: &[String]) {
             let b = "\x1b[34m";
             let r = "\x1b[0m";
             let bold = "\x1b[1m";
-            println!("{}Added{} {}{}{} → {}{}{}", g, r, bold, pattern, r, b, path.display(), r);
+            println!(
+                "{}Added{} {}{}{} → {}{}{}",
+                g,
+                r,
+                bold,
+                pattern,
+                r,
+                b,
+                path.display(),
+                r
+            );
         }
         Err(e) => {
             eprintln!("clawband: failed to write {}: {}", path.display(), e);
@@ -620,9 +630,18 @@ fn main() {
     // CLI subcommands
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
-        Some("stats") => { cmd_stats(); return; }
-        Some("allow") => { cmd_add_pattern("allow.patterns", &args[2..]); return; }
-        Some("deny")  => { cmd_add_pattern("deny.patterns",  &args[2..]); return; }
+        Some("stats") => {
+            cmd_stats();
+            return;
+        }
+        Some("allow") => {
+            cmd_add_pattern("allow.patterns", &args[2..]);
+            return;
+        }
+        Some("deny") => {
+            cmd_add_pattern("deny.patterns", &args[2..]);
+            return;
+        }
         Some("--version") | Some("-v") => {
             println!("clawband v{}", env!("CARGO_PKG_VERSION"));
             return;
