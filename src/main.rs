@@ -356,11 +356,12 @@ fn scan_script_file(
                     return Some((
                         "ask".into(),
                         format!(
-                            "Review before running — '{}' in {}:{}: {}",
+                            "Review before running — '{}' in {}:{}: {}\nTo always allow: clawband allow '{}'",
                             pat.label,
                             path,
                             lineno + 1,
-                            segment
+                            segment,
+                            pat.label
                         ),
                     ));
                 }
@@ -421,6 +422,50 @@ fn split_segments(cmd: &str) -> Vec<String> {
         .map(|seg| seg.trim().replace(ESC_SEMI, "\\;").replace(ESC_PIPE, "\\|"))
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+// ─── Allow / deny commands ───────────────────────────────────────────────────
+
+fn cmd_add_pattern(file: &str, args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: clawband allow|deny <pattern>");
+        std::process::exit(1);
+    }
+    let pattern = args.join(" ");
+
+    if Pattern::from_user(&pattern).is_none() {
+        eprintln!("clawband: invalid regex: {}", pattern);
+        std::process::exit(1);
+    }
+
+    let cfg = config_dir();
+    let _ = fs::create_dir_all(&cfg);
+    let path = cfg.join(file);
+
+    match fs::OpenOptions::new().append(true).create(true).open(&path) {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{}", pattern);
+            let g = "\x1b[32m";
+            let b = "\x1b[34m";
+            let r = "\x1b[0m";
+            let bold = "\x1b[1m";
+            println!(
+                "{}Added{} {}{}{} → {}{}{}",
+                g,
+                r,
+                bold,
+                pattern,
+                r,
+                b,
+                path.display(),
+                r
+            );
+        }
+        Err(e) => {
+            eprintln!("clawband: failed to write {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    }
 }
 
 // ─── Stats command ────────────────────────────────────────────────────────────
@@ -569,8 +614,8 @@ fn check_command<'a>(
                 return Some((
                     "ask",
                     format!(
-                        "Review before running — '{}' matched in: {}",
-                        pat.label, segment
+                        "Review before running — '{}' matched in: {}\nTo always allow: clawband allow '{}'",
+                        pat.label, segment, pat.label
                     ),
                 ));
             }
@@ -584,15 +629,24 @@ fn check_command<'a>(
 fn main() {
     // CLI subcommands
     let args: Vec<String> = env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("stats") {
-        cmd_stats();
-        return;
-    }
-    if args.get(1).map(|s| s.as_str()) == Some("--version")
-        || args.get(1).map(|s| s.as_str()) == Some("-v")
-    {
-        println!("clawband v{}", env!("CARGO_PKG_VERSION"));
-        return;
+    match args.get(1).map(|s| s.as_str()) {
+        Some("stats") => {
+            cmd_stats();
+            return;
+        }
+        Some("allow") => {
+            cmd_add_pattern("allow.patterns", &args[2..]);
+            return;
+        }
+        Some("deny") => {
+            cmd_add_pattern("deny.patterns", &args[2..]);
+            return;
+        }
+        Some("--version") | Some("-v") => {
+            println!("clawband v{}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        _ => {}
     }
 
     let mut input = String::new();

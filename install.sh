@@ -77,10 +77,20 @@ else
   green "Registered hook in $SETTINGS"
 fi
 
+# ── Install slash commands ────────────────────────────────────────────────────
+CMD_DIR="$HOME/.claude/commands"
+mkdir -p "$CMD_DIR"
+cp "$SCRIPT_DIR/.claude/commands/allow.md" "$CMD_DIR/allow.md"
+cp "$SCRIPT_DIR/.claude/commands/deny.md"  "$CMD_DIR/deny.md"
+green "Installed: /allow and /deny slash commands → $CMD_DIR"
+
 echo ""
 green "Done. Run /hooks in Claude Code (or restart) to activate clawband."
 echo ""
 echo "  Config:  $CONFIG_DIR/{deny,ask,allow}.patterns"
+echo "  CLI:     clawband allow '<pattern>'  add to allow list"
+echo "           clawband deny  '<pattern>'  add to deny list"
+echo "  Slash:   /allow <pattern>  /deny <pattern>"
 echo "  Options: RTK_ENABLED=1   strip rtk prefix before matching"
 echo "           CLAWBAND_LOG=1  append blocks/prompts to ~/.clawband.log"
 echo "           CLAWBAND_SKIP=1 bypass all checks (trusted scripts)"

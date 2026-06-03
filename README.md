@@ -120,6 +120,17 @@ my-infra nuke --all
 git reset --hard HEAD$
 ```
 
+## CLI commands
+
+```sh
+clawband allow '<pattern>'   # append to ~/.clawband/allow.patterns
+clawband deny  '<pattern>'   # append to ~/.clawband/deny.patterns
+clawband stats               # show pattern counts and audit log summary
+clawband --version
+```
+
+Patterns are validated as regexes before writing. The install script also adds `/allow` and `/deny` Claude Code slash commands so you can add patterns without leaving the chat.
+
 ## Options
 
 Set as environment variables (in your shell profile, or prefixed on the hook command):
