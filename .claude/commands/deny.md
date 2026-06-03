@@ -1,0 +1,1 @@
+Run `clawband deny '$ARGUMENTS'` to add the pattern to ~/.clawband/deny.patterns, then confirm it was added. If no arguments are given, explain that a pattern is required (e.g. `/deny docker system prune`).

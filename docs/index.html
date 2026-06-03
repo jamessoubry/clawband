@@ -658,6 +658,25 @@
   </div>
 </section>
 
+<!-- ── CLI ────────────────────────────────────────────────────────────────────── -->
+<section>
+  <div class="container">
+    <h2>CLI commands</h2>
+    <p style="color:var(--muted);margin-bottom:1.5rem">Manage your pattern lists without editing files. Changes take effect immediately — no restart needed.</p>
+    <div class="code-block">
+      <span class="comment"># Add a pattern to the allow list (stops prompting for it)</span><br>
+      <span class="pattern">clawband allow 'git reset --hard'</span><br>
+      <br>
+      <span class="comment"># Add a pattern to the deny list (always block)</span><br>
+      <span class="pattern">clawband deny 'my-infra nuke'</span><br>
+      <br>
+      <span class="comment"># View pattern counts and audit log summary</span><br>
+      <span class="pattern">clawband stats</span>
+    </div>
+    <p style="color:var(--muted);margin-top:1rem;font-size:.875rem">The installer also adds <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">/allow</code> and <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">/deny</code> Claude Code slash commands so you can update your lists without leaving the chat. When clawband prompts for approval it includes the exact <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">clawband allow</code> command to silence it permanently.</p>
+  </div>
+</section>
+
 <!-- ── Options ───────────────────────────────────────────────────────────────── -->
 <section>
   <div class="container">

@@ -1,0 +1,1 @@
+Run `clawband allow '$ARGUMENTS'` to add the pattern to ~/.clawband/allow.patterns, then confirm it was added. If no arguments are given, explain that a pattern is required (e.g. `/allow git reset --hard`).
