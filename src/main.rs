@@ -424,6 +424,63 @@ fn split_segments(cmd: &str) -> Vec<String> {
         .collect()
 }
 
+// ─── PostToolUse breadcrumb ───────────────────────────────────────────────────
+// Written by PreToolUse when decision is "ask". Read and deleted by `clawband post`
+// (PostToolUse hook). If the command ran, PostToolUse fires and we know the user
+// approved. If denied, PostToolUse never fires and the breadcrumb expires via TTL.
+
+fn breadcrumb_path() -> PathBuf {
+    config_dir().join(".last-ask")
+}
+
+fn write_ask_breadcrumb(reason: &str) {
+    let cfg = config_dir();
+    let _ = fs::create_dir_all(&cfg);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(breadcrumb_path())
+    {
+        let _ = writeln!(f, "{}\n{}", ts, reason);
+    }
+}
+
+fn cmd_post() {
+    let path = breadcrumb_path();
+    let Ok(content) = fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = fs::remove_file(&path);
+
+    let mut lines = content.lines();
+    let ts: u64 = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(ts) > 60 {
+        return;
+    }
+
+    let reason: String = lines.collect::<Vec<_>>().join("\n");
+
+    // Extract "clawband allow '<label>'" from the hint line if present.
+    if let Some(pos) = reason.find("clawband allow '") {
+        let snippet = reason[pos..].lines().next().unwrap_or("").trim();
+        println!(
+            "The user approved a clawband-prompted command. \
+             Suggest they run `{}` to stop being prompted for this in future.",
+            snippet
+        );
+    }
+}
+
 // ─── Allow / deny commands ───────────────────────────────────────────────────
 
 fn cmd_add_pattern(file: &str, args: &[String]) {
@@ -642,6 +699,10 @@ fn main() {
             cmd_add_pattern("deny.patterns", &args[2..]);
             return;
         }
+        Some("post") => {
+            cmd_post();
+            return;
+        }
         Some("--version") | Some("-v") => {
             println!("clawband v{}", env!("CARGO_PKG_VERSION"));
             return;
@@ -698,6 +759,9 @@ fn main() {
 
     // Core pattern check (deny/ask/pass)
     if let Some((decision, reason)) = check_command(&command, &deny_pats, &ask_pats, &allow_pats) {
+        if decision == "ask" {
+            write_ask_breadcrumb(&reason);
+        }
         emit(decision, &reason);
         return;
     }
@@ -707,6 +771,9 @@ fn main() {
         if let Some((decision, reason)) =
             scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
         {
+            if decision == "ask" {
+                write_ask_breadcrumb(&reason);
+            }
             emit(&decision, &reason);
             return;
         }

@@ -1,6 +1,13 @@
 #!/bin/bash
 # install.sh — build and install clawband
+# Options:
+#   --post-hook   also register the PostToolUse hook for allow suggestions
 set -euo pipefail
+
+POST_HOOK=0
+for arg in "$@"; do
+  [[ "$arg" == "--post-hook" ]] && POST_HOOK=1
+done
 
 HOOK_DIR="$HOME/.claude/hooks"
 SETTINGS="$HOME/.claude/settings.json"
@@ -77,6 +84,20 @@ else
   green "Registered hook in $SETTINGS"
 fi
 
+# ── Optional: PostToolUse hook ───────────────────────────────────────────────
+if [[ "$POST_HOOK" == "1" ]]; then
+  POST_ENTRY='{"matcher":"Bash","hooks":[{"type":"command","command":"~/.claude/hooks/clawband post"}]}'
+  if grep -q '"clawband post"' "$SETTINGS" 2>/dev/null; then
+    yellow "PostToolUse hook already registered — skipping"
+  else
+    UPDATED=$(jq --argjson entry "$POST_ENTRY" '
+      .hooks.PostToolUse = ([$entry] + (.hooks.PostToolUse // []))
+    ' "$SETTINGS")
+    echo "$UPDATED" > "$SETTINGS"
+    green "PostToolUse hook registered — will suggest 'clawband allow' after approvals"
+  fi
+fi
+
 # ── Install slash commands ────────────────────────────────────────────────────
 CMD_DIR="$HOME/.claude/commands"
 mkdir -p "$CMD_DIR"
@@ -94,3 +115,7 @@ echo "  Slash:   /allow <pattern>  /deny <pattern>"
 echo "  Options: RTK_ENABLED=1   strip rtk prefix before matching"
 echo "           CLAWBAND_LOG=1  append blocks/prompts to ~/.clawband.log"
 echo "           CLAWBAND_SKIP=1 bypass all checks (trusted scripts)"
+echo ""
+echo "  Optional: bash install.sh --post-hook"
+echo "            Registers a PostToolUse hook that suggests 'clawband allow'"
+echo "            in the chat after you approve a prompted command."

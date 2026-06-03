@@ -131,6 +131,16 @@ clawband --version
 
 Patterns are validated as regexes before writing. The install script also adds `/allow` and `/deny` Claude Code slash commands so you can add patterns without leaving the chat.
 
+## PostToolUse hook (optional)
+
+Install with `--post-hook` to enable in-chat allow suggestions:
+
+```sh
+bash install.sh --post-hook
+```
+
+When you approve a prompted command, the hook tells Claude the command ran and suggests the exact `clawband allow` command to permanently silence that prompt. Uses a breadcrumb file (`~/.clawband/.last-ask`) written at prompt time and consumed on approval — if you deny, PostToolUse never fires and the breadcrumb expires after 60 seconds.
+
 ## Options
 
 Set as environment variables (in your shell profile, or prefixed on the hook command):
