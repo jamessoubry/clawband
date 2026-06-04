@@ -510,6 +510,16 @@
       </div>
       <div class="step">
         <div class="num">04</div>
+        <h3>Scans script files</h3>
+        <p>When a command runs a script (<code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">bash foo.sh</code>, <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">./run.sh</code>, <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">bash &lt; script</code>), clawband reads the file and checks every line before execution.</p>
+      </div>
+      <div class="step">
+        <div class="num">05</div>
+        <h3>Catches write-then-execute</h3>
+        <p>If a compound command writes to a file and immediately runs it (<code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">echo "..." &gt; run.sh &amp;&amp; bash run.sh</code>), clawband flags it — the content can't be scanned between write and execute.</p>
+      </div>
+      <div class="step">
+        <div class="num">06</div>
         <h3>Sub-millisecond</h3>
         <p>Written in Rust. Single binary, no subprocesses. ~30ms per hook call vs ~380ms for an equivalent bash implementation.</p>
       </div>

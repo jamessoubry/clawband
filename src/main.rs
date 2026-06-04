@@ -256,7 +256,7 @@ fn path_basename(path: &str) -> &str {
 }
 
 fn extract_script_path(command: &str) -> Option<String> {
-    let interp = r"(?i)(?:sudo\s+)?(?:bash|sh|zsh|dash|python3?|node|deno|perl|lua[0-9.]*)";
+    let interp = r"(?i)(?:sudo\s+)?(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua[0-9.]*)";
 
     // Input redirection: bash < /path/to/script
     let redir_re = Regex::new(&format!(r"(?i)^\s*{}\s+<\s+(.+)$", interp)).unwrap();
@@ -1084,6 +1084,19 @@ mod tests {
     fn write_without_execute_passes() {
         // Writing to a script file alone is fine — will be scanned when run
         assert_eq!(decision(r#"echo "echo hello" > /tmp/greet.sh"#), None);
+    }
+
+    // ── ruby script scanning ───────────────────────────────────────────────────
+
+    #[test]
+    fn ruby_script_path_extracted() {
+        // ruby is now in the interpreter list — path should be extracted
+        // (file won't exist in test env, so check_command returns None,
+        //  but extract_script_path itself should return Some)
+        assert_eq!(
+            extract_script_path("ruby /tmp/script.rb"),
+            Some("/tmp/script.rb".into())
+        );
     }
 
     // ── txt extension and ./script ─────────────────────────────────────────────
