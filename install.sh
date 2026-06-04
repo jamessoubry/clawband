@@ -104,7 +104,7 @@ if [ ! -f "$SETTINGS" ]; then
   echo '{"hooks":{"PreToolUse":[]}}' > "$SETTINGS"
 fi
 
-if grep -q '"clawband"' "$SETTINGS" 2>/dev/null; then
+if jq -e '.hooks.PreToolUse[]?.hooks[]? | select(.command and (.command | contains("clawband")) and (.command | contains("icm") | not) and (.command | contains("sqz") | not))' "$SETTINGS" &>/dev/null; then
   yellow "Already registered in $SETTINGS — skipping"
 else
   UPDATED=$(jq --argjson entry "$HOOK_ENTRY" '
