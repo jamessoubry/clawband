@@ -251,12 +251,25 @@ fn strip_sqz(cmd: &str) -> String {
 // deny/ask patterns. Handles shell, Python, JS/TS, Perl, and Lua files.
 // Skips inline-execution flags (-c, -m, -e). Unreadable paths fail gracefully.
 
+fn path_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 fn extract_script_path(command: &str) -> Option<String> {
     let interp = r"(?i)(?:sudo\s+)?(?:bash|sh|zsh|dash|python3?|node|deno|perl|lua[0-9.]*)";
 
-    // Input redirection: bash < /path/to/script.sh
+    // Input redirection: bash < /path/to/script
     let redir_re = Regex::new(&format!(r"(?i)^\s*{}\s+<\s+(.+)$", interp)).unwrap();
     if let Some(caps) = redir_re.captures(command) {
+        let path_str = caps[1].trim().trim_matches('"').trim_matches('\'');
+        if let Some(path) = path_str.split_whitespace().next() {
+            return Some(path.to_string());
+        }
+    }
+
+    // Direct execution: ./script or ./script.sh — bash honours shebang, ignores extension
+    let direct_re = Regex::new(r"(?i)^\s*(?:sudo\s+)?(\./\S+)").unwrap();
+    if let Some(caps) = direct_re.captures(command) {
         let path_str = caps[1].trim().trim_matches('"').trim_matches('\'');
         if let Some(path) = path_str.split_whitespace().next() {
             return Some(path.to_string());
@@ -691,19 +704,39 @@ fn check_echo_to_script(
 }
 
 // ─── Write-then-execute detection ─────────────────────────────────────────────
-// If a compound command writes to a script file AND later executes a script,
-// the written content can't be scanned before execution. Flag as ask.
+// If a compound command writes a file AND later executes that same file,
+// the content can't be scanned before execution. Matches by basename so
+// extension doesn't matter — `echo bad > run.txt; bash run.txt` is caught too.
 
 fn check_write_then_execute(segments: &[String]) -> bool {
     if segments.len() < 2 {
         return false;
     }
-    let write_re = Regex::new(&format!(r"(?i)>>?\s*\S+\.(?:{SCRIPT_EXTS})\b")).unwrap();
-    let exec_re = Regex::new(&format!(
-        r"(?i)\b(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua)\s+\S+\.(?:{SCRIPT_EXTS})\b|^\./\S+"
-    ))
+    // Capture the filename after any output redirection operator
+    let write_re = Regex::new(r">>?\s*(\S+)").unwrap();
+    // Capture the filename passed to an interpreter or run directly
+    let exec_re = Regex::new(
+        r"(?i)(?:\b(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua)\s+<?|^\s*(?:sudo\s+)?\./)(\S+)",
+    )
     .unwrap();
-    segments.iter().any(|s| write_re.is_match(s)) && segments.iter().any(|s| exec_re.is_match(s))
+
+    let written: Vec<&str> = segments
+        .iter()
+        .flat_map(|s| write_re.captures_iter(s))
+        .filter_map(|c| c.get(1).map(|m| path_basename(m.as_str())))
+        .collect();
+
+    if written.is_empty() {
+        return false;
+    }
+
+    segments.iter().any(|s| {
+        exec_re.captures_iter(s).any(|c| {
+            c.get(1)
+                .map(|m| written.contains(&path_basename(m.as_str())))
+                .unwrap_or(false)
+        })
+    })
 }
 
 // ─── Core check logic ────────────────────────────────────────────────────────
@@ -1051,5 +1084,34 @@ mod tests {
     fn write_without_execute_passes() {
         // Writing to a script file alone is fine — will be scanned when run
         assert_eq!(decision(r#"echo "echo hello" > /tmp/greet.sh"#), None);
+    }
+
+    // ── txt extension and ./script ─────────────────────────────────────────────
+
+    #[test]
+    fn echo_then_bash_txt_asks() {
+        // .txt extension previously bypassed write-then-execute
+        assert_eq!(
+            decision("echo bad > bad.txt; bash bad.txt"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn echo_then_direct_exec_asks() {
+        // ./script form should also be detected
+        assert_eq!(
+            decision(r#"echo "bad" > run.sh && ./run.sh"#),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn write_different_file_than_executed_passes() {
+        // Writing to one file and executing a different file is safe
+        assert_eq!(
+            decision(r#"echo "log entry" > progress.log && bash build.sh"#),
+            None
+        );
     }
 }
