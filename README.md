@@ -26,13 +26,13 @@ Single `|` is intentionally **not** a splitter — this keeps pipe-to-interprete
 
 ## Installation
 
-Requires Rust (`cargo`) and `jq`.
+Requires `jq`. Rust is only needed if no pre-built binary is available for your platform.
 
 ```sh
 bash install.sh
 ```
 
-The installer builds the binary, installs it to `~/.claude/hooks/clawband`, creates `~/.clawband/` config files, and wires up `~/.claude/settings.json`. Then run `/hooks` in Claude Code (or restart) to activate.
+The installer downloads the latest pre-built binary for your platform (Linux x86_64, macOS arm64, macOS x86_64) and falls back to `cargo build` if none is available. It installs the binary to `~/.claude/hooks/clawband`, creates `~/.clawband/` config files, and wires up `~/.claude/settings.json`. Then run `/hooks` in Claude Code (or restart) to activate.
 
 ### Manual installation
 
@@ -154,7 +154,7 @@ Set as environment variables (in your shell profile, or prefixed on the hook com
 
 ## Requirements
 
-- `bash install.sh`: Rust toolchain (`cargo`), `jq`
+- `bash install.sh`: `jq` (always), Rust toolchain (`cargo`) only if no pre-built binary is available for your platform
 - Runtime: none (single static binary)
 
 ## Limitations

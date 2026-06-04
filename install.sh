@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — build and install clawband
+# install.sh — install clawband
 # Options:
 #   --post-hook   also register the PostToolUse hook for allow suggestions
 set -euo pipefail
@@ -13,12 +13,13 @@ HOOK_DIR="$HOME/.claude/hooks"
 SETTINGS="$HOME/.claude/settings.json"
 CONFIG_DIR="$HOME/.clawband"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="jamessoubry/clawband"
 
 green()  { printf '\033[32m%s\033[0m\n' "$1"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$1"; }
 red()    { printf '\033[31m%s\033[0m\n' "$1"; }
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
+# ── jq is always required (settings.json editing) ────────────────────────────
 if ! command -v jq &>/dev/null; then
   red "Error: jq is required."
   echo "  macOS:  brew install jq"
@@ -26,23 +27,52 @@ if ! command -v jq &>/dev/null; then
   exit 1
 fi
 
-if ! command -v cargo &>/dev/null; then
-  red "Error: Rust toolchain not found."
-  echo "  Install: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-  echo "  Then re-run this script."
-  exit 1
+mkdir -p "$HOOK_DIR"
+
+# ── Try pre-built binary ──────────────────────────────────────────────────────
+BINARY_INSTALLED=0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+case "$OS-$ARCH" in
+  linux-x86_64)  ASSET="clawband-linux-x86_64" ;;
+  darwin-arm64)  ASSET="clawband-macos-arm64" ;;
+  darwin-x86_64) ASSET="clawband-macos-x86_64" ;;
+  *)             ASSET="" ;;
+esac
+
+if [[ -n "$ASSET" ]]; then
+  echo "Checking for pre-built binary..."
+  LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | jq -r '.tag_name // empty' 2>/dev/null || true)
+  if [[ -n "$LATEST" ]]; then
+    URL="https://github.com/$REPO/releases/download/$LATEST/$ASSET"
+    if curl -fsSL "$URL" -o "$HOOK_DIR/clawband" 2>/dev/null; then
+      chmod +x "$HOOK_DIR/clawband"
+      green "Installed pre-built binary ($LATEST)"
+      BINARY_INSTALLED=1
+    else
+      yellow "Pre-built binary not available for this platform — building from source"
+    fi
+  else
+    yellow "No release found — building from source"
+  fi
 fi
 
-# ── Build ─────────────────────────────────────────────────────────────────────
-echo "Building clawband..."
-cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" --quiet
-green "Build complete"
-
-# ── Install binary ────────────────────────────────────────────────────────────
-mkdir -p "$HOOK_DIR"
-cp "$SCRIPT_DIR/target/release/clawband" "$HOOK_DIR/clawband"
-chmod +x "$HOOK_DIR/clawband"
-green "Installed: $HOOK_DIR/clawband"
+# ── Build from source (fallback) ──────────────────────────────────────────────
+if [[ "$BINARY_INSTALLED" == "0" ]]; then
+  if ! command -v cargo &>/dev/null; then
+    red "Error: no pre-built binary available and Rust toolchain not found."
+    echo "  Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    echo "  Then re-run this script."
+    exit 1
+  fi
+  echo "Building from source..."
+  cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" --quiet
+  cp "$SCRIPT_DIR/target/release/clawband" "$HOOK_DIR/clawband"
+  chmod +x "$HOOK_DIR/clawband"
+  green "Built and installed from source"
+fi
 
 # ── Create config dir ─────────────────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
