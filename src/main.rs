@@ -10,7 +10,8 @@ use std::{
 fn output(decision: &str, reason: &str) {
     // Manually build JSON to avoid depending on serde_json for output
     // (we still use it for input parsing)
-    let reason_escaped = reason
+    let prefixed = format!("[clawband] {}", reason);
+    let reason_escaped = prefixed
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
