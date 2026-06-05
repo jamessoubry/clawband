@@ -117,6 +117,8 @@ Add to `~/.claude/settings.json`:
 | git restore (working tree) | `git restore <path>` — discards uncommitted changes (`git restore --staged` is safe and not prompted) |
 | git branch -D | `git branch -D <branch>` — force-deletes branch regardless of merge status |
 | docker rm -f | `docker rm -f`, `docker container rm -f` — force-removes running containers |
+| npx / npm exec | `npx pkg`, `npm exec -- cmd` — downloads and executes arbitrary npm packages, content can't be scanned |
+| git push :<branch> | `git push origin :branch` — colon-prefix syntax for remote branch deletion |
 
 ### Safe patterns preserved
 
