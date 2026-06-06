@@ -232,6 +232,20 @@ fn config_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_default()).join(".clawband")
 }
 
+fn project_config_dir() -> Option<PathBuf> {
+    let pwd = env::var("PWD").ok()?;
+    let path = PathBuf::from(pwd).join(".clawband");
+    // Skip if it's the same as the global dir (home dir edge case)
+    if path == config_dir() {
+        return None;
+    }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 // ─── RTK prefix stripping ─────────────────────────────────────────────────────
 
 fn strip_rtk(cmd: &str) -> String {
@@ -513,17 +527,32 @@ fn cmd_post() {
 
 fn cmd_add_pattern(file: &str, args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: clawband allow|deny <pattern>");
+        eprintln!("Usage: clawband allow|deny [--project] <pattern>");
         std::process::exit(1);
     }
-    let pattern = args.join(" ");
+
+    let (use_project, pattern_args) = if args[0] == "--project" {
+        if args.len() < 2 {
+            eprintln!("Usage: clawband allow|deny [--project] <pattern>");
+            std::process::exit(1);
+        }
+        (true, &args[1..])
+    } else {
+        (false, args)
+    };
+
+    let pattern = pattern_args.join(" ");
 
     if Pattern::from_user(&pattern).is_none() {
         eprintln!("clawband: invalid regex: {}", pattern);
         std::process::exit(1);
     }
 
-    let cfg = config_dir();
+    let cfg = if use_project {
+        PathBuf::from(env::var("PWD").unwrap_or_else(|_| ".".to_string())).join(".clawband")
+    } else {
+        config_dir()
+    };
     let _ = fs::create_dir_all(&cfg);
     let path = cfg.join(file);
 
@@ -572,19 +601,26 @@ fn cmd_help() {
     println!();
 
     println!("{bold}Commands{r}");
-    println!("  {g}allow{r} {d}'<pattern>'{r}   Append a regex to ~/.clawband/allow.patterns");
-    println!("  {y}deny{r}  {d}'<pattern>'{r}   Append a regex to ~/.clawband/deny.patterns");
-    println!("  {b}stats{r}               Pattern counts, options, and audit log summary");
+    println!("  {g}allow{r} {d}[--project] '<pattern>'{r}   Append a regex to allow.patterns");
+    println!("  {y}deny{r}  {d}[--project] '<pattern>'{r}   Append a regex to deny.patterns");
+    println!("  {b}stats{r}                       Pattern counts, options, and audit log summary");
     println!(
-        "  {b}post{r}                PostToolUse companion — reads breadcrumb, suggests allow"
+        "  {b}post{r}                        PostToolUse companion — reads breadcrumb, suggests allow"
     );
-    println!("  {b}--version{r}           Print version and exit");
+    println!("  {b}--version{r}                   Print version and exit");
     println!();
 
-    println!("{bold}Pattern files{r}  {d}(~/.clawband/){r}");
-    println!("  deny.patterns    Always block — appended to built-in deny list");
-    println!("  ask.patterns     Always prompt — appended to built-in ask list");
-    println!("  allow.patterns   Override any block — matching commands skip all checks");
+    println!("{bold}Pattern files{r}");
+    println!("  Global (~/.clawband/)        Loaded for every project");
+    println!("    deny.patterns              Always block — appended to built-in deny list");
+    println!("    ask.patterns               Always prompt — appended to built-in ask list");
+    println!(
+        "    allow.patterns             Override any block — matching commands skip all checks"
+    );
+    println!("  Project (.clawband/ in CWD)  Loaded in addition to global patterns");
+    println!("    deny.patterns              Project-specific blocks");
+    println!("    ask.patterns               Project-specific prompts");
+    println!("    allow.patterns             Project-specific overrides");
     println!();
 
     println!("{bold}Options{r}  {d}(environment variables){r}");
@@ -659,7 +695,7 @@ fn cmd_stats() {
     println!("  {g}deny{r}   {bold}{builtin_deny_count}{r}");
     println!("  {y}ask{r}    {bold}{builtin_ask_count}{r}");
 
-    println!("\n{bold}User patterns{r}  {d}(~/.clawband/){r}");
+    println!("\n{bold}Global patterns{r}  {d}(~/.clawband/){r}");
     let file_status = |exists: bool, n: usize| -> String {
         if !exists {
             format!("{d}file not found{r}")
@@ -675,6 +711,22 @@ fn cmd_stats() {
         "  allow.patterns   {}",
         file_status(allow_exists, user_allow)
     );
+
+    if let Some(proj) = project_config_dir() {
+        println!("\n{bold}Project patterns{r}  {d}({}){r}", proj.display());
+        let proj_file_status = |name: &str| -> String {
+            let path = proj.join(name);
+            let n = load_patterns(&path).len();
+            if n == 0 {
+                format!("{d}0 patterns{r}")
+            } else {
+                format!("{bold}{n}{r} loaded")
+            }
+        };
+        println!("  deny.patterns    {}", proj_file_status("deny.patterns"));
+        println!("  ask.patterns     {}", proj_file_status("ask.patterns"));
+        println!("  allow.patterns   {}", proj_file_status("allow.patterns"));
+    }
 
     println!("\n{bold}Active protections{r}");
     println!("  script file scanning     {g}on{r}  {d}(bash/sh/python/node/ruby/perl/lua/deno + input redirection){r}");
@@ -1012,9 +1064,14 @@ fn main() {
     let cfg = config_dir();
     let mut deny_pats = builtin_deny();
     let mut ask_pats = builtin_ask();
-    let allow_pats = load_patterns(&cfg.join("allow.patterns"));
+    let mut allow_pats = load_patterns(&cfg.join("allow.patterns"));
     deny_pats.extend(load_patterns(&cfg.join("deny.patterns")));
     ask_pats.extend(load_patterns(&cfg.join("ask.patterns")));
+    if let Some(proj) = project_config_dir() {
+        deny_pats.extend(load_patterns(&proj.join("deny.patterns")));
+        ask_pats.extend(load_patterns(&proj.join("ask.patterns")));
+        allow_pats.extend(load_patterns(&proj.join("allow.patterns")));
+    }
 
     let emit = |decision: &str, reason: &str| {
         if log_enabled {

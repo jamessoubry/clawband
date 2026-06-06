@@ -129,7 +129,9 @@ Add to `~/.claude/settings.json`:
 
 ## Custom patterns
 
-Extend or override behaviour by editing files in `~/.clawband/`:
+Extend or override behaviour by editing pattern files. clawband loads two sets:
+
+**Global** (`~/.clawband/`) — applied to every project:
 
 | File | Effect |
 |------|--------|
@@ -137,25 +139,34 @@ Extend or override behaviour by editing files in `~/.clawband/`:
 | `ask.patterns` | Always prompt — added to built-in ask list |
 | `allow.patterns` | Override any block — matching commands skip all checks |
 
+**Project** (`.clawband/` in the current working directory) — loaded in addition to global patterns when the directory exists. Useful for per-repo restrictions or allowances without affecting other projects:
+
+| File | Effect |
+|------|--------|
+| `.clawband/deny.patterns` | Project-specific blocks |
+| `.clawband/ask.patterns` | Project-specific prompts |
+| `.clawband/allow.patterns` | Project-specific overrides |
+
 Each file is one **case-insensitive regex** per line. Lines starting with `#` and blank lines are ignored.
 
 See `deny.patterns.example` and `ask.patterns.example` for the format.
 
 ```sh
-# ~/.clawband/deny.patterns — add project-specific blocks
-docker system prune
+# ~/.clawband/deny.patterns — global blocks for all projects
 my-infra nuke --all
 
-# ~/.clawband/allow.patterns — whitelist specific safe usages
+# .clawband/allow.patterns — project-specific override
 git reset --hard HEAD$
 ```
 
 ## CLI commands
 
 ```sh
-clawband allow '<pattern>'   # append to ~/.clawband/allow.patterns
-clawband deny  '<pattern>'   # append to ~/.clawband/deny.patterns
-clawband stats               # show pattern counts and audit log summary
+clawband allow '<pattern>'            # append to ~/.clawband/allow.patterns (global)
+clawband allow --project '<pattern>'  # append to .clawband/allow.patterns (project CWD)
+clawband deny  '<pattern>'            # append to ~/.clawband/deny.patterns (global)
+clawband deny  --project '<pattern>'  # append to .clawband/deny.patterns (project CWD)
+clawband stats                        # show pattern counts and audit log summary
 clawband --version
 ```
 
