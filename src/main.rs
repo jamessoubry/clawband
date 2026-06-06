@@ -206,6 +206,11 @@ fn builtin_ask() -> Vec<Pattern> {
         ("java -jar", r"\bjava\b.*\s-jar\s"),
         ("go run", r"\bgo\s+run\b"),
         ("cargo run", r"\bcargo\s+run\b"),
+        // npx/npm exec — downloads and executes arbitrary npm packages
+        ("npx", r"\bnpx\s"),
+        ("npm exec", r"\bnpm\s+exec\b"),
+        // git push :<branch> — colon-prefix syntax for remote branch deletion
+        ("git push :<branch>", r"\bgit\s+push\b.*\s:\S"),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -1079,6 +1084,32 @@ mod tests {
     #[test]
     fn cargo_run_asks() {
         assert_eq!(decision("cargo run"), Some("ask".into()));
+    }
+
+    #[test]
+    fn npx_asks() {
+        assert_eq!(decision("npx some-package"), Some("ask".into()));
+    }
+
+    #[test]
+    fn npm_exec_asks() {
+        assert_eq!(decision("npm exec -- dangerous-cmd"), Some("ask".into()));
+    }
+
+    #[test]
+    fn git_push_colon_branch_asks() {
+        assert_eq!(
+            decision("git push origin :feature-branch"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_push_delete_flag_asks() {
+        assert_eq!(
+            decision("git push --delete origin feature-branch"),
+            Some("ask".into())
+        );
     }
 
     // ── pass cases ─────────────────────────────────────────────────────────────
