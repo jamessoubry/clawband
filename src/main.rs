@@ -1290,4 +1290,86 @@ mod tests {
     fn subshell_safe_content_passes() {
         assert_eq!(full_decision(r#"echo "version: $(cat VERSION)""#), None);
     }
+
+    // ── scan_script_file integration tests ────────────────────────────────────
+    // Write real temp files and verify the scanner catches dangerous content.
+
+    // Use unique per-test paths to avoid parallel-test race conditions
+    fn scan_content(name: &str, ext: &str, content: &str) -> Option<String> {
+        let path = format!("/tmp/clawband_test_{}_{}.{}", std::process::id(), name, ext);
+        fs::write(&path, content).unwrap();
+        let result =
+            scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow()).map(|(d, _)| d);
+        let _ = fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn scan_script_with_deny_pattern_denies() {
+        assert_eq!(
+            scan_content("deny", "sh", "#!/bin/bash\nrm -rf /home/user\n"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn scan_script_with_ask_pattern_asks() {
+        assert_eq!(
+            scan_content("ask", "sh", "#!/bin/bash\ngit reset --hard HEAD~1\n"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn scan_script_with_safe_content_passes() {
+        assert_eq!(
+            scan_content("safe", "sh", "#!/bin/bash\necho hello\nls -la\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_script_nonexistent_file_passes() {
+        assert_eq!(
+            scan_script_file(
+                "/tmp/clawband_nonexistent.sh",
+                &deny_pats(),
+                &ask_pats(),
+                &no_allow()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_python_script_with_deny_pattern_denies() {
+        assert_eq!(
+            scan_content("pydenied", "py", "import os\nos.system('rm -rf /')\n"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn scan_script_skips_comments() {
+        assert_eq!(
+            scan_content(
+                "comments",
+                "sh",
+                "#!/bin/bash\n# rm -rf / would be bad\necho safe\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_script_catches_compound_command() {
+        assert_eq!(
+            scan_content(
+                "compound",
+                "sh",
+                "#!/bin/bash\necho hi && docker system prune\n"
+            ),
+            Some("deny".into())
+        );
+    }
 }
