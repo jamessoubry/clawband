@@ -553,6 +553,56 @@ fn cmd_add_pattern(file: &str, args: &[String]) {
     }
 }
 
+// ─── Help command ─────────────────────────────────────────────────────────────
+
+fn cmd_help() {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    let bold = "\x1b[1m";
+    let d = "\x1b[2m";
+    let g = "\x1b[32m";
+    let y = "\x1b[33m";
+    let b = "\x1b[34m";
+    let r = "\x1b[0m";
+
+    println!("\n{bold}clawband v{VERSION}{r}  {d}— PreToolUse hook for Claude Code's Bash tool{r}");
+    println!("{d}Blocks destructive shell commands before they execute.{r}\n");
+
+    println!("{bold}Usage{r}");
+    println!("  clawband {d}<command>{r}");
+    println!();
+
+    println!("{bold}Commands{r}");
+    println!("  {g}allow{r} {d}'<pattern>'{r}   Append a regex to ~/.clawband/allow.patterns");
+    println!("  {y}deny{r}  {d}'<pattern>'{r}   Append a regex to ~/.clawband/deny.patterns");
+    println!("  {b}stats{r}               Pattern counts, options, and audit log summary");
+    println!(
+        "  {b}post{r}                PostToolUse companion — reads breadcrumb, suggests allow"
+    );
+    println!("  {b}--version{r}           Print version and exit");
+    println!();
+
+    println!("{bold}Pattern files{r}  {d}(~/.clawband/){r}");
+    println!("  deny.patterns    Always block — appended to built-in deny list");
+    println!("  ask.patterns     Always prompt — appended to built-in ask list");
+    println!("  allow.patterns   Override any block — matching commands skip all checks");
+    println!();
+
+    println!("{bold}Options{r}  {d}(environment variables){r}");
+    println!("  RTK_ENABLED=1   Strip 'rtk'/'rtk proxy' prefix before matching");
+    println!("  SQZ_ENABLED=1   Strip 'sqz compress' suffix before matching");
+    println!("  CLAWBAND_LOG=1  Append every block/prompt to ~/.clawband.log");
+    println!("  CLAWBAND_SKIP=1 Bypass all checks (trusted wrapper scripts)");
+    println!();
+
+    println!("{bold}Decisions{r}");
+    println!("  {g}deny{r}   Hard-blocked — command is not executed");
+    println!("  {y}ask{r}    Prompts for approval before execution");
+    println!("  {d}pass   Silent — command runs without interruption{r}");
+    println!();
+
+    println!("{d}https://github.com/jamessoubry/clawband{r}\n");
+}
+
 // ─── Stats command ────────────────────────────────────────────────────────────
 
 fn cmd_stats() {
@@ -917,6 +967,10 @@ fn main() {
         }
         Some("--version") | Some("-v") => {
             println!("clawband v{}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some("help") | Some("--help") | Some("-h") => {
+            cmd_help();
             return;
         }
         _ => {}
