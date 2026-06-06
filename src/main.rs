@@ -621,6 +621,14 @@ fn cmd_stats() {
         file_status(allow_exists, user_allow)
     );
 
+    println!("\n{bold}Active protections{r}");
+    println!("  script file scanning     {g}on{r}  {d}(bash/sh/python/node/ruby/perl/lua/deno + input redirection){r}");
+    println!("  write-then-execute       {g}on{r}  {d}(same-file write+execute in one compound command){r}");
+    println!("  echo content scanning    {g}on{r}  {d}(echo/printf redirected to script file){r}");
+    println!(
+        "  subshell scanning        {g}on{r}  {d}($() and backtick inner-command evaluation){r}"
+    );
+
     println!("\n{bold}Options{r}");
     let flag = |on: bool| {
         if on {
