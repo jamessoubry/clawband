@@ -249,6 +249,35 @@
     .term-body .pass-out { color: var(--muted); }
     .term-body .comment  { color: var(--muted); }
 
+    /* ── Usage modes ── */
+    .modes-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      margin-top: 1.5rem;
+    }
+    @media (max-width: 640px) { .modes-grid { grid-template-columns: 1fr; } }
+    .mode-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5rem;
+    }
+    .mode-card.mode-a { border-top: 3px solid var(--blue); }
+    .mode-card.mode-b { border-top: 3px solid var(--orange); }
+    .mode-label {
+      font-size: .7rem;
+      font-weight: 700;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      margin-bottom: .5rem;
+    }
+    .mode-card.mode-a .mode-label { color: var(--blue); }
+    .mode-card.mode-b .mode-label { color: var(--orange); }
+    .mode-card h3 { font-size: 1.05rem; font-weight: 700; margin-bottom: .75rem; }
+    .mode-card p { font-size: .875rem; color: var(--muted); line-height: 1.6; }
+    .mode-card p + p { margin-top: .5rem; }
+
     /* ── Options ── */
     .options-grid {
       display: grid;
@@ -483,6 +512,28 @@
             <div class="deny-out">⛔ Blocked: 'rm -rf /' matched in: rm -rf /</div>
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Two ways to use it ────────────────────────────────────────────────────── -->
+<section>
+  <div class="container">
+    <h2>Tired of approval fatigue? Scared of going full YOLO?</h2>
+    <p style="color:var(--muted);font-size:1rem">This hook blocks what actually matters. Two ways to use it:</p>
+    <div class="modes-grid">
+      <div class="mode-card mode-a">
+        <div class="mode-label">Mode A — keep approvals on</div>
+        <h3>Reduce the noise, not the safety</h3>
+        <p>Keep Claude Code's permission prompts active. Use clawband to guarantee that no compound-command trick or bypass can sneak a destructive command through — even when Claude hallucinates or gets prompt-injected.</p>
+        <p>Add patterns you trust to your <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">allow.patterns</code> file to stop being asked about them. clawband still hard-blocks anything catastrophic — you just stop approving the same safe commands over and over.</p>
+      </div>
+      <div class="mode-card mode-b">
+        <div class="mode-label">Mode B — full YOLO</div>
+        <h3>Go autonomous, with guardrails</h3>
+        <p>Turn off all of Claude Code's permission prompts (<code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">bypassPermissions</code> mode). Your agent runs freely without grinding to a halt every few seconds.</p>
+        <p>clawband becomes your safety net — automatically blocking filesystem destruction, supply-chain attacks, and infra wipeouts before they execute. Semi-autonomous without the terror.</p>
       </div>
     </div>
   </div>
