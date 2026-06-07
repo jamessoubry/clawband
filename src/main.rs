@@ -620,57 +620,88 @@ fn hook_command_string() -> String {
     "clawband".to_string()
 }
 
-// Returns true if a PreToolUse Bash hook for clawband is already registered.
+// Precisely identifies the clawband MAIN hook command — by executable basename,
+// not substring. Excludes the `clawband post` companion. Robust against paths
+// that happen to contain "icm"/"sqz" and against bare vs absolute forms.
+fn is_clawband_main_command(cmd: &str) -> bool {
+    let mut toks = cmd.split_whitespace();
+    let Some(first) = toks.next() else {
+        return false;
+    };
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if base != "clawband" {
+        return false;
+    }
+    // `clawband post` is the PostToolUse companion, not the main hook
+    toks.next() != Some("post")
+}
+
+// Returns true if at least one clawband main hook is registered anywhere in PreToolUse.
 fn clawband_hook_present(settings: &serde_json::Value) -> bool {
     settings["hooks"]["PreToolUse"]
         .as_array()
         .map(|entries| {
             entries.iter().any(|e| {
                 e["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h["command"].as_str().is_some_and(|c| {
-                            c.contains("clawband")
-                                && !c.contains("icm")
-                                && !c.contains("sqz")
-                                && !c.contains(" post")
-                        })
-                    })
+                    hooks
+                        .iter()
+                        .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
                 })
             })
         })
         .unwrap_or(false)
 }
 
-// Add the PreToolUse Bash hook to a settings JSON value. Returns false if it
-// was already present (no change). Pure-ish: mutates the value, no I/O.
+// Register the clawband PreToolUse hook, normalising to exactly one instance.
+// - Removes every existing clawband main hook (self-heals duplicates), dropping
+//   any entry left empty.
+// - Re-adds a single hook: prepended into an existing `Bash` matcher entry if one
+//   exists (so clawband runs first and there's no parallel Bash section), else a
+//   new entry at the front.
+// Returns true if the resulting settings differ from the input (i.e. a write is
+// warranted), false if it was already correct (idempotent).
 fn register_hook(settings: &mut serde_json::Value, command: &str) -> bool {
-    if clawband_hook_present(settings) {
-        return false;
-    }
-    use serde_json::{json, Value};
+    use serde_json::json;
     if !settings.is_object() {
         *settings = json!({});
     }
     let obj = settings.as_object_mut().unwrap();
-    let hooks = obj
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .map(|h| h.entry("PreToolUse").or_insert_with(|| json!([])));
-    let entry = json!({
-        "matcher": "Bash",
-        "hooks": [{"type": "command", "command": command}]
-    });
-    if let Some(pre) = hooks {
-        if let Some(arr) = pre.as_array_mut() {
-            arr.insert(0, entry);
-            return true;
-        }
-        // PreToolUse existed but wasn't an array — replace it
-        *pre = Value::Array(vec![entry]);
-        return true;
+    let hooks_obj = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks_obj.is_object() {
+        *hooks_obj = json!({});
     }
-    false
+    let pre_val = hooks_obj
+        .as_object_mut()
+        .unwrap()
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]));
+    if !pre_val.is_array() {
+        *pre_val = json!([]);
+    }
+    let before = pre_val.clone();
+    let pre = pre_val.as_array_mut().unwrap();
+
+    // Strip all existing clawband main hooks from every entry.
+    for entry in pre.iter_mut() {
+        if let Some(hs) = entry["hooks"].as_array_mut() {
+            hs.retain(|h| !h["command"].as_str().is_some_and(is_clawband_main_command));
+        }
+    }
+    // Drop entries whose hooks array is now empty (e.g. a former clawband-only entry).
+    pre.retain(|e| e["hooks"].as_array().map(|h| !h.is_empty()).unwrap_or(true));
+
+    let hook = json!({"type": "command", "command": command});
+    // Prefer merging into an existing Bash matcher entry over a parallel section.
+    if let Some(bash) = pre
+        .iter_mut()
+        .find(|e| e["matcher"].as_str() == Some("Bash") && e["hooks"].is_array())
+    {
+        bash["hooks"].as_array_mut().unwrap().insert(0, hook);
+    } else {
+        pre.insert(0, json!({"matcher": "Bash", "hooks": [hook]}));
+    }
+
+    *pre_val != before
 }
 
 fn cmd_install() {
@@ -1811,7 +1842,8 @@ mod tests {
     }
 
     #[test]
-    fn register_hook_preserves_existing_hooks() {
+    fn register_hook_merges_into_existing_bash_entry() {
+        // Existing Bash entry with another tool — clawband joins it, NOT a parallel section.
         let mut s = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
@@ -1821,11 +1853,72 @@ mod tests {
         });
         assert!(register_hook(&mut s, "clawband"));
         let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        // icm hook must still be present
-        assert!(arr
+        assert_eq!(arr.len(), 1, "should not create a second Bash section");
+        let hooks = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0]["command"].as_str(), Some("clawband"));
+        assert_eq!(
+            hooks[1]["command"].as_str(),
+            Some("/usr/local/bin/icm hook pre")
+        );
+    }
+
+    #[test]
+    fn register_hook_self_heals_duplicate_clawband_sections() {
+        // The reported bug: clawband present in two places. install collapses to one.
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/.claude/hooks/clawband"}]},
+                    {"matcher": "Bash", "hooks": [
+                        {"type": "command", "command": "clawband"},
+                        {"type": "command", "command": "/usr/local/bin/icm hook pre"}
+                    ]}
+                ]
+            }
+        });
+        assert!(register_hook(&mut s, "clawband"));
+        let count: usize = s["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|e| e["hooks"][0]["command"].as_str() == Some("/usr/local/bin/icm hook pre")));
+            .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+            .filter(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
+            .count();
+        assert_eq!(count, 1);
+        let icm = s["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+            .any(|h| h["command"].as_str() == Some("/usr/local/bin/icm hook pre"));
+        assert!(icm);
+    }
+
+    #[test]
+    fn register_hook_idempotent_when_already_correct() {
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [
+                        {"type": "command", "command": "clawband"},
+                        {"type": "command", "command": "/usr/local/bin/icm hook pre"}
+                    ]}
+                ]
+            }
+        });
+        assert!(!register_hook(&mut s, "clawband"), "no change expected");
+    }
+
+    #[test]
+    fn is_clawband_main_command_cases() {
+        assert!(is_clawband_main_command("clawband"));
+        assert!(is_clawband_main_command("~/.claude/hooks/clawband"));
+        assert!(is_clawband_main_command("/opt/homebrew/bin/clawband"));
+        assert!(!is_clawband_main_command("~/.claude/hooks/clawband post"));
+        assert!(!is_clawband_main_command("/usr/local/bin/icm hook pre"));
+        assert!(!is_clawband_main_command("/x/sqz hook claude"));
+        assert!(is_clawband_main_command("/home/u/sqz-tools/clawband"));
     }
 
     #[test]
