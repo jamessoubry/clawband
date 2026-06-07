@@ -66,9 +66,11 @@ The installer downloads the latest pre-built binary for your platform (Linux x86
 
 ```sh
 brew install jamessoubry/clawband/clawband
+clawband install   # wires the hook into ~/.claude/settings.json + seeds config
+clawband verify    # confirm it's active
 ```
 
-Homebrew installs the `clawband` binary onto your `PATH` but does **not** wire it into Claude Code — follow the hook-registration step in [Manual installation](#manual-installation) afterwards (`brew info clawband` prints the exact snippet). Upgrade with `brew upgrade clawband`.
+Homebrew installs the `clawband` binary onto your `PATH` but does **not** wire it into Claude Code. `clawband install` does that step (creates `~/.clawband/` pattern files and registers the `PreToolUse` hook). Then run `/hooks` in Claude Code (or restart). Upgrade with `brew upgrade clawband`.
 
 ### Manual installation
 
@@ -170,6 +172,8 @@ git reset --hard HEAD$
 ## CLI commands
 
 ```sh
+clawband install                      # wire the hook into ~/.claude/settings.json + seed config
+clawband verify                       # check the hook is registered and the engine works
 clawband allow '<pattern>'            # append to ~/.clawband/allow.patterns (global)
 clawband allow --project '<pattern>'  # append to .clawband/allow.patterns (project CWD)
 clawband deny  '<pattern>'            # append to ~/.clawband/deny.patterns (global)
@@ -177,6 +181,8 @@ clawband deny  --project '<pattern>'  # append to .clawband/deny.patterns (proje
 clawband stats                        # show pattern counts and audit log summary
 clawband --version
 ```
+
+`clawband install` is idempotent — it won't duplicate the hook if it's already registered, and it preserves any other hooks (icm, sqz, etc.) already in your settings. `clawband verify` runs a self-test that feeds a known-destructive command through the engine to confirm it actually blocks, and exits non-zero if anything is misconfigured (handy in CI or a dotfiles bootstrap).
 
 Patterns are validated as regexes before writing. The install script also adds `/allow` and `/deny` Claude Code slash commands so you can add patterns without leaving the chat.
 

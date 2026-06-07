@@ -75,21 +75,23 @@ impl Pattern {
 fn builtin_deny() -> Vec<Pattern> {
     let specs: &[(&str, &str)] = &[
         // File system destruction — handles any flag ordering: -rf, -fr, -r -f, -f -r
+        // Also handles preceding flags (e.g. --no-preserve-root, -v) and no-space
+        // glob/tilde anchors (e.g. rm -rf/* and rm -rf~).
         (
             "rm -rf /",
-            r"\brm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s+/",
+            r"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*/",
         ),
         (
             "rm -rf ~",
-            r"\brm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s+~",
+            r"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*~",
         ),
         (
             "rm -rf $HOME",
-            r"\brm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s+\$HOME",
+            r"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*\$HOME",
         ),
         (
             "sudo rm -rf",
-            r"\bsudo\s+rm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)",
+            r"\bsudo\s+rm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)",
         ),
         ("mkfs", r"\bmkfs\b"),
         ("dd if=", r"\bdd\s+if="),
@@ -582,6 +584,238 @@ fn cmd_add_pattern(file: &str, args: &[String]) {
     }
 }
 
+// ─── Install / verify ─────────────────────────────────────────────────────────
+
+const DENY_EXAMPLE: &str = include_str!("../deny.patterns.example");
+const ASK_EXAMPLE: &str = include_str!("../ask.patterns.example");
+const ALLOW_TEMPLATE: &str = "# allow.patterns — patterns that override deny/ask blocks\n\
+# One pattern per line. Case-insensitive regex. Lines starting with # ignored.\n\
+#\n\
+# Example: allow git reset --hard only to HEAD\n\
+# git reset --hard HEAD$\n";
+
+fn settings_path() -> PathBuf {
+    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".claude/settings.json")
+}
+
+// The command string to register in settings.json. Prefer the bare name when
+// clawband is resolvable on PATH (stable across Homebrew upgrades); otherwise
+// fall back to the absolute path of the running binary.
+fn hook_command_string() -> String {
+    if let Ok(exe) = env::current_exe() {
+        if let Ok(canon_exe) = fs::canonicalize(&exe) {
+            if let Ok(path) = env::var("PATH") {
+                for dir in path.split(':') {
+                    let candidate = PathBuf::from(dir).join("clawband");
+                    if let Ok(canon) = fs::canonicalize(&candidate) {
+                        if canon == canon_exe {
+                            return "clawband".to_string();
+                        }
+                    }
+                }
+            }
+        }
+        return exe.to_string_lossy().into_owned();
+    }
+    "clawband".to_string()
+}
+
+// Returns true if a PreToolUse Bash hook for clawband is already registered.
+fn clawband_hook_present(settings: &serde_json::Value) -> bool {
+    settings["hooks"]["PreToolUse"]
+        .as_array()
+        .map(|entries| {
+            entries.iter().any(|e| {
+                e["hooks"].as_array().is_some_and(|hooks| {
+                    hooks.iter().any(|h| {
+                        h["command"].as_str().is_some_and(|c| {
+                            c.contains("clawband")
+                                && !c.contains("icm")
+                                && !c.contains("sqz")
+                                && !c.contains(" post")
+                        })
+                    })
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+// Add the PreToolUse Bash hook to a settings JSON value. Returns false if it
+// was already present (no change). Pure-ish: mutates the value, no I/O.
+fn register_hook(settings: &mut serde_json::Value, command: &str) -> bool {
+    if clawband_hook_present(settings) {
+        return false;
+    }
+    use serde_json::{json, Value};
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let obj = settings.as_object_mut().unwrap();
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .map(|h| h.entry("PreToolUse").or_insert_with(|| json!([])));
+    let entry = json!({
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": command}]
+    });
+    if let Some(pre) = hooks {
+        if let Some(arr) = pre.as_array_mut() {
+            arr.insert(0, entry);
+            return true;
+        }
+        // PreToolUse existed but wasn't an array — replace it
+        *pre = Value::Array(vec![entry]);
+        return true;
+    }
+    false
+}
+
+fn cmd_install() {
+    let g = "\x1b[32m";
+    let y = "\x1b[33m";
+    let d = "\x1b[2m";
+    let r = "\x1b[0m";
+    let bold = "\x1b[1m";
+
+    // 1. Config dir + pattern templates
+    let cfg = config_dir();
+    let _ = fs::create_dir_all(&cfg);
+    let seed = |name: &str, content: &str| {
+        let p = cfg.join(name);
+        if p.exists() {
+            println!("  {d}exists{r}  {}", p.display());
+        } else if fs::write(&p, content).is_ok() {
+            println!("  {g}created{r} {}", p.display());
+        } else {
+            println!("  {y}failed{r} {}", p.display());
+        }
+    };
+    println!("{bold}Config{r}");
+    seed("deny.patterns", DENY_EXAMPLE);
+    seed("ask.patterns", ASK_EXAMPLE);
+    seed("allow.patterns", ALLOW_TEMPLATE);
+
+    // 2. Wire settings.json
+    println!("\n{bold}Hook{r}");
+    let path = settings_path();
+    let _ = fs::create_dir_all(path.parent().unwrap_or(&PathBuf::from(".")));
+    let mut settings: serde_json::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let command = hook_command_string();
+    if register_hook(&mut settings, &command) {
+        match serde_json::to_string_pretty(&settings) {
+            Ok(out) => {
+                if fs::write(&path, out + "\n").is_ok() {
+                    println!(
+                        "  {g}registered{r} PreToolUse Bash hook → {d}{}{r}",
+                        command
+                    );
+                    println!("  {d}in {}{r}", path.display());
+                } else {
+                    println!("  {y}failed to write {}{r}", path.display());
+                }
+            }
+            Err(_) => println!("  {y}failed to serialize settings{r}"),
+        }
+    } else {
+        println!("  {d}already registered in {}{r}", path.display());
+    }
+
+    println!("\n{g}Done.{r} Run {bold}/hooks{r} in Claude Code (or restart) to activate.");
+    println!("{d}Verify anytime with: clawband verify{r}");
+}
+
+fn cmd_verify() -> i32 {
+    let g = "\x1b[32m";
+    let y = "\x1b[33m";
+    let red = "\x1b[31m";
+    let d = "\x1b[2m";
+    let r = "\x1b[0m";
+    let bold = "\x1b[1m";
+    let ok = format!("{g}✓{r}");
+    let warn = format!("{y}!{r}");
+    let bad = format!("{red}✗{r}");
+
+    let mut failures = 0;
+    println!("\n{bold}clawband verify{r}\n");
+
+    // 1. Binary
+    match env::current_exe() {
+        Ok(p) => println!("  {ok} binary: {d}{}{r}", p.display()),
+        Err(_) => {
+            println!("  {bad} binary: could not resolve path");
+            failures += 1;
+        }
+    }
+
+    // 2. settings.json hook
+    let sp = settings_path();
+    let settings: Option<serde_json::Value> = fs::read_to_string(&sp)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    match &settings {
+        Some(v) if clawband_hook_present(v) => {
+            println!("  {ok} hook registered in {d}{}{r}", sp.display())
+        }
+        Some(_) => {
+            println!("  {bad} hook NOT registered — run: clawband install");
+            failures += 1;
+        }
+        None => {
+            println!("  {bad} {} missing or invalid JSON", sp.display());
+            failures += 1;
+        }
+    }
+
+    // 3. Config dir
+    let cfg = config_dir();
+    if cfg.exists() {
+        println!("  {ok} config dir: {d}{}{r}", cfg.display());
+    } else {
+        println!(
+            "  {warn} no config dir at {} {d}(built-in patterns still active){r}",
+            cfg.display()
+        );
+    }
+
+    // 4. CLAWBAND_SKIP
+    if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
+        println!("  {bad} {red}{bold}CLAWBAND_SKIP=1 — ALL CHECKS DISABLED{r}");
+        failures += 1;
+    } else {
+        println!("  {ok} CLAWBAND_SKIP not set");
+    }
+
+    // 5. Self-test: prove the engine blocks and passes correctly
+    let dp = builtin_deny();
+    let ap = builtin_ask();
+    let no_allow: Vec<Pattern> = vec![];
+    let blocks = check_command("rm -rf /", &dp, &ap, &no_allow)
+        .map(|(d, _)| d == "deny")
+        .unwrap_or(false);
+    let passes = check_command("ls -la", &dp, &ap, &no_allow).is_none();
+    if blocks && passes {
+        println!("  {ok} self-test: engine blocks destructive + passes safe commands");
+    } else {
+        println!("  {bad} self-test FAILED (blocks={blocks}, passes={passes})");
+        failures += 1;
+    }
+
+    if failures == 0 {
+        println!("\n{g}{bold}All checks passed.{r} clawband is active.\n");
+        0
+    } else {
+        println!("\n{red}{bold}{failures} check(s) failed.{r} See above.\n");
+        1
+    }
+}
+
 // ─── Help command ─────────────────────────────────────────────────────────────
 
 fn cmd_help() {
@@ -603,6 +837,10 @@ fn cmd_help() {
     println!("{bold}Commands{r}");
     println!("  {g}allow{r} {d}[--project] '<pattern>'{r}   Append a regex to allow.patterns");
     println!("  {y}deny{r}  {d}[--project] '<pattern>'{r}   Append a regex to deny.patterns");
+    println!("  {b}install{r}                     Wire the hook into ~/.claude/settings.json + seed config");
+    println!(
+        "  {b}verify{r}                      Check the hook is registered and the engine works"
+    );
     println!("  {b}stats{r}                       Pattern counts, options, and audit log summary");
     println!(
         "  {b}post{r}                        PostToolUse companion — reads breadcrumb, suggests allow"
@@ -1032,6 +1270,13 @@ fn main() {
             cmd_post();
             return;
         }
+        Some("install") => {
+            cmd_install();
+            return;
+        }
+        Some("verify") => {
+            std::process::exit(cmd_verify());
+        }
         Some("--version") | Some("-v") => {
             println!("clawband v{}", env!("CARGO_PKG_VERSION"));
             return;
@@ -1176,6 +1421,42 @@ mod tests {
     #[test]
     fn rm_rf_home_tilde_denied() {
         assert_eq!(decision("rm -rf ~/"), Some("deny".into()));
+    }
+
+    // ── bypass regression: no-space glob/tilde (Bug 1 & 2) ────────────────────
+
+    #[test]
+    fn rm_rf_glob_root_no_space_denied() {
+        // rm -rf/* — no whitespace between flag and path anchor
+        assert_eq!(decision("rm -rf/*"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_tilde_no_space_denied() {
+        // rm -rf~ — no whitespace between flag and tilde anchor
+        assert_eq!(decision("rm -rf~"), Some("deny".into()));
+    }
+
+    // ── bypass regression: preceding flags (Bug 3 & 4) ────────────────────────
+
+    #[test]
+    fn rm_no_preserve_root_rf_denied() {
+        // preceding long flag before -rf
+        assert_eq!(decision("rm --no-preserve-root -rf /"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_v_rf_root_denied() {
+        // preceding short flag before -rf
+        assert_eq!(decision("rm -v -rf /"), Some("deny".into()));
+    }
+
+    // ── regression: safe rm must still pass ───────────────────────────────────
+
+    #[test]
+    fn rm_rf_specific_file_passes() {
+        // No dangerous path anchor — must not be blocked
+        assert_eq!(decision("rm -rf file.txt"), None);
     }
 
     #[test]
@@ -1510,5 +1791,66 @@ mod tests {
             ),
             Some("deny".into())
         );
+    }
+
+    // ── install: register_hook ─────────────────────────────────────────────────
+
+    #[test]
+    fn register_hook_into_empty_settings() {
+        let mut s = serde_json::json!({});
+        assert!(register_hook(&mut s, "/usr/local/bin/clawband"));
+        assert!(clawband_hook_present(&s));
+    }
+
+    #[test]
+    fn register_hook_is_idempotent() {
+        let mut s = serde_json::json!({});
+        assert!(register_hook(&mut s, "clawband"));
+        // Second call detects existing hook and makes no change
+        assert!(!register_hook(&mut s, "clawband"));
+    }
+
+    #[test]
+    fn register_hook_preserves_existing_hooks() {
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/icm hook pre"}]}
+                ]
+            }
+        });
+        assert!(register_hook(&mut s, "clawband"));
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // icm hook must still be present
+        assert!(arr
+            .iter()
+            .any(|e| e["hooks"][0]["command"].as_str() == Some("/usr/local/bin/icm hook pre")));
+    }
+
+    #[test]
+    fn clawband_hook_not_confused_by_icm_or_sqz() {
+        let s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/x/icm hook pre"}]},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/x/sqz hook claude"}]}
+                ]
+            }
+        });
+        assert!(!clawband_hook_present(&s));
+    }
+
+    #[test]
+    fn clawband_post_hook_not_counted_as_main_hook() {
+        // The PostToolUse "clawband post" companion should not satisfy the main hook check
+        let s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/.claude/hooks/clawband post"}]}
+                ]
+            }
+        });
+        assert!(!clawband_hook_present(&s));
     }
 }
