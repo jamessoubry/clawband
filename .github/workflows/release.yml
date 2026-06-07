@@ -1,5 +1,12 @@
 name: Release
 
+# Tagging vX.Y.Z builds binaries, publishes a GitHub release, and bumps the
+# Homebrew tap (jamessoubry/homebrew-clawband).
+#
+# The tap bump requires a repo secret HOMEBREW_TAP_TOKEN: a fine-grained PAT
+# with Contents: read & write on jamessoubry/homebrew-clawband. If the secret
+# is absent the bump step is skipped (the release still succeeds).
+
 on:
   push:
     tags:
@@ -83,3 +90,57 @@ jobs:
             clawband-linux-x86_64
             clawband-macos-x86_64
             clawband-macos-arm64
+
+  bump-formula:
+    name: Bump Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Check for tap token
+        id: gate
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "Tap token not set — skipping formula bump."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout clawband (for gen-formula.sh)
+        if: steps.gate.outputs.present == 'true'
+        uses: actions/checkout@v4
+
+      - name: Download release binaries
+        if: steps.gate.outputs.present == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate and push formula
+        if: steps.gate.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+
+          sha() { sha256sum "$1" | cut -d' ' -f1; }
+          SHA_MAC_ARM="$(sha clawband-macos-arm64)"
+          SHA_MAC_X86="$(sha clawband-macos-x86_64)"
+          SHA_LINUX_X86="$(sha clawband-linux-x86_64)"
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/jamessoubry/homebrew-clawband.git" tap
+          bash scripts/gen-formula.sh "$VERSION" "$SHA_MAC_ARM" "$SHA_MAC_X86" "$SHA_LINUX_X86" \
+            > tap/Formula/clawband.rb
+
+          cd tap
+          if git diff --quiet; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/clawband.rb
+          git commit -m "clawband ${VERSION}"
+          git push origin master
