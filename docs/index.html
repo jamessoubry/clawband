@@ -3,11 +3,53 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>clawband — guard Claude Code's bash tool</title>
-  <meta name="description" content="A Claude Code PreToolUse hook that blocks destructive shell commands before they execute.">
-  <meta property="og:title" content="clawband">
-  <meta property="og:description" content="A rubber band around Claude's claws. Guards Claude Code's Bash tool against destructive shell commands.">
+  <title>clawband — safely run Claude Code in YOLO mode (bypassPermissions)</title>
+  <meta name="description" content="clawband is a Claude Code PreToolUse hook that blocks destructive shell commands like rm -rf before they run — so you can safely use --dangerously-skip-permissions / bypassPermissions and stop approving every command.">
+  <meta name="keywords" content="claude code, bypassPermissions, dangerously-skip-permissions, PreToolUse hook, claude code safety, stop claude rm -rf, claude code approval fatigue, claude code yolo mode">
+  <meta property="og:title" content="clawband — safely run Claude Code in YOLO mode">
+  <meta property="og:description" content="A rubber band around Claude's claws. Blocks rm -rf and other destructive commands before they run, so bypassPermissions mode is actually safe.">
   <meta property="og:image" content="https://jamessoubry.github.io/clawband/logo.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Is it safe to run Claude Code with --dangerously-skip-permissions / bypassPermissions?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "On its own, no — that mode lets the agent run any shell command with no confirmation, so a single hallucinated or prompt-injected rm -rf can wipe your files. clawband makes it far safer: it runs as a PreToolUse hook that hard-blocks catastrophic commands before they execute, regardless of permission mode."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How do I stop Claude Code from running rm -rf or other destructive commands?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Install clawband as a PreToolUse hook. It intercepts every Bash command and denies known-destructive ones (rm -rf /, mkfs, dd, git push --force, pipe-to-shell, and 70+ more) before they run. Unlike Claude Code's built-in deny list, it splits compound commands so 'ls && rm -rf /' is still caught."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Claude Code keeps asking me to approve every command — how do I reduce the prompts without losing safety?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Keep approvals on and add trusted commands to clawband's allow.patterns so you stop being asked about them; or turn approvals off entirely (bypassPermissions) and let clawband hard-block only the genuinely dangerous commands."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How is clawband different from Claude Code's built-in permission deny list?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "The built-in deny list matches the whole command as a glob and never looks inside a compound command, so 'echo hi && rm -rf /' sails through. clawband splits on &&, ||, and ;, scans script files before execution, inspects subshells, and catches write-then-execute tricks."
+        }
+      }
+    ]
+  }
+  </script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -391,6 +433,25 @@
       color: #e6edf3;
     }
 
+    /* ── FAQ ── */
+    .faq-item { margin-bottom: 1.75rem; }
+    .faq-item:last-child { margin-bottom: 0; }
+    .faq-q {
+      font-size: 1.05rem;
+      font-weight: 700;
+      margin-bottom: .5rem;
+      color: var(--text);
+    }
+    .faq-a { font-size: .95rem; color: var(--muted); }
+    .faq-a code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: .82rem;
+      background: var(--code-bg);
+      padding: .1em .4em;
+      border-radius: 4px;
+      color: var(--blue);
+    }
+
     /* ── Footer ── */
     footer {
       border-top: 1px solid var(--border);
@@ -759,6 +820,38 @@
         <code>SQZ_ENABLED=1</code>
         <p>Works with the <a href="https://github.com/ojuschugh1/sqz" target="_blank">sqz</a> tool by stripping the <code style="font-size:.82rem">2>&1 | sqz compress</code> suffix appended to commands before evaluating them.</p>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── FAQ ───────────────────────────────────────────────────────────────────── -->
+<section>
+  <div class="container">
+    <h2>FAQ</h2>
+
+    <div class="faq-item">
+      <div class="faq-q">Is it safe to run Claude Code with <code style="font-size:.85rem">--dangerously-skip-permissions</code> / <code style="font-size:.85rem">bypassPermissions</code>?</div>
+      <div class="faq-a">On its own, no — that mode lets the agent run any shell command with no confirmation, so a single hallucinated or prompt-injected <code>rm -rf</code> can wipe your files. clawband makes it far safer: it runs as a <code>PreToolUse</code> hook that hard-blocks catastrophic commands before they execute, regardless of permission mode. Many people run bypassPermissions specifically <em>because</em> clawband is the backstop.</div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">How do I stop Claude Code from running <code style="font-size:.85rem">rm -rf</code> or other destructive commands?</div>
+      <div class="faq-a">Install clawband as a PreToolUse hook. It intercepts every Bash command and denies known-destructive ones (<code>rm -rf /</code>, <code>mkfs</code>, <code>dd</code>, <code>git push --force</code>, pipe-to-shell, and 70+ more) before they run. Unlike Claude Code's built-in deny list, it splits compound commands so <code>ls &amp;&amp; rm -rf /</code> is still caught.</div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">Claude Code keeps asking me to approve every command — how do I reduce the prompts without losing safety?</div>
+      <div class="faq-a">That's "approval fatigue." Two options: keep approvals on and add commands you trust to clawband's <code>allow.patterns</code> so you stop being asked about them; or turn approvals off entirely (bypassPermissions) and let clawband hard-block only the genuinely dangerous commands. Either way you stop rubber-stamping safe commands while staying protected from catastrophic ones.</div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">How is this different from Claude Code's built-in permission deny list?</div>
+      <div class="faq-a">The built-in deny list matches the whole command as a glob, so it never looks inside a compound command — <code>echo hi &amp;&amp; rm -rf /</code> sails through. clawband splits on <code>&amp;&amp;</code>, <code>||</code>, and <code>;</code>, scans script files before execution, inspects subshells, and catches write-then-execute tricks. It's a real parser, not a string match.</div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">Does clawband send my commands anywhere?</div>
+      <div class="faq-a">No. It's a single self-contained Rust binary that runs locally, reads the command from stdin, and returns a decision. No network, no telemetry, no dependencies at runtime.</div>
     </div>
   </div>
 </section>
