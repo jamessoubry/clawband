@@ -584,6 +584,121 @@ fn cmd_add_pattern(file: &str, args: &[String]) {
     }
 }
 
+// ─── Protected-paths config ───────────────────────────────────────────────────
+
+/// Expand a leading `~/` or `~` to `$HOME/`.
+fn expand_home(s: &str) -> String {
+    let home = env::var("HOME").unwrap_or_default();
+    if let Some(rest) = s.strip_prefix("~/") {
+        format!("{}/{}", home, rest)
+    } else if s == "~" {
+        home
+    } else {
+        s.to_string()
+    }
+}
+
+/// Load protect.paths from a directory.  Each line is a case-insensitive regex
+/// matched against the absolute target file path.  A leading `~/` is expanded
+/// to `$HOME/` before compilation.
+fn load_protect_patterns(dir: &std::path::Path) -> Vec<Pattern> {
+    let path = dir.join("protect.paths");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return vec![];
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(expand_home)
+        .filter_map(|l| Pattern::from_user(&l))
+        .collect()
+}
+
+/// Collect protect patterns from global (~/.clawband/) and project (.clawband/)
+/// protect.paths files.
+fn protect_patterns() -> Vec<Pattern> {
+    let mut pats = load_protect_patterns(&config_dir());
+    if let Some(proj) = project_config_dir() {
+        pats.extend(load_protect_patterns(&proj));
+    }
+    pats
+}
+
+/// Returns true if at least one protect.paths file exists (global or project).
+fn protect_active() -> bool {
+    let global = config_dir().join("protect.paths");
+    if global.exists() {
+        return true;
+    }
+    if let Some(proj) = project_config_dir() {
+        if proj.join("protect.paths").exists() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check whether an edit target path matches any protect pattern.
+/// Pure helper (testable without env/FS — pass patterns in directly).
+fn edit_protected(path: &str, pats: &[Pattern]) -> bool {
+    pats.iter().any(|p| p.matches(path))
+}
+
+/// Self-protect deny patterns added to the Bash check when protect_active().
+/// These block shell commands that would tamper with clawband's own files.
+/// They are anchored to specific file locations so they do NOT match
+/// `brew upgrade clawband`, `clawband install`, or `bash install.sh`.
+fn self_protect_deny_patterns() -> Vec<Pattern> {
+    let specs: &[(&str, &str)] = &[
+        // rm / mv / shred / truncate referencing clawband files
+        (
+            "rm clawband hook",
+            r"\b(?:rm|mv|shred)\b[^|;&\n]*\.claude/hooks/clawband\b",
+        ),
+        (
+            "rm clawband settings",
+            r"\b(?:rm|mv|shred)\b[^|;&\n]*\.claude/settings\.json\b",
+        ),
+        (
+            "rm clawband dir",
+            r"\b(?:rm|mv|shred|truncate)\b[^|;&\n]*\.clawband/",
+        ),
+        (
+            "truncate clawband hook",
+            r"\btruncate\b[^|;&\n]*\.claude/hooks/clawband\b",
+        ),
+        (
+            "truncate clawband settings",
+            r"\btruncate\b[^|;&\n]*\.claude/settings\.json\b",
+        ),
+        // Output redirection > or >> to clawband files
+        (
+            "redirect to clawband hook",
+            r">+\s*[^\n]*\.claude/hooks/clawband\b",
+        ),
+        (
+            "redirect to clawband settings",
+            r">+\s*[^\n]*\.claude/settings\.json\b",
+        ),
+        // sed -i targeting settings.json
+        (
+            "sed -i clawband settings",
+            r"\bsed\b[^|;&\n]*-i[^|;&\n]*\.claude/settings\.json\b",
+        ),
+        // tee targeting settings.json
+        (
+            "tee clawband settings",
+            r"\btee\b[^|;&\n]*\.claude/settings\.json\b",
+        ),
+        // chmod -x removing execute from the hook binary
+        (
+            "chmod -x clawband hook",
+            r"\bchmod\b[^|;&\n]*-[a-zA-Z]*x[^|;&\n]*\.claude/hooks/clawband\b",
+        ),
+    ];
+    specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
+}
+
 // ─── Install / verify ─────────────────────────────────────────────────────────
 
 const DENY_EXAMPLE: &str = include_str!("../deny.patterns.example");
@@ -593,6 +708,14 @@ const ALLOW_TEMPLATE: &str = "# allow.patterns — patterns that override deny/a
 #\n\
 # Example: allow git reset --hard only to HEAD\n\
 # git reset --hard HEAD$\n";
+
+const PROTECT_PATHS_TEMPLATE: &str =
+    "# protect.paths — clawband denies Write/Edit (and tamper Bash ops) on matching paths.\n\
+# One regex per line, matched case-insensitively against the absolute file path.\n\
+# A leading ~/ is expanded to your home directory.\n\
+~/.claude/settings\\.json$\n\
+~/.claude/hooks/clawband$\n\
+~/.clawband/.*\n";
 
 fn settings_path() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_default()).join(".claude/settings.json")
@@ -704,7 +827,72 @@ fn register_hook(settings: &mut serde_json::Value, command: &str) -> bool {
     *pre_val != before
 }
 
-fn cmd_install() {
+/// Register a second PreToolUse hook entry with matcher "Write|Edit|MultiEdit|NotebookEdit"
+/// pointing at the same clawband main command.  Idempotent — does nothing if an entry
+/// whose matcher contains "Edit" already has a clawband main command.
+/// Returns true if the settings were modified.
+fn register_edit_hook(settings: &mut serde_json::Value, command: &str) -> bool {
+    use serde_json::json;
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let obj = settings.as_object_mut().unwrap();
+    let hooks_obj = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks_obj.is_object() {
+        *hooks_obj = json!({});
+    }
+    let pre_val = hooks_obj
+        .as_object_mut()
+        .unwrap()
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]));
+    if !pre_val.is_array() {
+        *pre_val = json!([]);
+    }
+    let before = pre_val.clone();
+    let pre = pre_val.as_array_mut().unwrap();
+
+    // Check if an entry with an "Edit"-containing matcher already has a clawband main command.
+    let already = pre.iter().any(|e| {
+        let matcher = e["matcher"].as_str().unwrap_or("");
+        matcher.contains("Edit")
+            && e["hooks"].as_array().is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
+            })
+    });
+    if already {
+        return false;
+    }
+
+    let hook = json!({"type": "command", "command": command});
+    pre.push(json!({"matcher": "Write|Edit|MultiEdit|NotebookEdit", "hooks": [hook]}));
+
+    *pre_val != before
+}
+
+/// Returns true if the Write|Edit|MultiEdit|NotebookEdit protect hook is registered.
+fn edit_hook_present(settings: &serde_json::Value) -> bool {
+    settings["hooks"]["PreToolUse"]
+        .as_array()
+        .map(|entries| {
+            entries.iter().any(|e| {
+                let matcher = e["matcher"].as_str().unwrap_or("");
+                matcher.contains("Edit")
+                    && e["hooks"].as_array().is_some_and(|hooks| {
+                        hooks
+                            .iter()
+                            .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
+                    })
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn cmd_install(extra_args: &[String]) {
+    let protect = extra_args.iter().any(|a| a == "--protect");
+
     let g = "\x1b[32m";
     let y = "\x1b[33m";
     let d = "\x1b[2m";
@@ -756,6 +944,56 @@ fn cmd_install() {
         }
     } else {
         println!("  {d}already registered in {}{r}", path.display());
+    }
+
+    // 3. Self-protect (--protect flag)
+    if protect {
+        println!("\n{bold}Self-protect{r}");
+
+        // Seed protect.paths if missing
+        let pp = cfg.join("protect.paths");
+        if pp.exists() {
+            println!("  {d}exists{r}  {}", pp.display());
+        } else if fs::write(&pp, PROTECT_PATHS_TEMPLATE).is_ok() {
+            println!("  {g}created{r} {}", pp.display());
+        } else {
+            println!("  {y}failed{r} to create {}", pp.display());
+        }
+
+        // Re-read settings (may have been written above)
+        let mut settings2: serde_json::Value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        if register_edit_hook(&mut settings2, &command) {
+            match serde_json::to_string_pretty(&settings2) {
+                Ok(out) => {
+                    if fs::write(&path, out + "\n").is_ok() {
+                        println!(
+                            "  {g}registered{r} PreToolUse Write|Edit|MultiEdit|NotebookEdit hook → {d}{}{r}",
+                            command
+                        );
+                    } else {
+                        println!("  {y}failed to write {}{r}", path.display());
+                    }
+                }
+                Err(_) => println!("  {y}failed to serialize settings{r}"),
+            }
+        } else {
+            println!("  {d}edit hook already registered{r}");
+        }
+
+        println!();
+        println!("  Self-protect is now active.");
+        println!("  Claude's Write/Edit tools are guarded against modifying protected paths.");
+        println!("  Your own terminal is unaffected — only Claude Code's tools are guarded.");
+        println!(
+            "  Edit {}{}/protect.paths{r} to customise protected paths.",
+            d,
+            cfg.display(),
+            r = r
+        );
     }
 
     println!("\n{g}Done.{r} Run {bold}/hooks{r} in Claude Code (or restart) to activate.");
@@ -838,6 +1076,19 @@ fn cmd_verify() -> i32 {
         failures += 1;
     }
 
+    // 6. Self-protect status (informational — no failure if off)
+    let sp_paths_active = protect_active();
+    let sp_hook_active = settings.as_ref().map(edit_hook_present).unwrap_or(false);
+    if sp_paths_active && sp_hook_active {
+        println!("  {ok} self-protect: active (protect.paths + Write/Edit hook registered)");
+    } else if !sp_paths_active && !sp_hook_active {
+        println!("  {d}self-protect: off{r}  {d}(run: clawband install --protect to enable){r}");
+    } else {
+        println!(
+            "  {warn} self-protect: partial (paths_active={sp_paths_active}, edit_hook={sp_hook_active})"
+        );
+    }
+
     if failures == 0 {
         println!("\n{g}{bold}All checks passed.{r} clawband is active.\n");
         0
@@ -869,6 +1120,7 @@ fn cmd_help() {
     println!("  {g}allow{r} {d}[--project] '<pattern>'{r}   Append a regex to allow.patterns");
     println!("  {y}deny{r}  {d}[--project] '<pattern>'{r}   Append a regex to deny.patterns");
     println!("  {b}install{r}                     Wire the hook into ~/.claude/settings.json + seed config");
+    println!("  {b}install --protect{r}           Also enable self-protect (guard clawband files from edits)");
     println!(
         "  {b}verify{r}                      Check the hook is registered and the engine works"
     );
@@ -886,10 +1138,20 @@ fn cmd_help() {
     println!(
         "    allow.patterns             Override any block — matching commands skip all checks"
     );
+    println!("    protect.paths              Paths Claude cannot Write/Edit (one regex per line)");
     println!("  Project (.clawband/ in CWD)  Loaded in addition to global patterns");
     println!("    deny.patterns              Project-specific blocks");
     println!("    ask.patterns               Project-specific prompts");
     println!("    allow.patterns             Project-specific overrides");
+    println!("    protect.paths              Project-specific protected paths");
+    println!();
+
+    println!("{bold}Self-protection{r}  {d}(clawband install --protect){r}");
+    println!("  Registers a second hook for Write/Edit/MultiEdit/NotebookEdit tools.");
+    println!("  Any file matching a regex in protect.paths is denied.");
+    println!("  Bash tamper commands (rm/mv/redirect to clawband files) are also blocked.");
+    println!("  {d}Your own terminal is unaffected — only Claude Code's tools are guarded.{r}");
+    println!("  {d}Install/upgrade (brew upgrade clawband, bash install.sh) still works.{r}");
     println!();
 
     println!("{bold}Options{r}  {d}(environment variables){r}");
@@ -1302,7 +1564,7 @@ fn main() {
             return;
         }
         Some("install") => {
-            cmd_install();
+            cmd_install(&args[2..]);
             return;
         }
         Some("verify") => {
@@ -1322,25 +1584,74 @@ fn main() {
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
 
-    // Parse command from Claude Code hook JSON: {"tool_input": {"command": "..."}}
+    // Parse hook JSON: {"tool_name": "...", "tool_input": {...}}
     let v: serde_json::Value = match serde_json::from_str(&input) {
         Ok(v) => v,
         Err(_) => return,
-    };
-    let command = match v["tool_input"]["command"].as_str() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => return,
     };
 
     let log_enabled = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
 
     if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
         // Total bypass — leave an audit trail so a forgotten global skip is visible.
+        // We don't have a command string here yet, so use a placeholder for file tools.
+        let cmd_preview = v["tool_input"]["command"]
+            .as_str()
+            .unwrap_or("<non-bash tool>")
+            .to_string();
         if log_enabled {
-            log_action("skip", "CLAWBAND_SKIP=1 — all checks bypassed", &command);
+            log_action(
+                "skip",
+                "CLAWBAND_SKIP=1 — all checks bypassed",
+                &cmd_preview,
+            );
         }
         return;
     }
+
+    // ── Write/Edit/MultiEdit/NotebookEdit guard ──────────────────────────────
+    // These tools are only hooked when --protect was used at install time.
+    let tool_name = v["tool_name"].as_str().unwrap_or("");
+    if matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+        if !protect_active() {
+            return;
+        }
+        // Determine the target path key
+        let raw_path = if tool_name == "NotebookEdit" {
+            v["tool_input"]["notebook_path"].as_str()
+        } else {
+            v["tool_input"]["file_path"].as_str()
+        };
+        let Some(raw_path) = raw_path else {
+            return;
+        };
+
+        // Expand ~/ and resolve to absolute path
+        let expanded = expand_home(raw_path);
+        let abs_path = if std::path::Path::new(&expanded).is_absolute() {
+            expanded.clone()
+        } else {
+            let pwd = env::var("PWD").unwrap_or_default();
+            format!("{}/{}", pwd, expanded)
+        };
+
+        let pats = protect_patterns();
+        let protected = edit_protected(&abs_path, &pats) || edit_protected(raw_path, &pats);
+        if protected {
+            let reason = format!("clawband protects this path from edits: {}", abs_path);
+            if log_enabled {
+                log_action("deny", &reason, &abs_path);
+            }
+            output("deny", &reason);
+        }
+        return;
+    }
+
+    // ── Bash tool path ────────────────────────────────────────────────────────
+    let command = match v["tool_input"]["command"].as_str() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return,
+    };
 
     let rtk_enabled = env::var("RTK_ENABLED").as_deref() == Ok("1");
     let sqz_enabled = env::var("SQZ_ENABLED").as_deref() == Ok("1");
@@ -1367,6 +1678,11 @@ fn main() {
         deny_pats.extend(load_patterns(&proj.join("deny.patterns")));
         ask_pats.extend(load_patterns(&proj.join("ask.patterns")));
         allow_pats.extend(load_patterns(&proj.join("allow.patterns")));
+    }
+
+    // When self-protect is active, extend deny patterns with tamper-guard patterns.
+    if protect_active() {
+        deny_pats.extend(self_protect_deny_patterns());
     }
 
     let emit = |decision: &str, reason: &str| {
@@ -1945,5 +2261,240 @@ mod tests {
             }
         });
         assert!(!clawband_hook_present(&s));
+    }
+
+    // ── self-protect: edit_protected helper ───────────────────────────────────
+
+    fn make_protect_pats(raw_lines: &[&str]) -> Vec<Pattern> {
+        raw_lines
+            .iter()
+            .filter_map(|l| {
+                let expanded = if l.starts_with("~/") {
+                    // In tests we don't have a real HOME — substitute a fixed prefix
+                    format!("/home/testuser/{}", &l[2..])
+                } else {
+                    l.to_string()
+                };
+                Pattern::from_user(&expanded)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edit_protected_matches_exact_path() {
+        let pats = make_protect_pats(&[r"/home/testuser/\.claude/settings\.json$"]);
+        assert!(edit_protected(
+            "/home/testuser/.claude/settings.json",
+            &pats
+        ));
+    }
+
+    #[test]
+    fn edit_protected_unprotected_path_passes() {
+        let pats = make_protect_pats(&[r"/home/testuser/\.claude/settings\.json$"]);
+        assert!(!edit_protected("/home/testuser/projects/myfile.txt", &pats));
+    }
+
+    #[test]
+    fn edit_protected_clawband_dir_wildcard() {
+        let pats = make_protect_pats(&[r"/home/testuser/\.clawband/.*"]);
+        assert!(edit_protected(
+            "/home/testuser/.clawband/protect.paths",
+            &pats
+        ));
+        assert!(edit_protected(
+            "/home/testuser/.clawband/deny.patterns",
+            &pats
+        ));
+        assert!(!edit_protected("/home/testuser/other/file.txt", &pats));
+    }
+
+    #[test]
+    fn edit_protected_hook_binary() {
+        let pats = make_protect_pats(&[r"/home/testuser/\.claude/hooks/clawband$"]);
+        assert!(edit_protected(
+            "/home/testuser/.claude/hooks/clawband",
+            &pats
+        ));
+        assert!(!edit_protected(
+            "/home/testuser/.claude/hooks/other-tool",
+            &pats
+        ));
+    }
+
+    #[test]
+    fn expand_home_tilde_slash() {
+        // expand_home is tested with a real HOME env var
+        let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let expanded = expand_home("~/.claude/settings.json");
+        assert_eq!(expanded, format!("{}/.claude/settings.json", home));
+    }
+
+    #[test]
+    fn expand_home_no_tilde_unchanged() {
+        assert_eq!(
+            expand_home("/absolute/path/file.txt"),
+            "/absolute/path/file.txt"
+        );
+        assert_eq!(expand_home("relative/path"), "relative/path");
+    }
+
+    // ── self-protect: Bash tamper patterns ────────────────────────────────────
+
+    fn self_protect_deny() -> Vec<Pattern> {
+        self_protect_deny_patterns()
+    }
+
+    fn sp_decision(cmd: &str) -> Option<String> {
+        check_command(cmd, &self_protect_deny(), &[], &[]).map(|(d, _)| d.to_string())
+    }
+
+    #[test]
+    fn tamper_rm_hook_binary_denied() {
+        assert_eq!(
+            sp_decision("rm ~/.claude/hooks/clawband"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn tamper_mv_hook_binary_denied() {
+        assert_eq!(
+            sp_decision("mv ~/.claude/hooks/clawband /tmp/cb"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn tamper_rm_settings_denied() {
+        assert_eq!(
+            sp_decision("rm ~/.claude/settings.json"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn tamper_redirect_to_hook_denied() {
+        assert_eq!(
+            sp_decision("echo '' > ~/.claude/hooks/clawband"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn tamper_redirect_to_settings_denied() {
+        assert_eq!(
+            sp_decision("echo '{}' > ~/.claude/settings.json"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn tamper_sed_i_settings_denied() {
+        assert_eq!(
+            sp_decision("sed -i 's/clawband//' ~/.claude/settings.json"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn tamper_tee_settings_denied() {
+        assert_eq!(
+            sp_decision("cat /dev/null | tee ~/.claude/settings.json"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn tamper_chmod_remove_x_hook_denied() {
+        assert_eq!(
+            sp_decision("chmod -x ~/.claude/hooks/clawband"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn tamper_rm_clawband_dir_denied() {
+        assert_eq!(
+            sp_decision("rm -r ~/.clawband/deny.patterns"),
+            Some("deny".into())
+        );
+    }
+
+    // ── self-protect: legitimate install/upgrade must NOT be blocked ──────────
+
+    #[test]
+    fn brew_upgrade_clawband_passes() {
+        assert_eq!(sp_decision("brew upgrade clawband"), None);
+    }
+
+    #[test]
+    fn brew_install_clawband_passes() {
+        assert_eq!(
+            sp_decision("brew install jamessoubry/clawband/clawband"),
+            None
+        );
+    }
+
+    #[test]
+    fn clawband_install_passes() {
+        assert_eq!(sp_decision("clawband install"), None);
+    }
+
+    #[test]
+    fn clawband_install_protect_passes() {
+        assert_eq!(sp_decision("clawband install --protect"), None);
+    }
+
+    #[test]
+    fn bash_install_sh_passes() {
+        assert_eq!(sp_decision("bash install.sh"), None);
+    }
+
+    // ── register_edit_hook ────────────────────────────────────────────────────
+
+    #[test]
+    fn register_edit_hook_into_empty_settings() {
+        let mut s = serde_json::json!({});
+        assert!(register_edit_hook(&mut s, "clawband"));
+        assert!(edit_hook_present(&s));
+    }
+
+    #[test]
+    fn register_edit_hook_is_idempotent() {
+        let mut s = serde_json::json!({});
+        assert!(register_edit_hook(&mut s, "clawband"));
+        assert!(!register_edit_hook(&mut s, "clawband"));
+    }
+
+    #[test]
+    fn edit_hook_not_confused_by_bash_entry() {
+        // A Bash-only entry should not satisfy the edit_hook_present check
+        let s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "clawband"}]}
+                ]
+            }
+        });
+        assert!(!edit_hook_present(&s));
+    }
+
+    #[test]
+    fn register_edit_hook_does_not_disturb_bash_entry() {
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "clawband"}]}
+                ]
+            }
+        });
+        register_edit_hook(&mut s, "clawband");
+        // Bash entry still present
+        assert!(clawband_hook_present(&s));
+        // Edit entry also added
+        assert!(edit_hook_present(&s));
+        // Total entries = 2
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
     }
 }

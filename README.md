@@ -169,10 +169,51 @@ my-infra nuke --all
 git reset --hard HEAD$
 ```
 
+## Self-protection
+
+By default clawband guards Claude's **Bash** tool. With `--protect` it also guards Claude's **Write/Edit** tools, preventing the model from modifying clawband itself or any other path you list.
+
+```sh
+clawband install --protect
+```
+
+This does three things:
+
+1. **Registers a second `PreToolUse` hook** with matcher `Write|Edit|MultiEdit|NotebookEdit`. Every file-edit attempt goes through clawband before it executes.
+2. **Seeds `~/.clawband/protect.paths`** (if missing) with default protected paths:
+   - `~/.claude/settings.json` — Claude Code's settings (where hooks are registered)
+   - `~/.claude/hooks/clawband` — the clawband binary itself
+   - `~/.clawband/*` — all clawband config files
+3. **Extends the Bash deny patterns** (when protect.paths is present) to block shell tamper commands: `rm`/`mv`/`shred` referencing clawband files, output redirection (`>`/`>>`) to those files, `sed -i` or `tee` targeting `settings.json`, and `chmod -x` on the hook binary.
+
+### What is still allowed
+
+- **Your own terminal** is completely unaffected — clawband hooks only fire on Claude Code's tools, never on commands you type yourself.
+- `brew upgrade clawband`, `brew install ... clawband`, `clawband install`, `bash install.sh` all pass unimpeded.
+- Any Bash command that does not reference the protected file paths is unchanged.
+
+### Customising protect.paths
+
+`~/.clawband/protect.paths` is one case-insensitive regex per line. Lines starting with `#` and blank lines are ignored. A leading `~/` is expanded to your home directory at load time.
+
+```
+# ~/.clawband/protect.paths
+~/.claude/settings\.json$
+~/.claude/hooks/clawband$
+~/.clawband/.*
+# protect a project's production secrets too
+/etc/myapp/prod\.env$
+```
+
+A project-level `.clawband/protect.paths` (in the current working directory) is loaded in addition to the global file.
+
+`clawband verify` reports whether self-protect is active (both protect.paths present and the Write/Edit hook registered).
+
 ## CLI commands
 
 ```sh
 clawband install                      # wire the hook into ~/.claude/settings.json + seed config
+clawband install --protect            # also enable self-protect (guard clawband files from edits)
 clawband verify                       # check the hook is registered and the engine works
 clawband allow '<pattern>'            # append to ~/.clawband/allow.patterns (global)
 clawband allow --project '<pattern>'  # append to .clawband/allow.patterns (project CWD)
