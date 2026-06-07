@@ -54,18 +54,10 @@ class Clawband < Formula
     <<~CAVEAT
       clawband is installed, but it is not yet wired into Claude Code.
 
-      Register it as a PreToolUse hook in ~/.claude/settings.json:
+      Run:
 
-        {
-          "hooks": {
-            "PreToolUse": [
-              {
-                "matcher": "Bash",
-                "hooks": [{"type": "command", "command": "#{opt_bin}/clawband"}]
-              }
-            ]
-          }
-        }
+        clawband install   # registers the PreToolUse hook + seeds ~/.clawband/
+        clawband verify    # confirm it's active
 
       Then run /hooks in Claude Code (or restart) to activate.
       See: https://github.com/jamessoubry/clawband#installation
