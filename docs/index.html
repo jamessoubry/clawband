@@ -427,6 +427,13 @@
     <button class="copy-btn" id="copy-btn" onclick="copyInstall()">copy</button>
   </div>
   <p class="install-note">Requires <code style="font-size:.8rem">jq</code> — pre-built binaries for Linux x86_64, macOS arm64, macOS x86_64. Rust only needed as a fallback.</p>
+
+  <div class="install-wrap" style="margin-top:1rem">
+    <span class="prompt">$</span>
+    <code id="brew-cmd">brew install jamessoubry/clawband/clawband</code>
+    <button class="copy-btn" id="brew-btn" onclick="copyBrew()">copy</button>
+  </div>
+  <p class="install-note">Homebrew installs the binary — register the hook afterwards (<code style="font-size:.8rem">brew info clawband</code> shows how).</p>
 </div>
 
 <!-- ── Stats bar ─────────────────────────────────────────────────────────────── -->
@@ -779,6 +786,15 @@
     const cmd = 'git clone https://github.com/jamessoubry/clawband && bash clawband/install.sh';
     navigator.clipboard.writeText(cmd).then(() => {
       const btn = document.getElementById('copy-btn');
+      btn.textContent = 'copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 2000);
+    });
+  }
+
+  function copyBrew() {
+    navigator.clipboard.writeText('brew install jamessoubry/clawband/clawband').then(() => {
+      const btn = document.getElementById('brew-btn');
       btn.textContent = 'copied!';
       btn.classList.add('copied');
       setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 2000);
