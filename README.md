@@ -237,7 +237,7 @@ The variable only takes effect when it is actually exported into the hook's envi
 
 ## Contributing
 
-Patterns are in `src/main.rs` in `builtin_deny()` and `builtin_ask()`. If you find a destructive pattern that should be blocked or prompted, open a PR with the pattern and a comment explaining the risk.
+Found a destructive command clawband misses? Open a [New pattern issue](https://github.com/jamessoubry/clawband/issues/new?template=new-pattern.md) (no Rust needed) or add it yourself — patterns live in `src/main.rs` in `builtin_deny()` and `builtin_ask()`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the pattern recipe, guidelines, and dev setup.
 
 ## Licence
 
