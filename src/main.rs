@@ -662,24 +662,27 @@ fn cmd_stats() {
     let rtk = env::var("RTK_ENABLED").as_deref() == Ok("1");
     let sqz = env::var("SQZ_ENABLED").as_deref() == Ok("1");
     let logging = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
+    let skip = env::var("CLAWBAND_SKIP").as_deref() == Ok("1");
     let log_path = PathBuf::from(&home).join(".clawband.log");
 
     // Parse audit log if present
-    let (log_deny, log_ask) = if log_path.exists() {
+    let (log_deny, log_ask, log_skip) = if log_path.exists() {
         fs::read_to_string(&log_path)
             .unwrap_or_default()
             .lines()
-            .fold((0u64, 0u64), |(d, a), line| {
+            .fold((0u64, 0u64, 0u64), |(d, a, s), line| {
                 if line.contains("] DENY |") {
-                    (d + 1, a)
+                    (d + 1, a, s)
                 } else if line.contains("] ASK |") {
-                    (d, a + 1)
+                    (d, a + 1, s)
+                } else if line.contains("] SKIP |") {
+                    (d, a, s + 1)
                 } else {
-                    (d, a)
+                    (d, a, s)
                 }
             })
     } else {
-        (0u64, 0u64)
+        (0u64, 0u64, 0u64)
     };
 
     let g = "\x1b[32m"; // green
@@ -747,10 +750,18 @@ fn cmd_stats() {
     println!("  RTK_ENABLED    {}", flag(rtk));
     println!("  SQZ_ENABLED    {}", flag(sqz));
     println!("  CLAWBAND_LOG   {}", flag(logging));
+    if skip {
+        let red = "\x1b[31m";
+        println!(
+            "  CLAWBAND_SKIP  {red}{bold}ON — ALL CHECKS DISABLED{r}  {d}clawband is bypassed in this environment{r}"
+        );
+    } else {
+        println!("  CLAWBAND_SKIP  {}", flag(skip));
+    }
 
     println!("\n{bold}Audit log{r}");
     if log_path.exists() {
-        let total = log_deny + log_ask;
+        let total = log_deny + log_ask + log_skip;
         println!(
             "  {b}{}{r}  {d}({}){r}",
             log_path.display(),
@@ -763,6 +774,10 @@ fn cmd_stats() {
         if total > 0 {
             println!("  {g}deny{r}   {bold}{log_deny}{r}");
             println!("  {y}ask{r}    {bold}{log_ask}{r}");
+            if log_skip > 0 {
+                let red = "\x1b[31m";
+                println!("  {red}skip{r}   {bold}{log_skip}{r}  {d}(bypassed by CLAWBAND_SKIP){r}");
+            }
         }
     } else if logging {
         println!("  {d}enabled — no events yet{r}");
@@ -1041,13 +1056,18 @@ fn main() {
         _ => return,
     };
 
+    let log_enabled = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
+
     if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
+        // Total bypass — leave an audit trail so a forgotten global skip is visible.
+        if log_enabled {
+            log_action("skip", "CLAWBAND_SKIP=1 — all checks bypassed", &command);
+        }
         return;
     }
 
     let rtk_enabled = env::var("RTK_ENABLED").as_deref() == Ok("1");
     let sqz_enabled = env::var("SQZ_ENABLED").as_deref() == Ok("1");
-    let log_enabled = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
 
     let command = if rtk_enabled {
         strip_rtk(&command)

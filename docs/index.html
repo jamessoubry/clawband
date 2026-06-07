@@ -756,7 +756,7 @@
       </div>
       <div class="option-card">
         <code>CLAWBAND_SKIP=1</code>
-        <p>Bypass all checks. For trusted wrapper scripts that need to run blocked commands.</p>
+        <p><strong>Total bypass</strong> — disables every check (deny included), not a downgrade to a prompt. Read from the hook's own environment, <em>not</em> the command string, so prefixing <code style="font-size:.82rem">CLAWBAND_SKIP=1 rm -rf /</code> does <strong>not</strong> work — that's still blocked. Only takes effect when exported into the hook's env. Set it globally and clawband is silently off for the whole session (<code style="font-size:.82rem">clawband stats</code> warns when it detects this).</p>
       </div>
       <div class="option-card">
         <code>RTK_ENABLED=1</code>

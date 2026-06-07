@@ -199,7 +199,22 @@ Set as environment variables (in your shell profile, or prefixed on the hook com
 | `RTK_ENABLED` | `0` | Strip `rtk` prefix before matching ([RTK](https://github.com/rtk-ai/rtk) users) |
 | `SQZ_ENABLED` | `0` | Strip `sqz compress` suffix before matching ([sqz](https://github.com/ojuschugh1/sqz) users) |
 | `CLAWBAND_LOG` | `0` | Append every block/prompt to `~/.clawband.log` |
-| `CLAWBAND_SKIP` | `0` | Bypass all checks (for trusted wrapper scripts) |
+| `CLAWBAND_SKIP` | `0` | **Total bypass** — disables *all* checks (see below) |
+
+### About `CLAWBAND_SKIP`
+
+`CLAWBAND_SKIP=1` is a complete bypass: clawband exits immediately and the command runs with no checks at all — deny patterns included. It does **not** downgrade blocks to prompts; it skips everything.
+
+Crucially, clawband reads this variable from **its own process environment**, *not* from the command string. That means a model cannot bypass the guard by prefixing a command:
+
+```sh
+CLAWBAND_SKIP=1 rm -rf /     # STILL BLOCKED — the prefix is just text in the
+                             # command string; rm -rf / still matches
+```
+
+The variable only takes effect when it is actually exported into the hook's environment. The safe, intended use is a one-off inline prefix on a **trusted wrapper you invoke yourself**, where it applies to that single invocation.
+
+⚠️ **Footgun:** if you `export CLAWBAND_SKIP=1` globally (shell profile or Claude Code `settings.json` `env` block), clawband is silently disabled for the entire session. `clawband stats` shows a red **ALL CHECKS DISABLED** warning when it detects this, and (with `CLAWBAND_LOG=1`) every bypassed command is recorded as a `SKIP` event in `~/.clawband.log`.
 
 ## Requirements
 
