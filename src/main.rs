@@ -1442,10 +1442,7 @@ mod tests {
     #[test]
     fn rm_no_preserve_root_rf_denied() {
         // preceding long flag before -rf
-        assert_eq!(
-            decision("rm --no-preserve-root -rf /"),
-            Some("deny".into())
-        );
+        assert_eq!(decision("rm --no-preserve-root -rf /"), Some("deny".into()));
     }
 
     #[test]
