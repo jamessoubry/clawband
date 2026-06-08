@@ -10,7 +10,9 @@ use std::{
 fn output(decision: &str, reason: &str) {
     // Manually build JSON to avoid depending on serde_json for output
     // (we still use it for input parsing)
-    let prefixed = format!("[clawband] {}", reason);
+    // Upper-case so the source stays prominent even where Claude Code renders the
+    // permission message without colour (e.g. worktree sessions) — see issue #47.
+    let prefixed = format!("[CLAWBAND] {}", reason);
     let reason_escaped = prefixed
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
