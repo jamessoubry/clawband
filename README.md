@@ -227,12 +227,15 @@ clawband deny  --project '<pattern>'  # append to .clawband/deny.patterns (proje
 clawband stats                        # show pattern counts and audit log summary
 clawband test '<command>'             # dry-run: print DENY/ASK/PASS without executing
 clawband patterns                     # list all active patterns (built-in + user + project)
+clawband log                          # view the audit log (--enable, -n N, --clear, --path)
 clawband --version
 ```
 
 `clawband test` is useful when authoring custom patterns or debugging false positives. It loads the same pattern set the live hook uses (built-in + global + project + self-protect patterns) and prints a coloured `DENY`, `ASK`, or `PASS` result with the matching reason.
 
 `clawband patterns` prints all currently-active patterns grouped by source — built-in deny, built-in ask, user deny/ask/allow, project deny/ask/allow, and self-protect paths — so you can audit exactly what the running hook enforces.
+
+`clawband log` shows the audit trail of past decisions. Turn logging on with `clawband log --enable` (writes a marker so it persists without setting `CLAWBAND_LOG=1`); then `clawband log` prints recent deny/ask/skip events (newest last, coloured), `clawband log -n 100` shows more, `clawband log --clear` truncates it, and `clawband log --path` prints the log file location.
 
 `clawband install` is idempotent — it won't duplicate the hook if it's already registered, and it preserves any other hooks (icm, sqz, etc.) already in your settings. `clawband verify` runs a self-test that feeds a known-destructive command through the engine to confirm it actually blocks, and exits non-zero if anything is misconfigured (handy in CI or a dotfiles bootstrap).
 
