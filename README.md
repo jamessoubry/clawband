@@ -4,6 +4,8 @@ A `PreToolUse` hook for [Claude Code](https://claude.ai/code) that hard-blocks k
 
 Written in Rust: single binary, sub-millisecond execution, proper regex engine.
 
+![clawband blocking destructive commands](docs/demo.svg)
+
 ## What it does
 
 Claude Code runs shell commands via its `Bash` tool. This hook intercepts every command before execution and:
