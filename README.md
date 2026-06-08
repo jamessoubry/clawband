@@ -52,7 +52,7 @@ echo "hello world"          # pass — no redirection
 
 ### Attribution
 
-Every block or prompt message is prefixed with `[clawband]` so you can always tell the source — distinguishable from Claude Code's built-in deny list and Claude's own safety judgment.
+Every block or prompt message is prefixed with `[CLAWBAND]` so you can always tell the source — distinguishable from Claude Code's built-in deny list and Claude's own safety judgment, and prominent even where the message renders without colour.
 
 ## Installation
 

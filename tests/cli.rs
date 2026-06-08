@@ -56,7 +56,7 @@ fn e2e_blocks_destructive_bash() {
     assert_eq!(decision(&out), Some("deny"));
     // attribution prefix is present in the reason
     assert!(
-        out.contains("[clawband]"),
+        out.contains("[CLAWBAND]"),
         "reason should be prefixed: {out}"
     );
 }
