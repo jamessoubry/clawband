@@ -213,6 +213,23 @@ fn builtin_ask() -> Vec<Pattern> {
         ("npm exec", r"\bnpm\s+exec\b"),
         // git push :<branch> — colon-prefix syntax for remote branch deletion
         ("git push :<branch>", r"\bgit\s+push\b.*\s:\S"),
+        // Obfuscation / anti-inspection vectors — decoding content before execution
+        // or persistence is a common supply-chain and C2 technique.
+        //
+        // base64 decode piped onward — decoded payload fed to another command
+        ("base64 decode piped", r"\bbase64\s+(-d|-D|--decode)\b.*\|"),
+        // base64 decode redirected to a file — writing a decoded binary or script
+        (
+            "base64 decode redirect",
+            r"\bbase64\s+(-d|-D|--decode)\b.*>",
+        ),
+        // xxd -r — reverse hex dump piped or redirected (hex-encoded payload)
+        ("xxd reverse", r"\bxxd\s+-r\b.*(\||>)"),
+        // openssl base64 -d / enc -d — SSL-tool decoding used to evade text scanning
+        (
+            "openssl base64 decode",
+            r"\bopenssl\b.*(base64\s+-d|enc\b.*-d)\b",
+        ),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -642,6 +659,35 @@ fn protect_active() -> bool {
 /// Pure helper (testable without env/FS — pass patterns in directly).
 fn edit_protected(path: &str, pats: &[Pattern]) -> bool {
     pats.iter().any(|p| p.matches(path))
+}
+
+/// Resolve symlinks for an edit target, returning a list of candidate paths to
+/// check against protect patterns.  The original expanded-absolute path is
+/// always first; the canonicalized path (symlinks resolved, `..` collapsed) is
+/// added as a second candidate when it differs.  For a path that doesn't exist
+/// yet (e.g. a new file being created), we canonicalize the parent directory
+/// and re-append the filename so that a symlinked parent is still resolved.
+fn edit_candidates(abs_path: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = vec![abs_path.to_string()];
+    let p = std::path::Path::new(abs_path);
+
+    let canon = if p.exists() {
+        fs::canonicalize(p).ok()
+    } else {
+        // Path doesn't exist yet — canonicalize its parent and re-join the filename
+        p.parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            .and_then(|canon_parent| p.file_name().map(|name| canon_parent.join(name)))
+    };
+
+    if let Some(c) = canon {
+        let cs = c.to_string_lossy().into_owned();
+        if cs != abs_path {
+            candidates.push(cs);
+        }
+    }
+
+    candidates
 }
 
 /// Self-protect deny patterns added to the Bash check when protect_active().
@@ -1098,6 +1144,145 @@ fn cmd_verify() -> i32 {
     }
 }
 
+// ─── Test subcommand ──────────────────────────────────────────────────────────
+// Dry-run: shows what clawband WOULD decide for a command, without running it.
+
+fn cmd_test(command_args: &[String]) {
+    let red = "\x1b[31m";
+    let y = "\x1b[33m";
+    let g = "\x1b[32m";
+    let r = "\x1b[0m";
+    let bold = "\x1b[1m";
+    let d = "\x1b[2m";
+
+    if command_args.is_empty() {
+        eprintln!("Usage: clawband test '<command>'");
+        eprintln!("  Prints what clawband would decide without executing the command.");
+        std::process::exit(1);
+    }
+
+    let command = command_args.join(" ");
+
+    // Load the same pattern set as main()
+    let cfg = config_dir();
+    let mut deny_pats = builtin_deny();
+    let mut ask_pats = builtin_ask();
+    let mut allow_pats = load_patterns(&cfg.join("allow.patterns"));
+    deny_pats.extend(load_patterns(&cfg.join("deny.patterns")));
+    ask_pats.extend(load_patterns(&cfg.join("ask.patterns")));
+    if let Some(proj) = project_config_dir() {
+        deny_pats.extend(load_patterns(&proj.join("deny.patterns")));
+        ask_pats.extend(load_patterns(&proj.join("ask.patterns")));
+        allow_pats.extend(load_patterns(&proj.join("allow.patterns")));
+    }
+    if protect_active() {
+        deny_pats.extend(self_protect_deny_patterns());
+    }
+
+    match check_command(&command, &deny_pats, &ask_pats, &allow_pats) {
+        Some(("deny", reason)) => {
+            println!("\n  {red}{bold}DENY{r}  {d}{}{r}\n", reason);
+        }
+        Some((_, reason)) => {
+            println!("\n  {y}{bold}ASK{r}   {d}{}{r}\n", reason);
+        }
+        None => {
+            println!("\n  {g}{bold}PASS{r}  {d}command would run{r}\n");
+        }
+    }
+}
+
+// ─── Patterns subcommand ──────────────────────────────────────────────────────
+// Lists all active patterns so users can see what's enforced.
+
+fn cmd_patterns() {
+    let g = "\x1b[32m";
+    let y = "\x1b[33m";
+    let d = "\x1b[2m";
+    let r = "\x1b[0m";
+    let bold = "\x1b[1m";
+
+    let bd = builtin_deny();
+    let ba = builtin_ask();
+
+    println!("\n{bold}Built-in deny{r}  {d}({} patterns){r}", bd.len());
+    for p in &bd {
+        println!("  {g}deny{r}  {}", p.label);
+    }
+
+    println!("\n{bold}Built-in ask{r}  {d}({} patterns){r}", ba.len());
+    for p in &ba {
+        println!("  {y}ask{r}   {}", p.label);
+    }
+
+    // User global patterns
+    let cfg = config_dir();
+    let user_deny = load_patterns(&cfg.join("deny.patterns"));
+    let user_ask = load_patterns(&cfg.join("ask.patterns"));
+    let user_allow = load_patterns(&cfg.join("allow.patterns"));
+
+    if !user_deny.is_empty() || !user_ask.is_empty() || !user_allow.is_empty() {
+        println!("\n{bold}User patterns{r}  {d}(~/.clawband/){r}");
+        for p in &user_deny {
+            println!("  {g}deny{r}  {}", p.label);
+        }
+        for p in &user_ask {
+            println!("  {y}ask{r}   {}", p.label);
+        }
+        for p in &user_allow {
+            println!("  allow {}", p.label);
+        }
+    } else {
+        println!("\n{bold}User patterns{r}  {d}(none loaded from ~/.clawband/){r}");
+    }
+
+    // Project patterns
+    if let Some(proj) = project_config_dir() {
+        let proj_deny = load_patterns(&proj.join("deny.patterns"));
+        let proj_ask = load_patterns(&proj.join("ask.patterns"));
+        let proj_allow = load_patterns(&proj.join("allow.patterns"));
+
+        if !proj_deny.is_empty() || !proj_ask.is_empty() || !proj_allow.is_empty() {
+            println!("\n{bold}Project patterns{r}  {d}({}){r}", proj.display());
+            for p in &proj_deny {
+                println!("  {g}deny{r}  {}", p.label);
+            }
+            for p in &proj_ask {
+                println!("  {y}ask{r}   {}", p.label);
+            }
+            for p in &proj_allow {
+                println!("  allow {}", p.label);
+            }
+        } else {
+            println!(
+                "\n{bold}Project patterns{r}  {d}(none loaded from {}){r}",
+                proj.display()
+            );
+        }
+    }
+
+    // Self-protect status
+    println!("\n{bold}Self-protect{r}");
+    if protect_active() {
+        println!("  {g}active{r}");
+        let protect_pats = protect_patterns();
+        if protect_pats.is_empty() {
+            println!("  {d}(no protect.paths entries){r}");
+        } else {
+            for p in &protect_pats {
+                println!("  {d}path:{r} {}", p.label);
+            }
+        }
+        println!();
+        let sp = self_protect_deny_patterns();
+        println!("  {d}+{} Bash tamper-guard patterns active{r}", sp.len());
+    } else {
+        println!("  {d}inactive (run: clawband install --protect to enable){r}");
+    }
+
+    println!();
+}
+
 // ─── Help command ─────────────────────────────────────────────────────────────
 
 fn cmd_help() {
@@ -1125,6 +1310,10 @@ fn cmd_help() {
         "  {b}verify{r}                      Check the hook is registered and the engine works"
     );
     println!("  {b}stats{r}                       Pattern counts, options, and audit log summary");
+    println!("  {b}test{r} {d}'<command>'{r}              Dry-run: print DENY/ASK/PASS without executing");
+    println!(
+        "  {b}patterns{r}                    List all active patterns (built-in + user + project)"
+    );
     println!(
         "  {b}post{r}                        PostToolUse companion — reads breadcrumb, suggests allow"
     );
@@ -1570,6 +1759,14 @@ fn main() {
         Some("verify") => {
             std::process::exit(cmd_verify());
         }
+        Some("test") => {
+            cmd_test(&args[2..]);
+            return;
+        }
+        Some("patterns") => {
+            cmd_patterns();
+            return;
+        }
         Some("--version") | Some("-v") => {
             println!("clawband v{}", env!("CARGO_PKG_VERSION"));
             return;
@@ -1636,7 +1833,12 @@ fn main() {
         };
 
         let pats = protect_patterns();
-        let protected = edit_protected(&abs_path, &pats) || edit_protected(raw_path, &pats);
+        // Check the original raw path, the expanded-absolute path, and any
+        // canonicalized paths (resolves symlinks and `..` so symlink bypass
+        // is not possible even when the target does not yet exist).
+        let mut candidates = edit_candidates(&abs_path);
+        candidates.push(raw_path.to_string());
+        let protected = candidates.iter().any(|c| edit_protected(c, &pats));
         if protected {
             let reason = format!("clawband protects this path from edits: {}", abs_path);
             if log_enabled {
@@ -2496,5 +2698,145 @@ mod tests {
         assert!(edit_hook_present(&s));
         // Total entries = 2
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    }
+
+    // ── base64 / obfuscation ask patterns ─────────────────────────────────────
+
+    #[test]
+    fn base64_decode_piped_asks() {
+        // base64 -d with output piped to another command — obfuscation vector
+        assert_eq!(
+            decision("base64 -d encoded.txt | sh"),
+            // pipe to sh is DENY (checked before ask), so this particular example is deny
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn base64_decode_piped_to_non_interpreter_asks() {
+        // base64 -d piped to cat — not a deny (no interpreter), but still ask
+        assert_eq!(decision("base64 -d payload.b64 | cat"), Some("ask".into()));
+    }
+
+    #[test]
+    fn base64_decode_redirect_asks() {
+        // base64 -d writing decoded content to a file — could produce executable
+        assert_eq!(
+            decision("base64 -d encoded.b64 > output.bin"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn base64_uppercase_d_asks() {
+        // -D is the macOS variant for decode
+        assert_eq!(
+            decision("base64 -D input.txt > out.bin"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn base64_long_decode_flag_asks() {
+        // --decode long form
+        assert_eq!(
+            decision("base64 --decode payload.b64 | cat"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn base64_encode_only_passes() {
+        // Plain encode (no -d/-D/--decode) — safe, no ask
+        assert_eq!(decision("base64 file.txt"), None);
+        assert_eq!(decision("base64 -e file.txt"), None);
+    }
+
+    #[test]
+    fn xxd_reverse_piped_asks() {
+        // xxd -r (hex decode) with output piped onward — obfuscation vector
+        assert_eq!(decision("xxd -r hex.txt | sh"), Some("deny".into()));
+    }
+
+    #[test]
+    fn xxd_reverse_redirect_asks() {
+        // xxd -r writing decoded content to a file
+        assert_eq!(decision("xxd -r hex.txt > out.bin"), Some("ask".into()));
+    }
+
+    #[test]
+    fn xxd_normal_passes() {
+        // xxd without -r is just a hex dump — safe
+        assert_eq!(decision("xxd file.bin"), None);
+    }
+
+    #[test]
+    fn openssl_base64_decode_asks() {
+        // openssl base64 -d — decoding via SSL tool
+        assert_eq!(
+            decision("openssl base64 -d -in encoded.txt -out decoded.bin"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn openssl_enc_d_asks() {
+        // openssl enc -d — generic decrypt/decode via SSL tool
+        assert_eq!(
+            decision("openssl enc -d -aes-256-cbc -in secret.enc -out secret.txt"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn openssl_no_decode_passes() {
+        // openssl used for certificate inspection — no decoding flag
+        assert_eq!(decision("openssl x509 -in cert.pem -text"), None);
+    }
+
+    // ── symlink hardening: edit_candidates ────────────────────────────────────
+
+    #[test]
+    fn edit_candidates_existing_path_includes_abs() {
+        // /tmp always exists — at minimum the abs path should be in candidates
+        let candidates = edit_candidates("/tmp");
+        assert!(candidates.contains(&"/tmp".to_string()));
+    }
+
+    #[test]
+    fn edit_candidates_nonexistent_path_parent_resolved() {
+        // /tmp exists, /tmp/clawband_test_nonexistent_xyz.txt does not
+        let path = "/tmp/clawband_test_nonexistent_xyz_unique.txt";
+        let candidates = edit_candidates(path);
+        // Must contain the original path
+        assert!(candidates.iter().any(|c| c == path));
+        // The canonicalized form should resolve /tmp to real path (may be /tmp itself)
+        // and include a candidate ending with the filename
+        assert!(candidates
+            .iter()
+            .any(|c| c.ends_with("clawband_test_nonexistent_xyz_unique.txt")));
+    }
+
+    #[test]
+    fn edit_candidates_real_symlink_resolved() {
+        use std::os::unix::fs::symlink;
+        let target = "/tmp/clawband_symlink_target_test.txt";
+        let link = "/tmp/clawband_symlink_link_test.txt";
+        let _ = fs::remove_file(target);
+        let _ = fs::remove_file(link);
+        fs::write(target, "content").unwrap();
+        symlink(target, link).unwrap();
+
+        let candidates = edit_candidates(link);
+        // Must contain the symlink path
+        assert!(candidates.iter().any(|c| c == link));
+        // Must also contain the resolved real path
+        assert!(candidates
+            .iter()
+            .any(|c| c.contains("clawband_symlink_target_test.txt")));
+
+        // Cleanup
+        let _ = fs::remove_file(target);
+        let _ = fs::remove_file(link);
     }
 }
