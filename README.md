@@ -129,6 +129,9 @@ Add to `~/.claude/settings.json`:
 | docker rm -f | `docker rm -f`, `docker container rm -f` — force-removes running containers |
 | npx / npm exec | `npx pkg`, `npm exec -- cmd` — downloads and executes arbitrary npm packages, content can't be scanned |
 | git push :<branch> | `git push origin :branch` — colon-prefix syntax for remote branch deletion |
+| base64 decode | `base64 -d`, `base64 --decode` piped or redirected — decoding obfuscated content is an anti-inspection vector |
+| xxd reverse | `xxd -r` piped or redirected — hex-decode used to smuggle binary payloads |
+| openssl decode | `openssl base64 -d`, `openssl enc -d` — SSL-tool decoding to evade text scanning |
 
 ### Safe patterns preserved
 
@@ -179,7 +182,7 @@ clawband install --protect
 
 This does three things:
 
-1. **Registers a second `PreToolUse` hook** with matcher `Write|Edit|MultiEdit|NotebookEdit`. Every file-edit attempt goes through clawband before it executes.
+1. **Registers a second `PreToolUse` hook** with matcher `Write|Edit|MultiEdit|NotebookEdit`. Every file-edit attempt goes through clawband before it executes. The guard resolves symlinks (via `std::fs::canonicalize`) so a symlinked path cannot bypass protection.
 2. **Seeds `~/.clawband/protect.paths`** (if missing) with default protected paths:
    - `~/.claude/settings.json` — Claude Code's settings (where hooks are registered)
    - `~/.claude/hooks/clawband` — the clawband binary itself
@@ -220,8 +223,14 @@ clawband allow --project '<pattern>'  # append to .clawband/allow.patterns (proj
 clawband deny  '<pattern>'            # append to ~/.clawband/deny.patterns (global)
 clawband deny  --project '<pattern>'  # append to .clawband/deny.patterns (project CWD)
 clawband stats                        # show pattern counts and audit log summary
+clawband test '<command>'             # dry-run: print DENY/ASK/PASS without executing
+clawband patterns                     # list all active patterns (built-in + user + project)
 clawband --version
 ```
+
+`clawband test` is useful when authoring custom patterns or debugging false positives. It loads the same pattern set the live hook uses (built-in + global + project + self-protect patterns) and prints a coloured `DENY`, `ASK`, or `PASS` result with the matching reason.
+
+`clawband patterns` prints all currently-active patterns grouped by source — built-in deny, built-in ask, user deny/ask/allow, project deny/ask/allow, and self-protect paths — so you can audit exactly what the running hook enforces.
 
 `clawband install` is idempotent — it won't duplicate the hook if it's already registered, and it preserves any other hooks (icm, sqz, etc.) already in your settings. `clawband verify` runs a self-test that feeds a known-destructive command through the engine to confirm it actually blocks, and exits non-zero if anything is misconfigured (handy in CI or a dotfiles bootstrap).
 
