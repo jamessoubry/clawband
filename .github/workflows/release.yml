@@ -70,6 +70,47 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
+  smoke-test:
+    name: Smoke test (linux-x86_64)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: clawband-linux-x86_64
+
+      - name: Make executable
+        run: chmod +x clawband-linux-x86_64
+
+      - name: Version flag prints
+        run: ./clawband-linux-x86_64 --version | grep -E '^clawband v[0-9]'
+
+      - name: Patterns subcommand runs
+        run: ./clawband-linux-x86_64 patterns > /dev/null
+
+      - name: Destructive command is denied
+        run: |
+          RESULT=$(printf '{"tool_name":"Bash","tool_input":{"command":"docker system prune -af"}}' \
+            | ./clawband-linux-x86_64)
+          echo "$RESULT" | grep -q '"permissionDecision":"deny"'
+
+      - name: Safe command passes (no output)
+        run: |
+          RESULT=$(printf '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' \
+            | ./clawband-linux-x86_64)
+          if echo "$RESULT" | grep -q '"permissionDecision"'; then
+            echo "FAIL: safe command should produce no decision output"
+            exit 1
+          fi
+          echo "PASS: safe command produced no permissionDecision output"
+
+      - name: git reset hard is asked
+        run: |
+          RESULT=$(printf '{"tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~1"}}' \
+            | ./clawband-linux-x86_64)
+          echo "$RESULT" | grep -q '"permissionDecision":"ask"'
+
   release:
     name: Create GitHub release
     needs: build
