@@ -38,6 +38,8 @@ fn decision(stdout: &str) -> Option<&'static str> {
         Some("deny")
     } else if stdout.contains("\"permissionDecision\":\"ask\"") {
         Some("ask")
+    } else if stdout.contains("\"permissionDecision\":\"allow\"") {
+        Some("allow")
     } else {
         None // empty output = pass
     }
@@ -98,6 +100,35 @@ fn e2e_malformed_json_is_safe_noop() {
     // Garbage stdin must not crash or emit a decision.
     let out = run("not json at all", &[]);
     assert_eq!(decision(&out), None);
+}
+
+#[test]
+fn e2e_allow_pattern_emits_explicit_allow() {
+    // A full-command match in allow.patterns should emit permissionDecision:allow
+    // (so Claude Code skips its own check), while an unrelated command still passes
+    // silently (None) — proving allow is scoped to the listed command only.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_allow_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    fs::write(
+        home.join(".clawband/allow.patterns"),
+        "^cd \\S+ && git log\n",
+    )
+    .unwrap();
+    let h = home.to_str().unwrap();
+
+    let allowed = run(&bash("cd /tmp && git log 2>/dev/null"), &[("HOME", h)]);
+    assert_eq!(decision(&allowed), Some("allow"));
+
+    let other = run(&bash("echo hello"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&other),
+        None,
+        "non-listed command must stay silent"
+    );
+
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]

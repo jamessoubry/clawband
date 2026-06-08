@@ -152,7 +152,11 @@ Extend or override behaviour by editing pattern files. clawband loads two sets:
 |------|--------|
 | `deny.patterns` | Always block — added to built-in deny list |
 | `ask.patterns` | Always prompt — added to built-in ask list |
-| `allow.patterns` | Override any block — matching commands skip all checks |
+| `allow.patterns` | Override any block, and emit an explicit `allow` (see below) |
+
+### How `allow.patterns` works
+
+When a **whole command** matches an `allow.patterns` entry, clawband returns an explicit `permissionDecision: "allow"`. This does two things: it skips clawband's own deny/ask checks, **and** it tells Claude Code to skip its *native* permission check too — so an allow-listed command won't trigger Claude Code's built-in prompts either (handy for working around false positives in its compound-command checker). A single allow-listed *segment* of a compound command does not green-light the whole command — the explicit allow only fires on a full-command match.
 
 **Project** (`.clawband/` in the current working directory) — loaded in addition to global patterns when the directory exists. Useful for per-repo restrictions or allowances without affecting other projects:
 

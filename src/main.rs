@@ -2195,6 +2195,16 @@ fn main() {
     if let Some((decision, reason)) = check_subshells(&command, &deny_pats, &ask_pats, &allow_pats)
     {
         emit(decision, &reason);
+        return;
+    }
+
+    // Nothing flagged. If the WHOLE command is explicitly allow-listed, emit an
+    // explicit `allow` so Claude Code skips its own permission check (which has
+    // false positives, e.g. the `cd … 2>/dev/null` compound-command warning).
+    // Only a full-command match qualifies — a single allow-listed segment must
+    // not green-light an entire compound command past the native checks.
+    if !allow_pats.is_empty() && allow_pats.iter().any(|p| p.matches(&command)) {
+        emit("allow", "Allowed by clawband allow.patterns");
     }
 }
 
