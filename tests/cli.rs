@@ -9,7 +9,9 @@ use std::process::{Command, Stdio};
 /// Optional env overrides are applied (e.g. CLAWBAND_SKIP, HOME).
 fn run(stdin: &str, env: &[(&str, &str)]) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_clawband"));
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     // Neutralise ambient config so tests are deterministic regardless of the
     // machine's real ~/.clawband or env.
     cmd.env_remove("CLAWBAND_SKIP")
@@ -42,7 +44,10 @@ fn decision(stdout: &str) -> Option<&'static str> {
 }
 
 fn bash(command: &str) -> String {
-    format!(r#"{{"tool_name":"Bash","tool_input":{{"command":{:?}}}}}"#, command)
+    format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":{:?}}}}}"#,
+        command
+    )
 }
 
 #[test]
@@ -50,7 +55,10 @@ fn e2e_blocks_destructive_bash() {
     let out = run(&bash("docker system prune"), &[]);
     assert_eq!(decision(&out), Some("deny"));
     // attribution prefix is present in the reason
-    assert!(out.contains("[clawband]"), "reason should be prefixed: {out}");
+    assert!(
+        out.contains("[clawband]"),
+        "reason should be prefixed: {out}"
+    );
 }
 
 #[test]
