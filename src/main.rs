@@ -22,14 +22,38 @@ fn output(decision: &str, reason: &str) {
     );
 }
 
+fn log_path() -> PathBuf {
+    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".clawband.log")
+}
+
+fn log_marker() -> PathBuf {
+    config_dir().join("log.enabled")
+}
+
+// Logging is on if CLAWBAND_LOG=1 OR the persistent marker (set by
+// `clawband log --enable`) exists — so logging survives without env-var fiddling.
+fn logging_enabled() -> bool {
+    env::var("CLAWBAND_LOG").as_deref() == Ok("1") || log_marker().exists()
+}
+
+// Return the last `n` non-empty lines of `content`, in order. Pure/testable.
+fn tail_lines(content: &str, n: usize) -> Vec<&str> {
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].to_vec()
+}
+
 fn log_action(decision: &str, reason: &str, command: &str) {
-    let home = env::var("HOME").unwrap_or_default();
-    let path = PathBuf::from(&home).join(".clawband.log");
+    let path = log_path();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let cmd_preview = &command[..command.len().min(200)];
+    // Flatten newlines so each event is exactly one line (reasons may contain a
+    // multi-line "To always allow" hint).
+    let reason = reason.replace('\n', " ");
+    let cmd_preview = cmd_preview.replace('\n', " ");
     if let Ok(mut f) = fs::OpenOptions::new().append(true).create(true).open(path) {
         let _ = writeln!(
             f,
@@ -1283,6 +1307,103 @@ fn cmd_patterns() {
     println!();
 }
 
+// ─── Log command ──────────────────────────────────────────────────────────────
+
+fn cmd_log(args: &[String]) {
+    let g = "\x1b[32m";
+    let y = "\x1b[33m";
+    let red = "\x1b[31m";
+    let d = "\x1b[2m";
+    let r = "\x1b[0m";
+    let bold = "\x1b[1m";
+    let path = log_path();
+
+    match args.first().map(|s| s.as_str()) {
+        Some("--enable") => {
+            let _ = fs::create_dir_all(config_dir());
+            match fs::write(log_marker(), "") {
+                Ok(_) => println!(
+                    "{g}Logging enabled.{r} Every block/prompt is appended to {}",
+                    path.display()
+                ),
+                Err(e) => {
+                    eprintln!("clawband: failed to enable logging: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("--disable") => {
+            let _ = fs::remove_file(log_marker());
+            println!(
+                "{y}Logging disabled.{r} {d}(CLAWBAND_LOG=1 in your env would still enable it.){r}"
+            );
+            return;
+        }
+        Some("--clear") => {
+            match fs::write(&path, "") {
+                Ok(_) => println!("{g}Cleared{r} {}", path.display()),
+                Err(e) => {
+                    eprintln!("clawband: failed to clear log: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("--path") => {
+            println!("{}", path.display());
+            return;
+        }
+        _ => {}
+    }
+
+    // Default: show recent entries. `-n N` overrides the count (default 50).
+    let mut n = 50usize;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-n" {
+            if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+                n = v;
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if !path.exists() {
+        if logging_enabled() {
+            println!("{d}Logging is on, but nothing has been recorded yet.{r}");
+        } else {
+            println!(
+                "{d}Logging is off.{r} Enable it with: {bold}clawband log --enable{r}  {d}(or set CLAWBAND_LOG=1){r}"
+            );
+        }
+        return;
+    }
+
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let lines = tail_lines(&content, n);
+    let total = content.lines().filter(|l| !l.trim().is_empty()).count();
+    println!(
+        "\n{bold}clawband log{r}  {d}({} — showing last {} of {}){r}\n",
+        path.display(),
+        lines.len(),
+        total
+    );
+    for line in &lines {
+        let coloured = if line.contains("] DENY |") || line.contains("] SKIP |") {
+            format!("{red}{line}{r}")
+        } else if line.contains("] ASK |") {
+            format!("{y}{line}{r}")
+        } else {
+            line.to_string()
+        };
+        println!("  {coloured}");
+    }
+    println!();
+}
+
 // ─── Help command ─────────────────────────────────────────────────────────────
 
 fn cmd_help() {
@@ -1313,6 +1434,9 @@ fn cmd_help() {
     println!("  {b}test{r} {d}'<command>'{r}              Dry-run: print DENY/ASK/PASS without executing");
     println!(
         "  {b}patterns{r}                    List all active patterns (built-in + user + project)"
+    );
+    println!(
+        "  {b}log{r} {d}[-n N|--enable|--clear]{r} View the audit log (--enable turns logging on)"
     );
     println!(
         "  {b}post{r}                        PostToolUse companion — reads breadcrumb, suggests allow"
@@ -1381,7 +1505,7 @@ fn cmd_stats() {
 
     let rtk = env::var("RTK_ENABLED").as_deref() == Ok("1");
     let sqz = env::var("SQZ_ENABLED").as_deref() == Ok("1");
-    let logging = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
+    let logging = logging_enabled();
     let skip = env::var("CLAWBAND_SKIP").as_deref() == Ok("1");
     let log_path = PathBuf::from(&home).join(".clawband.log");
 
@@ -1502,7 +1626,7 @@ fn cmd_stats() {
     } else if logging {
         println!("  {d}enabled — no events yet{r}");
     } else {
-        println!("  {d}set CLAWBAND_LOG=1 in clawband to activate{r}");
+        println!("  {d}logging off — enable with: clawband log --enable{r}");
     }
 
     println!();
@@ -1767,6 +1891,10 @@ fn main() {
             cmd_patterns();
             return;
         }
+        Some("log") => {
+            cmd_log(&args[2..]);
+            return;
+        }
         Some("--version") | Some("-v") => {
             println!("clawband v{}", env!("CARGO_PKG_VERSION"));
             return;
@@ -1787,7 +1915,7 @@ fn main() {
         Err(_) => return,
     };
 
-    let log_enabled = env::var("CLAWBAND_LOG").as_deref() == Ok("1");
+    let log_enabled = logging_enabled();
 
     if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
         // Total bypass — leave an audit trail so a forgotten global skip is visible.
@@ -2838,5 +2966,13 @@ mod tests {
         // Cleanup
         let _ = fs::remove_file(target);
         let _ = fs::remove_file(link);
+    }
+
+    #[test]
+    fn tail_lines_returns_last_n_nonempty() {
+        let content = "a\nb\n\nc\n  \nd\n";
+        assert_eq!(tail_lines(content, 2), vec!["c", "d"]);
+        assert_eq!(tail_lines(content, 100), vec!["a", "b", "c", "d"]);
+        assert_eq!(tail_lines("", 5), Vec::<&str>::new());
     }
 }
