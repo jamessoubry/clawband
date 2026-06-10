@@ -35,10 +35,12 @@ OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 
 case "$OS-$ARCH" in
-  linux-x86_64)  ASSET="clawband-linux-x86_64" ;;
-  darwin-arm64)  ASSET="clawband-macos-arm64" ;;
-  darwin-x86_64) ASSET="clawband-macos-x86_64" ;;
-  *)             ASSET="" ;;
+  linux-x86_64)   ASSET="clawband-linux-x86_64" ;;
+  linux-aarch64)  ASSET="clawband-linux-arm64" ;;
+  linux-arm64)    ASSET="clawband-linux-arm64" ;;
+  darwin-arm64)   ASSET="clawband-macos-arm64" ;;
+  darwin-x86_64)  ASSET="clawband-macos-x86_64" ;;
+  *)              ASSET="" ;;
 esac
 
 if [[ -n "$ASSET" ]]; then

@@ -62,7 +62,7 @@ Requires `jq`. Rust is only needed if no pre-built binary is available for your 
 bash install.sh
 ```
 
-The installer downloads the latest pre-built binary for your platform (Linux x86_64, macOS arm64, macOS x86_64) and falls back to `cargo build` if none is available. It installs the binary to `~/.claude/hooks/clawband`, creates `~/.clawband/` config files, and wires up `~/.claude/settings.json`. Then run `/hooks` in Claude Code (or restart) to activate.
+The installer downloads the latest pre-built binary for your platform (Linux x86_64, Linux arm64, macOS arm64, macOS x86_64) and falls back to `cargo build` if none is available. It installs the binary to `~/.claude/hooks/clawband`, creates `~/.clawband/` config files, and wires up `~/.claude/settings.json`. Then run `/hooks` in Claude Code (or restart) to activate.
 
 ### Homebrew
 

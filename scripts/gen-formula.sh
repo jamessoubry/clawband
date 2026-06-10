@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # gen-formula.sh — emit the Homebrew formula for a given version + binary SHA256s.
-# Usage: gen-formula.sh <version> <sha_macos_arm64> <sha_macos_x86_64> <sha_linux_x86_64>
+# Usage: gen-formula.sh <version> <sha_macos_arm64> <sha_macos_x86_64> <sha_linux_x86_64> <sha_linux_arm64>
 # Prints the formula to stdout. Used by the release workflow to bump the tap.
 set -euo pipefail
 
-if [ "$#" -ne 4 ]; then
-  echo "Usage: $0 <version> <sha_macos_arm64> <sha_macos_x86_64> <sha_linux_x86_64>" >&2
+if [ "$#" -ne 5 ]; then
+  echo "Usage: $0 <version> <sha_macos_arm64> <sha_macos_x86_64> <sha_linux_x86_64> <sha_linux_arm64>" >&2
   exit 1
 fi
 
@@ -13,6 +13,7 @@ VERSION="$1"
 SHA_MAC_ARM="$2"
 SHA_MAC_X86="$3"
 SHA_LINUX_X86="$4"
+SHA_LINUX_ARM="$5"
 BASE="https://github.com/jamessoubry/clawband/releases/download/v${VERSION}"
 
 cat <<EOF
@@ -39,6 +40,10 @@ class Clawband < Formula
   end
 
   on_linux do
+    on_arm do
+      url "${BASE}/clawband-linux-arm64"
+      sha256 "${SHA_LINUX_ARM}"
+    end
     on_intel do
       url "${BASE}/clawband-linux-x86_64"
       sha256 "${SHA_LINUX_X86}"
