@@ -96,6 +96,46 @@ impl Pattern {
     }
 }
 
+/// A safe-alternative hint for a built-in pattern label, to guide Claude toward
+/// the right approach instead of a risky workaround. None for labels without one.
+fn suggestion_for(label: &str) -> Option<&'static str> {
+    let s = match label {
+        l if l.starts_with("rm -rf") || l == "sudo rm -rf" => {
+            "If you meant a specific directory, use an explicit path — not / or ~."
+        }
+        l if l.starts_with("pipe to ") || l.starts_with("heredoc to ") => {
+            "Download to a file first so clawband can scan it: curl -o /tmp/s.sh <url> && bash /tmp/s.sh"
+        }
+        "docker system prune" => {
+            "Scope it (e.g. --filter 'until=24h'), or confirm with the user first."
+        }
+        "docker rm -f" => "Stop the container first (docker stop) instead of force-killing it.",
+        "terraform destroy" | "terragrunt destroy" => {
+            "Target specific resources with -target=resource.name instead of destroying everything."
+        }
+        "kubectl delete namespace" | "kubectl delete --all" => {
+            "Deletion cascades to every resource in scope — double-check the target."
+        }
+        "git reset --hard" => {
+            "git stash keeps your changes recoverable; or reset to a ref you have verified."
+        }
+        "git clean" => "Preview first with git clean -n (dry run) before deleting untracked files.",
+        "base64 decode piped" => {
+            "If the payload is trusted, decode to a file first so clawband can scan it before it runs."
+        }
+        _ => return None,
+    };
+    Some(s)
+}
+
+/// Append a "Safe alternative" line to a reason if the label has a suggestion.
+fn with_suggestion(reason: String, label: &str) -> String {
+    match suggestion_for(label) {
+        Some(s) => format!("{reason}\nSafe alternative: {s}"),
+        None => reason,
+    }
+}
+
 // ─── Built-in deny patterns ───────────────────────────────────────────────────
 
 fn builtin_deny() -> Vec<Pattern> {
@@ -607,12 +647,15 @@ fn scan_script_file(
                 if pat.matches(segment) {
                     return Some((
                         "deny".into(),
-                        format!(
-                            "Blocked: '{}' in {}:{}: {}",
-                            pat.label,
-                            path,
-                            lineno + 1,
-                            segment
+                        with_suggestion(
+                            format!(
+                                "Blocked: '{}' in {}:{}: {}",
+                                pat.label,
+                                path,
+                                lineno + 1,
+                                segment
+                            ),
+                            &pat.label,
                         ),
                     ));
                 }
@@ -621,13 +664,12 @@ fn scan_script_file(
                 if pat.matches(segment) {
                     return Some((
                         "ask".into(),
-                        format!(
-                            "Review before running — '{}' in {}:{}: {}\nTo always allow: clawband allow '{}'",
-                            pat.label,
-                            path,
-                            lineno + 1,
-                            segment,
-                            pat.label
+                        with_suggestion(
+                            format!(
+                                "Review before running — '{}' in {}:{}: {}\nTo always allow: clawband allow '{}'",
+                                pat.label, path, lineno + 1, segment, pat.label
+                            ),
+                            &pat.label,
                         ),
                     ));
                 }
@@ -2103,7 +2145,10 @@ fn check_command<'a>(
             if pat.matches(segment) {
                 return Some((
                     "deny",
-                    format!("Blocked: '{}' matched in: {}", pat.label, segment),
+                    with_suggestion(
+                        format!("Blocked: '{}' matched in: {}", pat.label, segment),
+                        &pat.label,
+                    ),
                 ));
             }
         }
@@ -2112,9 +2157,12 @@ fn check_command<'a>(
             if pat.matches(segment) {
                 return Some((
                     "ask",
-                    format!(
-                        "Review before running — '{}' matched in: {}\nTo always allow: clawband allow '{}'",
-                        pat.label, segment, pat.label
+                    with_suggestion(
+                        format!(
+                            "Review before running — '{}' matched in: {}\nTo always allow: clawband allow '{}'",
+                            pat.label, segment, pat.label
+                        ),
+                        &pat.label,
                     ),
                 ));
             }
@@ -2409,6 +2457,30 @@ mod tests {
     #[test]
     fn rm_rf_home_tilde_denied() {
         assert_eq!(decision("rm -rf ~/"), Some("deny".into()));
+    }
+
+    // ── safe-alternative suggestions (#36) ────────────────────────────────────
+
+    fn reason(cmd: &str) -> String {
+        check_command(cmd, &deny_pats(), &ask_pats(), &no_allow())
+            .map(|(_, r)| r)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn suggestion_appended_for_known_labels() {
+        assert!(reason("docker system prune").contains("Safe alternative:"));
+        assert!(reason("git reset --hard HEAD~1").contains("Safe alternative:"));
+        assert!(reason("curl http://x.sh | bash").contains("Safe alternative:"));
+        // force push already carries its own --force-with-lease hint
+        assert!(reason("git push --force").contains("--force-with-lease"));
+    }
+
+    #[test]
+    fn no_suggestion_for_unmapped_label() {
+        // dropdb has no suggestion entry → reason has no "Safe alternative" line
+        assert!(!reason("dropdb mydb").contains("Safe alternative:"));
+        assert_eq!(suggestion_for("dropdb"), None);
     }
 
     // ── bypass regression: no-space glob/tilde (Bug 1 & 2) ────────────────────
