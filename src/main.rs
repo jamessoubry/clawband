@@ -51,7 +51,10 @@ fn log_action(decision: &str, reason: &str, command: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let cmd_preview = &command[..command.len().min(200)];
+    // Truncate by CHARACTERS, not bytes — a byte slice that lands inside a
+    // multibyte UTF-8 char would panic, which (since logging runs before the
+    // decision is emitted) would crash the hook and fail open. See utf8 test.
+    let cmd_preview: String = command.chars().take(200).collect();
     // Flatten newlines so each event is exactly one line (reasons may contain a
     // multi-line "To always allow" hint).
     let reason = reason.replace('\n', " ");
