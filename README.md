@@ -193,6 +193,7 @@ This does three things:
    - `~/.claude/settings.json` — Claude Code's settings (where hooks are registered)
    - `~/.claude/hooks/clawband` — the clawband binary itself
    - `~/.clawband/*` — all clawband config files
+   - shell startup files (`~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`, `~/.zprofile`, `~/.zshenv`) — so Claude can't export `CLAWBAND_SKIP=1` (or remove the hook) by editing them
 3. **Extends the Bash deny patterns** (when protect.paths is present) to block shell tamper commands: `rm`/`mv`/`shred` referencing clawband files, output redirection (`>`/`>>`) to those files, `sed -i` or `tee` targeting `settings.json`, and `chmod -x` on the hook binary.
 
 ### What is still allowed
@@ -223,6 +224,7 @@ A project-level `.clawband/protect.paths` (in the current working directory) is 
 ```sh
 clawband install                      # wire the hook into ~/.claude/settings.json + seed config
 clawband install --protect            # also enable self-protect (guard clawband files from edits)
+clawband install --post               # also wire the PostToolUse companion (suggests allow after a prompt)
 clawband verify                       # check the hook is registered and the engine works
 clawband allow '<pattern>'            # append to ~/.clawband/allow.patterns (global)
 clawband allow --project '<pattern>'  # append to .clawband/allow.patterns (project CWD)
