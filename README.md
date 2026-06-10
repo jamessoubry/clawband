@@ -340,14 +340,14 @@ All reason strings carry the `[CLAWBAND]` prefix regardless of mode.
 
 Claude's PreToolUse can prompt the user interactively ("ask"). Codex, Gemini, and Hermes have no equivalent. When the engine decides "ask" and mode is not `claude`, clawband applies `ask_fallback`:
 
-- `ask_fallback = deny` (default) — renders as a hard deny with the reason:  
+- `ask_fallback = allow` (default) — renders as allow (passes the command through). The ask tier is meant to *confirm*, not *forbid*; on agents that can't prompt, hard-blocking it would be surprising. Your hard **deny** patterns still block.
+- `ask_fallback = deny` — renders as a hard deny with the reason:  
   `[CLAWBAND] manual-approval required (ask tier) — blocked under <mode> (set ask_fallback=allow to permit). Original: …`
-- `ask_fallback = allow` — renders as allow (passes the command through)
 
 Set it in `~/.clawband/config`:
 
 ```
-ask_fallback = allow
+ask_fallback = deny
 ```
 
 ### OpenClaw

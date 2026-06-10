@@ -322,23 +322,45 @@ fn e2e_codex_safe_command_passes() {
 }
 
 #[test]
-fn e2e_codex_ask_fallback_default_deny() {
-    // Codex: ask tier → deny by default (ask_fallback=deny is the default).
-    // git reset --hard triggers ask.
+fn e2e_codex_ask_fallback_default_allow() {
+    // Codex: ask tier → allow by default (ask_fallback=allow is the default;
+    // non-Claude agents can't render an interactive ask). git reset --hard
+    // triggers ask.
     let out = run(
         &bash("git reset --hard HEAD~1"),
         &[("CLAWBAND_MODE", "codex")],
     );
-    // Should be denied (ask_fallback=deny default), not asked
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        "codex ask-tier must fall back to allow by default: {out}"
+    );
+}
+
+#[test]
+fn e2e_codex_ask_fallback_deny_explicit() {
+    // Codex with ask_fallback=deny: ask tier → hard deny with the hint reason.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_codex_dn_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    fs::write(home.join(".clawband/config"), "ask_fallback = deny\n").unwrap();
+    let h = home.to_str().unwrap();
+
+    let out = run(
+        &bash("git reset --hard HEAD~1"),
+        &[("CLAWBAND_MODE", "codex"), ("HOME", h)],
+    );
     assert_eq!(
         decision(&out),
         Some("deny"),
-        "codex ask-tier must fall back to deny by default: {out}"
+        "codex ask-tier with ask_fallback=deny must deny: {out}"
     );
     assert!(
         out.contains("ask_fallback=allow to permit"),
         "fallback reason must mention ask_fallback=allow: {out}"
     );
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -397,17 +419,39 @@ fn e2e_gemini_safe_command_passes() {
 }
 
 #[test]
-fn e2e_gemini_ask_fallback_deny() {
-    // Gemini: ask tier → block by default.
+fn e2e_gemini_ask_fallback_default_allow() {
+    // Gemini: ask tier → allow by default (ask_fallback=allow).
     let out = run(
         &bash("git reset --hard HEAD~1"),
         &[("CLAWBAND_MODE", "gemini")],
     );
     assert_eq!(
         gemini_decision(&out),
-        Some("block"),
-        "gemini ask-tier must fall back to block: {out}"
+        Some("allow"),
+        "gemini ask-tier must fall back to allow by default: {out}"
     );
+}
+
+#[test]
+fn e2e_gemini_ask_fallback_deny_explicit() {
+    // Gemini with ask_fallback=deny: ask tier → block.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_gemini_dn_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    fs::write(home.join(".clawband/config"), "ask_fallback = deny\n").unwrap();
+    let h = home.to_str().unwrap();
+
+    let out = run(
+        &bash("git reset --hard HEAD~1"),
+        &[("CLAWBAND_MODE", "gemini"), ("HOME", h)],
+    );
+    assert_eq!(
+        gemini_decision(&out),
+        Some("block"),
+        "gemini ask-tier with ask_fallback=deny must block: {out}"
+    );
+    let _ = fs::remove_dir_all(&home);
 }
 
 // ── Hermes mode ───────────────────────────────────────────────────────────────
@@ -444,17 +488,39 @@ fn e2e_hermes_safe_command_passes_silently() {
 }
 
 #[test]
-fn e2e_hermes_ask_fallback_deny() {
-    // Hermes: ask tier → block by default.
+fn e2e_hermes_ask_fallback_default_allow() {
+    // Hermes: ask tier → allow by default (ask_fallback=allow; rendered as `{}`).
     let out = run(
         &bash("git reset --hard HEAD~1"),
         &[("CLAWBAND_MODE", "hermes")],
     );
     assert_eq!(
         hermes_decision(&out),
-        Some("block"),
-        "hermes ask-tier must fall back to block: {out}"
+        Some("allow"),
+        "hermes ask-tier must fall back to allow by default: {out}"
     );
+}
+
+#[test]
+fn e2e_hermes_ask_fallback_deny_explicit() {
+    // Hermes with ask_fallback=deny: ask tier → block.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_hermes_dn_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    fs::write(home.join(".clawband/config"), "ask_fallback = deny\n").unwrap();
+    let h = home.to_str().unwrap();
+
+    let out = run(
+        &bash("git reset --hard HEAD~1"),
+        &[("CLAWBAND_MODE", "hermes"), ("HOME", h)],
+    );
+    assert_eq!(
+        hermes_decision(&out),
+        Some("block"),
+        "hermes ask-tier with ask_fallback=deny must block: {out}"
+    );
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]

@@ -82,7 +82,10 @@ fn resolve_mode(flag: Option<&str>) -> Mode {
 
 /// What to do when the engine says "ask" but the agent has no interactive ask.
 /// Resolved from `ask_fallback = deny|allow` in `~/.clawband/config`.
-/// Default is `deny` (safest).
+/// Default is `allow`: Codex/Gemini/Hermes can't render an interactive prompt,
+/// so an ask-tier command would otherwise be hard-blocked — surprising for a
+/// tier meant to "confirm", not "forbid". Hard deny patterns still block. Set
+/// `ask_fallback = deny` to treat ask-tier as a block on these agents instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AskFallback {
     Deny,
@@ -119,7 +122,7 @@ fn resolve_ask_fallback() -> AskFallback {
     project_config_dir()
         .and_then(read)
         .or_else(|| read(config_dir()))
-        .unwrap_or(AskFallback::Deny)
+        .unwrap_or(AskFallback::Allow)
 }
 
 // ─── Decision output ──────────────────────────────────────────────────────────
@@ -1282,7 +1285,18 @@ const CONFIG_TEMPLATE: &str = "# clawband config\n\
 #   allow                  — emit `allow` so clawband is the sole gatekeeper (no native prompts)\n\
 #   ask                    — review everything not explicitly allowed\n\
 # Note: a hook `ask` only prompts when NOT in bypassPermissions mode; in YOLO mode `ask` runs.\n\
-default_decision = passthrough\n";
+default_decision = passthrough\n\
+#\n\
+# Which agent's hook protocol to speak: claude (default) | codex | gemini | hermes.\n\
+# Usually set by `clawband install --mode <agent>`; overridable per-invocation\n\
+# with `--mode` or the CLAWBAND_MODE env var.\n\
+# mode = claude\n\
+#\n\
+# How to treat an `ask`-tier command on agents with no interactive ask\n\
+# (codex/gemini/hermes; claude is unaffected):\n\
+#   allow (default) — let it through; only hard deny patterns block\n\
+#   deny            — hard-block ask-tier commands too\n\
+# ask_fallback = allow\n";
 
 const PROTECT_PATHS_TEMPLATE: &str =
     "# protect.paths — clawband denies Write/Edit (and tamper Bash ops) on matching paths.\n\
