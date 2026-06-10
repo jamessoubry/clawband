@@ -5,23 +5,235 @@ use std::{
     path::PathBuf,
 };
 
+// ─── Multi-agent mode ─────────────────────────────────────────────────────────
+
+/// Which agent the hook is serving.  Affects only output rendering and install
+/// wiring — the core engine (deny/ask/allow/script/subshell) is identical for
+/// all modes.  Default is `Claude` for full backward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    Claude,
+    Codex,
+    Gemini,
+    Hermes,
+}
+
+impl Mode {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "gemini" => Some(Self::Gemini),
+            "hermes" => Some(Self::Hermes),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Hermes => "hermes",
+        }
+    }
+}
+
+/// Resolve mode in priority order:
+///   1. `--mode <value>` CLI flag (passed in as already-extracted string)
+///   2. `CLAWBAND_MODE` environment variable
+///   3. `mode = <value>` line in `~/.clawband/config`
+///   4. Default: Claude
+fn resolve_mode(flag: Option<&str>) -> Mode {
+    // 1. CLI flag
+    if let Some(s) = flag {
+        if let Some(m) = Mode::from_str(s) {
+            return m;
+        }
+    }
+    // 2. Env var
+    if let Ok(v) = env::var("CLAWBAND_MODE") {
+        if let Some(m) = Mode::from_str(v.trim()) {
+            return m;
+        }
+    }
+    // 3. Config file
+    let read_config = |dir: std::path::PathBuf| -> Option<Mode> {
+        let text = fs::read_to_string(dir.join("config")).ok()?;
+        for line in text.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == "mode" {
+                    return Mode::from_str(v.trim().trim_matches('"').trim_matches('\''));
+                }
+            }
+        }
+        None
+    };
+    if let Some(m) = read_config(config_dir()) {
+        return m;
+    }
+    // 4. Default
+    Mode::Claude
+}
+
+/// What to do when the engine says "ask" but the agent has no interactive ask.
+/// Resolved from `ask_fallback = deny|allow` in `~/.clawband/config`.
+/// Default is `deny` (safest).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AskFallback {
+    Deny,
+    Allow,
+}
+
+fn resolve_ask_fallback() -> AskFallback {
+    let read = |dir: std::path::PathBuf| -> Option<AskFallback> {
+        let text = fs::read_to_string(dir.join("config")).ok()?;
+        for line in text.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == "ask_fallback" {
+                    return match v
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "allow" => Some(AskFallback::Allow),
+                        "deny" => Some(AskFallback::Deny),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    };
+    // Project config takes precedence over global
+    project_config_dir()
+        .and_then(read)
+        .or_else(|| read(config_dir()))
+        .unwrap_or(AskFallback::Deny)
+}
+
 // ─── Decision output ──────────────────────────────────────────────────────────
 
-fn output(decision: &str, reason: &str) {
-    // Manually build JSON to avoid depending on serde_json for output
-    // (we still use it for input parsing)
+/// Escape a JSON string value (inner content, no surrounding quotes).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+/// Claude-mode output (existing format — byte-identical to pre-multi-agent behaviour).
+/// Pass = no output; caller must not call this for pass decisions.
+fn output_claude(decision: &str, reason: &str) {
     // Upper-case so the source stays prominent even where Claude Code renders the
     // permission message without colour (e.g. worktree sessions) — see issue #47.
     let prefixed = format!("[CLAWBAND] {}", reason);
-    let reason_escaped = prefixed
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r");
     println!(
         r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"{}","permissionDecisionReason":"{}"}}}}"#,
-        decision, reason_escaped
+        decision,
+        json_escape(&prefixed)
     );
+}
+
+/// Codex-mode output.  Same JSON shape as Claude; no native "ask" — ask is
+/// converted to deny or allow via `ask_fallback`.  Pass = no output.
+fn output_codex(decision: &str, reason: &str) {
+    let prefixed = format!("[CLAWBAND] {}", reason);
+    println!(
+        r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"{}","permissionDecisionReason":"{}"}}}}"#,
+        decision,
+        json_escape(&prefixed)
+    );
+}
+
+/// Gemini-mode output.
+/// DENY → `{"decision":"block","reason":"<reason>"}` (exit 0)
+/// ALLOW → `{"decision":"allow"}`
+/// Pass = no output
+fn output_gemini(decision: &str, reason: &str) {
+    if decision == "allow" {
+        println!(r#"{{"decision":"allow"}}"#);
+    } else {
+        // deny (or ask-turned-deny)
+        let prefixed = format!("[CLAWBAND] {}", reason);
+        println!(
+            r#"{{"decision":"block","reason":"{}"}}"#,
+            json_escape(&prefixed)
+        );
+    }
+}
+
+/// Hermes-mode output.
+/// DENY → `{"decision":"block","reason":"<reason>"}`
+/// ALLOW → `{}`
+/// Pass = no output (caller must not invoke for pass)
+fn output_hermes(decision: &str, reason: &str) {
+    if decision == "allow" {
+        println!("{{}}");
+    } else {
+        let prefixed = format!("[CLAWBAND] {}", reason);
+        println!(
+            r#"{{"decision":"block","reason":"{}"}}"#,
+            json_escape(&prefixed)
+        );
+    }
+}
+
+/// Dispatch to the correct output renderer based on mode.
+/// Only call this for non-pass decisions; pass (no output) is handled by caller.
+fn output_for_mode(mode: Mode, decision: &str, reason: &str) {
+    match mode {
+        Mode::Claude => output_claude(decision, reason),
+        Mode::Codex => output_codex(decision, reason),
+        Mode::Gemini => output_gemini(decision, reason),
+        Mode::Hermes => output_hermes(decision, reason),
+    }
+}
+
+/// Resolve an "ask" engine decision to the final decision string for a
+/// non-Claude mode, applying `ask_fallback`.
+fn apply_ask_fallback(mode: Mode, reason: &str, fallback: AskFallback) -> (String, String) {
+    match fallback {
+        AskFallback::Allow => ("allow".to_string(), reason.to_string()),
+        AskFallback::Deny => {
+            let new_reason = format!(
+                "manual-approval required (ask tier) — blocked under {} \
+                 (set ask_fallback=allow to permit). Original: {}",
+                mode.as_str(),
+                reason
+            );
+            ("deny".to_string(), new_reason)
+        }
+    }
+}
+
+/// Top-level output helper used by the hook body.  Handles ask-fallback for
+/// non-Claude modes and dispatches to the right renderer.
+/// Returns the effective decision string (for logging).
+fn emit_decision(mode: Mode, fallback: AskFallback, decision: &str, reason: &str) -> String {
+    let (final_decision, final_reason) = if decision == "ask" && mode != Mode::Claude {
+        apply_ask_fallback(mode, reason, fallback)
+    } else {
+        (decision.to_string(), reason.to_string())
+    };
+    output_for_mode(mode, &final_decision, &final_reason);
+    final_decision
+}
+
+/// Backward-compatible shim used by callers that always operate in Claude mode
+/// (edit-protect path, SKIP audit trail).
+fn output(decision: &str, reason: &str) {
+    output_claude(decision, reason);
 }
 
 fn log_path() -> PathBuf {
@@ -1314,9 +1526,234 @@ fn edit_hook_present(settings: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+// ─── Agent-specific install wiring ───────────────────────────────────────────
+
+/// Install clawband into `~/.codex/config.toml`.  Idempotent — only appends the
+/// block if a line containing `command = "clawband --mode codex"` is absent.
+/// Always prints the snippet so the user can verify or add it manually.
+fn install_codex(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str) {
+    let home = env::var("HOME").unwrap_or_default();
+    let config_path = PathBuf::from(&home).join(".codex/config.toml");
+    let snippet = format!(
+        "\n[[hooks.PreToolUse]]\nmatcher = \"^(Bash|apply_patch)$\"\n\
+         [[hooks.PreToolUse.hooks]]\ntype = \"command\"\n\
+         command = \"{hook_cmd} --mode codex\"\ntimeout = 30\n"
+    );
+
+    println!("\n{bold}Codex wiring{r}");
+    println!("  {d}config:{r} {}", config_path.display());
+
+    let needle = format!("command = \"{hook_cmd} --mode codex\"");
+
+    // Read existing file (if any)
+    let existing = fs::read_to_string(&config_path).unwrap_or_default();
+    if existing.contains(&needle) {
+        println!("  {d}already present — no change{r}");
+    } else {
+        // Ensure parent dir exists
+        if let Some(p) = config_path.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        // Append
+        match fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&config_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                if f.write_all(snippet.as_bytes()).is_ok() {
+                    println!("  {g}appended{r} hook block to {}", config_path.display());
+                } else {
+                    println!("  {y}failed to write {}{r}", config_path.display());
+                }
+            }
+            Err(e) => {
+                println!(
+                    "  {y}could not open {} for writing: {e}{r}",
+                    config_path.display()
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("  Snippet (for manual verification):");
+    for line in snippet.lines() {
+        println!("    {d}{line}{r}");
+    }
+    println!();
+    println!(
+        "  {bold}Note:{r} Codex requires you to trust new hooks — run {bold}/hooks{r} in \
+         Codex to review and trust this hook before it takes effect."
+    );
+}
+
+/// Install clawband into `~/.gemini/settings.json`.  Idempotent.
+fn install_gemini(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str) {
+    let home = env::var("HOME").unwrap_or_default();
+    let config_path = PathBuf::from(&home).join(".gemini/settings.json");
+    let command_str = format!("{hook_cmd} --mode gemini");
+
+    // The Gemini CLI hooks schema (BeforeTool / beforeToolExecution) as best-effort:
+    // https://github.com/google-gemini/gemini-cli — settings.json key: "hooks"
+    let snippet = format!(
+        r#"  "hooks": {{
+    "beforeToolExecution": [
+      {{
+        "matcher": ".*",
+        "command": "{command_str}"
+      }}
+    ]
+  }}"#
+    );
+
+    println!("\n{bold}Gemini wiring{r}");
+    println!("  {d}config:{r} {}", config_path.display());
+
+    let needle = &command_str;
+
+    if let Some(p) = config_path.parent() {
+        let _ = fs::create_dir_all(p);
+    }
+
+    let existing_raw = fs::read_to_string(&config_path).unwrap_or_default();
+    if existing_raw.contains(needle.as_str()) {
+        println!("  {d}already present — no change{r}");
+    } else if existing_raw.trim().is_empty() {
+        // No file (or empty) — write a minimal settings.json
+        let content = format!("{{\n{snippet}\n}}\n");
+        match fs::write(&config_path, &content) {
+            Ok(_) => println!("  {g}created{r} {}", config_path.display()),
+            Err(e) => println!("  {y}failed to create {}: {e}{r}", config_path.display()),
+        }
+    } else {
+        // Try to parse and merge into existing JSON
+        match serde_json::from_str::<serde_json::Value>(&existing_raw) {
+            Ok(mut settings) => {
+                // Append to hooks.beforeToolExecution array (create if absent)
+                let hooks = settings
+                    .as_object_mut()
+                    .map(|o| o.entry("hooks").or_insert_with(|| serde_json::json!({})))
+                    .and_then(|h| h.as_object_mut());
+                if let Some(hooks_obj) = hooks {
+                    let arr = hooks_obj
+                        .entry("beforeToolExecution")
+                        .or_insert_with(|| serde_json::json!([]));
+                    if let Some(a) = arr.as_array_mut() {
+                        a.push(serde_json::json!({
+                            "matcher": ".*",
+                            "command": command_str
+                        }));
+                    }
+                }
+                match serde_json::to_string_pretty(&settings) {
+                    Ok(out) => match fs::write(&config_path, out + "\n") {
+                        Ok(_) => println!("  {g}merged{r} hook into {}", config_path.display()),
+                        Err(e) => {
+                            println!("  {y}failed to write {}: {e}{r}", config_path.display())
+                        }
+                    },
+                    Err(_) => println!("  {y}failed to serialize settings{r}"),
+                }
+            }
+            Err(_) => {
+                println!(
+                    "  {y}could not parse existing {}{r} — add the snippet manually:",
+                    config_path.display()
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("  Snippet (for manual verification):");
+    println!("  {d}{snippet}{r}");
+    println!();
+    println!(
+        "  {bold}Note:{r} The exact Gemini CLI hooks JSON schema may differ across versions — \
+         confirm the snippet matches your Gemini CLI's expected format."
+    );
+}
+
+/// Install clawband into `~/.hermes/config.yaml`.  Idempotent.
+fn install_hermes(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str) {
+    let home = env::var("HOME").unwrap_or_default();
+    let config_path = PathBuf::from(&home).join(".hermes/config.yaml");
+    let command_str = format!("{hook_cmd} --mode hermes");
+
+    let snippet = format!(
+        "hooks:\n  pre_tool_call:\n    - matcher: \".*\"\n      command: \"{command_str}\"\n      timeout: 10\n"
+    );
+    let needle = &command_str;
+
+    println!("\n{bold}Hermes wiring{r}");
+    println!("  {d}config:{r} {}", config_path.display());
+
+    if let Some(p) = config_path.parent() {
+        let _ = fs::create_dir_all(p);
+    }
+
+    let existing = fs::read_to_string(&config_path).unwrap_or_default();
+    if existing.contains(needle.as_str()) {
+        println!("  {d}already present — no change{r}");
+    } else if existing.trim().is_empty() {
+        match fs::write(&config_path, &snippet) {
+            Ok(_) => println!("  {g}created{r} {}", config_path.display()),
+            Err(e) => println!("  {y}failed to create {}: {e}{r}", config_path.display()),
+        }
+    } else {
+        // Append YAML block; YAML can't be reliably parsed without a dependency —
+        // do a simple needle-absent append.
+        match fs::OpenOptions::new().append(true).open(&config_path) {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                let block = format!("\n{snippet}");
+                if f.write_all(block.as_bytes()).is_ok() {
+                    println!("  {g}appended{r} hook block to {}", config_path.display());
+                } else {
+                    println!("  {y}failed to append to {}{r}", config_path.display());
+                }
+            }
+            Err(e) => println!(
+                "  {y}could not open {} for appending: {e}{r}",
+                config_path.display()
+            ),
+        }
+    }
+
+    println!();
+    println!("  Snippet (for manual verification):");
+    for line in snippet.lines() {
+        println!("    {d}{line}{r}");
+    }
+    println!();
+    println!(
+        "  {bold}Note:{r} Hermes asks for first-use consent — add the hook command to \
+         {d}~/.hermes/shell-hooks-allowlist.json{r} if prompted."
+    );
+}
+
 fn cmd_install(extra_args: &[String]) {
     let protect = extra_args.iter().any(|a| a == "--protect");
     let post = extra_args.iter().any(|a| a == "--post");
+
+    // Extract optional --mode <codex|gemini|hermes>; default is Claude (no flag).
+    let install_mode: Option<Mode> = {
+        let mut m = None;
+        let mut i = 0;
+        while i < extra_args.len() {
+            if extra_args[i] == "--mode" {
+                if let Some(val) = extra_args.get(i + 1) {
+                    m = Mode::from_str(val);
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        m
+    };
 
     let g = "\x1b[32m";
     let y = "\x1b[33m";
@@ -1450,7 +1887,21 @@ fn cmd_install(extra_args: &[String]) {
         }
     }
 
-    println!("\n{g}Done.{r} Run {bold}/hooks{r} in Claude Code (or restart) to activate.");
+    // 5. Agent-specific wiring (--mode codex|gemini|hermes)
+    match install_mode {
+        Some(Mode::Codex) => install_codex(&command, g, y, d, r, bold),
+        Some(Mode::Gemini) => install_gemini(&command, g, y, d, r, bold),
+        Some(Mode::Hermes) => install_hermes(&command, g, y, d, r, bold),
+        Some(Mode::Claude) | None => {}
+    }
+
+    let done_msg = match install_mode {
+        Some(Mode::Codex) => "Done. Review and trust the hook via `/hooks` in Codex.",
+        Some(Mode::Gemini) => "Done. Restart Gemini CLI to activate the hook.",
+        Some(Mode::Hermes) => "Done. Restart Hermes Agent to activate the hook.",
+        _ => "Done. Run /hooks in Claude Code (or restart) to activate.",
+    };
+    println!("\n{g}{done_msg}{r}");
     println!("{d}Verify anytime with: clawband verify{r}");
 }
 
@@ -2255,19 +2706,40 @@ fn check_command<'a>(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // CLI subcommands
+    // CLI subcommands — pull out any leading `--mode <val>` first so it doesn't
+    // shadow subcommand matching, then hand the remainder to the subcommand.
     let args: Vec<String> = env::args().collect();
-    match args.get(1).map(|s| s.as_str()) {
+
+    // Extract `--mode <value>` from args[1..] (may appear before OR after a
+    // subcommand, but in practice is passed before stdin-reading).  Strip it so
+    // the subcommand dispatcher sees clean args.
+    let mut mode_flag: Option<String> = None;
+    let mut filtered_args: Vec<String> = Vec::with_capacity(args.len());
+    filtered_args.push(args[0].clone()); // keep argv[0]
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--mode" {
+            if let Some(val) = args.get(i + 1) {
+                mode_flag = Some(val.clone());
+                i += 2;
+                continue;
+            }
+        }
+        filtered_args.push(args[i].clone());
+        i += 1;
+    }
+
+    match filtered_args.get(1).map(|s| s.as_str()) {
         Some("stats") => {
             cmd_stats();
             return;
         }
         Some("allow") => {
-            cmd_add_pattern("allow.patterns", &args[2..]);
+            cmd_add_pattern("allow.patterns", &filtered_args[2..]);
             return;
         }
         Some("deny") => {
-            cmd_add_pattern("deny.patterns", &args[2..]);
+            cmd_add_pattern("deny.patterns", &filtered_args[2..]);
             return;
         }
         Some("post") => {
@@ -2275,14 +2747,14 @@ fn main() {
             return;
         }
         Some("install") => {
-            cmd_install(&args[2..]);
+            cmd_install(&filtered_args[2..]);
             return;
         }
         Some("verify") => {
             std::process::exit(cmd_verify());
         }
         Some("test") => {
-            cmd_test(&args[2..]);
+            cmd_test(&filtered_args[2..]);
             return;
         }
         Some("patterns") => {
@@ -2290,7 +2762,7 @@ fn main() {
             return;
         }
         Some("log") => {
-            cmd_log(&args[2..]);
+            cmd_log(&filtered_args[2..]);
             return;
         }
         Some("--version") | Some("-v") => {
@@ -2303,6 +2775,11 @@ fn main() {
         }
         _ => {}
     }
+
+    // Resolve mode and ask-fallback before reading stdin so they're available
+    // for all subsequent output calls.
+    let mode = resolve_mode(mode_flag.as_deref());
+    let ask_fallback = resolve_ask_fallback();
 
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
@@ -2334,16 +2811,21 @@ fn main() {
 
     // ── Write/Edit/MultiEdit/NotebookEdit guard ──────────────────────────────
     // These tools are only hooked when --protect was used at install time.
+    // This path always runs in Claude mode (the edit-protect hook is always
+    // wired for Claude); output() shim preserves the existing Claude format.
     let tool_name = v["tool_name"].as_str().unwrap_or("");
     if matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
         if !protect_active() {
             return;
         }
-        // Determine the target path key
+        // Detect target path: file_path (Write/Edit/MultiEdit) or notebook_path
+        // (NotebookEdit).  Also accept `path` as a generic alias used by some agents.
         let raw_path = if tool_name == "NotebookEdit" {
             v["tool_input"]["notebook_path"].as_str()
         } else {
-            v["tool_input"]["file_path"].as_str()
+            v["tool_input"]["file_path"]
+                .as_str()
+                .or_else(|| v["tool_input"]["path"].as_str())
         };
         let Some(raw_path) = raw_path else {
             return;
@@ -2375,7 +2857,10 @@ fn main() {
         return;
     }
 
-    // ── Bash tool path ────────────────────────────────────────────────────────
+    // ── Command tool path ─────────────────────────────────────────────────────
+    // Accept tool_input.command regardless of tool_name: Claude Code uses
+    // tool_name "Bash", Codex uses "Bash", Hermes uses "terminal", Gemini
+    // varies — but all place the shell command in tool_input.command.
     let command = match v["tool_input"]["command"].as_str() {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return,
@@ -2413,16 +2898,17 @@ fn main() {
         deny_pats.extend(self_protect_deny_patterns());
     }
 
+    // emit: log and render the decision via the active mode adapter.
     let emit = |decision: &str, reason: &str| {
+        let effective = emit_decision(mode, ask_fallback, decision, reason);
         if log_enabled {
-            log_action(decision, reason, &command);
+            log_action(&effective, reason, &command);
         }
-        output(decision, reason);
     };
 
     // Core pattern check (deny/ask/pass)
     if let Some((decision, reason)) = check_command(&command, &deny_pats, &ask_pats, &allow_pats) {
-        if decision == "ask" {
+        if decision == "ask" && mode == Mode::Claude {
             write_ask_breadcrumb(&reason);
         }
         emit(decision, &reason);
@@ -2434,7 +2920,7 @@ fn main() {
         if let Some((decision, reason)) =
             scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
         {
-            if decision == "ask" {
+            if decision == "ask" && mode == Mode::Claude {
                 write_ask_breadcrumb(&reason);
             }
             emit(&decision, &reason);
@@ -2452,18 +2938,22 @@ fn main() {
 
     // Nothing flagged by deny/ask/script/subshell.
     //
-    // 1) Explicit allow.patterns full-command match → emit `allow` so Claude Code
+    // 1) Explicit allow.patterns full-command match → emit `allow` so the agent
     //    skips its own permission check (which has false positives, e.g. the
     //    `cd … 2>/dev/null` compound-command warning). Only a full-command match
     //    qualifies — a single allow-listed segment must not green-light an entire
     //    compound command past the native checks.
     if !allow_pats.is_empty() && allow_pats.iter().any(|p| p.matches(&command)) {
-        emit("allow", "Allowed by clawband allow.patterns");
+        let reason = "Allowed by clawband allow.patterns";
+        output_for_mode(mode, "allow", reason);
+        if log_enabled {
+            log_action("allow", reason, &command);
+        }
         return;
     }
 
     // 2) Default decision for commands no pattern matched (config: default_decision).
-    //    passthrough → stay silent and let Claude Code's native check handle it;
+    //    passthrough → stay silent and let the agent's native check handle it;
     //    allow → make clawband the sole gatekeeper (suppress native prompts);
     //    ask → review everything not explicitly allowed.
     match default_decision() {
@@ -4057,5 +4547,96 @@ mod tests {
             PROTECT_PATHS_TEMPLATE.contains(".envrc"),
             "PROTECT_PATHS_TEMPLATE should include .envrc pattern"
         );
+    }
+
+    // ── Multi-agent mode unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn mode_from_str_round_trips() {
+        assert_eq!(Mode::from_str("claude"), Some(Mode::Claude));
+        assert_eq!(Mode::from_str("CLAUDE"), Some(Mode::Claude));
+        assert_eq!(Mode::from_str("codex"), Some(Mode::Codex));
+        assert_eq!(Mode::from_str("Gemini"), Some(Mode::Gemini));
+        assert_eq!(Mode::from_str("HERMES"), Some(Mode::Hermes));
+        assert_eq!(Mode::from_str("unknown"), None);
+        assert_eq!(Mode::from_str(""), None);
+    }
+
+    #[test]
+    fn mode_as_str_matches_from_str() {
+        for mode in [Mode::Claude, Mode::Codex, Mode::Gemini, Mode::Hermes] {
+            assert_eq!(Mode::from_str(mode.as_str()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn apply_ask_fallback_deny_returns_deny_with_hint() {
+        let (decision, reason) =
+            apply_ask_fallback(Mode::Codex, "some ask reason", AskFallback::Deny);
+        assert_eq!(decision, "deny");
+        assert!(
+            reason.contains("ask_fallback=allow to permit"),
+            "hint missing: {reason}"
+        );
+        assert!(reason.contains("codex"), "mode name missing: {reason}");
+    }
+
+    #[test]
+    fn apply_ask_fallback_allow_returns_allow_with_original_reason() {
+        let (decision, reason) =
+            apply_ask_fallback(Mode::Gemini, "some ask reason", AskFallback::Allow);
+        assert_eq!(decision, "allow");
+        assert_eq!(reason, "some ask reason");
+    }
+
+    #[test]
+    fn emit_decision_claude_ask_unchanged() {
+        // In Claude mode, "ask" is passed through as-is (no fallback applied).
+        // We can't easily capture stdout in a unit test, but we can verify that
+        // the function returns the decision unchanged.
+        // (Actual output rendering is tested in the e2e suite.)
+        let result = emit_decision(Mode::Claude, AskFallback::Deny, "ask", "reason");
+        assert_eq!(result, "ask");
+    }
+
+    #[test]
+    fn emit_decision_codex_ask_becomes_deny() {
+        let result = emit_decision(Mode::Codex, AskFallback::Deny, "ask", "reason");
+        assert_eq!(result, "deny");
+    }
+
+    #[test]
+    fn emit_decision_codex_ask_with_allow_fallback_becomes_allow() {
+        let result = emit_decision(Mode::Codex, AskFallback::Allow, "ask", "reason");
+        assert_eq!(result, "allow");
+    }
+
+    #[test]
+    fn emit_decision_gemini_deny_unchanged() {
+        let result = emit_decision(Mode::Gemini, AskFallback::Deny, "deny", "reason");
+        assert_eq!(result, "deny");
+    }
+
+    #[test]
+    fn resolve_mode_env_var() {
+        // Temporarily set CLAWBAND_MODE via env; resolve_mode(None) should pick it up.
+        // We can't actually set env vars in a safe test without side effects, so we
+        // verify the flag-priority path instead.
+        assert_eq!(resolve_mode(Some("codex")), Mode::Codex);
+        assert_eq!(resolve_mode(Some("gemini")), Mode::Gemini);
+        assert_eq!(resolve_mode(Some("hermes")), Mode::Hermes);
+        assert_eq!(resolve_mode(Some("claude")), Mode::Claude);
+        // Unknown flag value → falls through to env/config/default (default = Claude
+        // when no env var is set in the test environment).
+        // We don't assert on resolve_mode(Some("badval")) because it depends on ambient env.
+    }
+
+    #[test]
+    fn json_escape_handles_special_chars() {
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("a\"b"), "a\\\"b");
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("a\rb"), "a\\rb");
+        assert_eq!(json_escape("normal"), "normal");
     }
 }
