@@ -169,6 +169,31 @@ fn e2e_default_decision_config() {
 }
 
 #[test]
+fn e2e_long_command_with_multibyte_does_not_crash_logger() {
+    // Regression: log_action truncated by BYTE index, which panics if a multibyte
+    // char straddles the cut — and because logging runs before the decision is
+    // emitted, the crashed hook would fail OPEN. Build a denied command with a
+    // 3-byte char at byte boundary 200, with logging ON, and assert it still denies.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_utf8_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let h = home.to_str().unwrap();
+
+    let mut cmd = "a".repeat(199); // bytes 0..199
+    cmd.push('€'); // 3 bytes at 199,200,201 — byte 200 is mid-char
+    cmd.push_str(" ; docker system prune"); // denied segment
+
+    let out = run(&bash(&cmd), &[("HOME", h), ("CLAWBAND_LOG", "1")]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "must still deny (no panic / fail-open) on multibyte-boundary command"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn e2e_version_flag() {
     let out = run("", &[]); // stdin unused for --version path; invoke separately
     let _ = out;
