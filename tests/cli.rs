@@ -132,6 +132,43 @@ fn e2e_allow_pattern_emits_explicit_allow() {
 }
 
 #[test]
+fn e2e_default_decision_config() {
+    // default_decision in ~/.clawband/config controls what an unmatched command does.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_dd_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    let h = home.to_str().unwrap();
+    let unmatched = bash("echo hello world"); // matches nothing
+
+    // passthrough (default) → silent
+    fs::write(
+        home.join(".clawband/config"),
+        "default_decision = passthrough\n",
+    )
+    .unwrap();
+    assert_eq!(decision(&run(&unmatched, &[("HOME", h)])), None);
+
+    // allow → explicit allow
+    fs::write(home.join(".clawband/config"), "default_decision = allow\n").unwrap();
+    assert_eq!(decision(&run(&unmatched, &[("HOME", h)])), Some("allow"));
+
+    // ask → explicit ask
+    fs::write(home.join(".clawband/config"), "default_decision = ask\n").unwrap();
+    assert_eq!(decision(&run(&unmatched, &[("HOME", h)])), Some("ask"));
+
+    // a denied command is STILL denied regardless of default_decision=allow
+    fs::write(home.join(".clawband/config"), "default_decision = allow\n").unwrap();
+    assert_eq!(
+        decision(&run(&bash("docker system prune"), &[("HOME", h)])),
+        Some("deny"),
+        "default_decision must not override deny patterns"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn e2e_version_flag() {
     let out = run("", &[]); // stdin unused for --version path; invoke separately
     let _ = out;

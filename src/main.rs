@@ -406,6 +406,41 @@ fn project_config_dir() -> Option<PathBuf> {
     }
 }
 
+/// The decision for a command that matches no deny/ask/allow pattern. Read from a
+/// `config` file (`default_decision = passthrough | allow | ask`); project config
+/// overrides global. Defaults to "passthrough" (stay silent, let Claude Code's
+/// native permission check handle it).
+fn default_decision() -> &'static str {
+    let read = |dir: PathBuf| -> Option<String> {
+        let text = fs::read_to_string(dir.join("config")).ok()?;
+        for line in text.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == "default_decision" {
+                    return Some(
+                        v.trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_ascii_lowercase(),
+                    );
+                }
+            }
+        }
+        None
+    };
+    let val = project_config_dir()
+        .and_then(read)
+        .or_else(|| read(config_dir()));
+    match val.as_deref() {
+        Some("allow") => "allow",
+        Some("ask") => "ask",
+        _ => "passthrough",
+    }
+}
+
 // ─── RTK prefix stripping ─────────────────────────────────────────────────────
 
 fn strip_rtk(cmd: &str) -> String {
@@ -925,6 +960,15 @@ const ALLOW_TEMPLATE: &str = "# allow.patterns — patterns that override deny/a
 # Example: allow git reset --hard only to HEAD\n\
 # git reset --hard HEAD$\n";
 
+const CONFIG_TEMPLATE: &str = "# clawband config\n\
+#\n\
+# What clawband decides for a command that matches NO deny/ask/allow pattern:\n\
+#   passthrough  (default) — stay silent; Claude Code's native permission check handles it\n\
+#   allow                  — emit `allow` so clawband is the sole gatekeeper (no native prompts)\n\
+#   ask                    — review everything not explicitly allowed\n\
+# Note: a hook `ask` only prompts when NOT in bypassPermissions mode; in YOLO mode `ask` runs.\n\
+default_decision = passthrough\n";
+
 const PROTECT_PATHS_TEMPLATE: &str =
     "# protect.paths — clawband denies Write/Edit (and tamper Bash ops) on matching paths.\n\
 # One regex per line, matched case-insensitively against the absolute file path.\n\
@@ -1190,6 +1234,7 @@ fn cmd_install(extra_args: &[String]) {
     seed("deny.patterns", DENY_EXAMPLE);
     seed("ask.patterns", ASK_EXAMPLE);
     seed("allow.patterns", ALLOW_TEMPLATE);
+    seed("config", CONFIG_TEMPLATE);
 
     // 2. Wire settings.json
     println!("\n{bold}Hook{r}");
@@ -1815,6 +1860,14 @@ fn cmd_stats() {
         "  subshell scanning        {g}on{r}  {d}($() and backtick inner-command evaluation){r}"
     );
 
+    let dd = default_decision();
+    let dd_note = match dd {
+        "allow" => "clawband is the sole gatekeeper — native prompts suppressed",
+        "ask" => "unmatched commands reviewed (only prompts outside bypass mode)",
+        _ => "unmatched commands fall through to Claude Code's native check",
+    };
+    println!("  default_decision         {g}{dd}{r}  {d}({dd_note}){r}");
+
     println!("\n{bold}Options{r}");
     let flag = |on: bool| {
         if on {
@@ -2284,13 +2337,29 @@ fn main() {
         return;
     }
 
-    // Nothing flagged. If the WHOLE command is explicitly allow-listed, emit an
-    // explicit `allow` so Claude Code skips its own permission check (which has
-    // false positives, e.g. the `cd … 2>/dev/null` compound-command warning).
-    // Only a full-command match qualifies — a single allow-listed segment must
-    // not green-light an entire compound command past the native checks.
+    // Nothing flagged by deny/ask/script/subshell.
+    //
+    // 1) Explicit allow.patterns full-command match → emit `allow` so Claude Code
+    //    skips its own permission check (which has false positives, e.g. the
+    //    `cd … 2>/dev/null` compound-command warning). Only a full-command match
+    //    qualifies — a single allow-listed segment must not green-light an entire
+    //    compound command past the native checks.
     if !allow_pats.is_empty() && allow_pats.iter().any(|p| p.matches(&command)) {
         emit("allow", "Allowed by clawband allow.patterns");
+        return;
+    }
+
+    // 2) Default decision for commands no pattern matched (config: default_decision).
+    //    passthrough → stay silent and let Claude Code's native check handle it;
+    //    allow → make clawband the sole gatekeeper (suppress native prompts);
+    //    ask → review everything not explicitly allowed.
+    match default_decision() {
+        "allow" => emit("allow", "no clawband rule matched (default_decision=allow)"),
+        "ask" => emit(
+            "ask",
+            "no clawband rule matched (default_decision=ask) — approve to run",
+        ),
+        _ => {} // passthrough
     }
 }
 

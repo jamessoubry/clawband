@@ -158,6 +158,21 @@ Extend or override behaviour by editing pattern files. clawband loads two sets:
 
 When a **whole command** matches an `allow.patterns` entry, clawband returns an explicit `permissionDecision: "allow"`. This does two things: it skips clawband's own deny/ask checks, **and** it tells Claude Code to skip its *native* permission check too — so an allow-listed command won't trigger Claude Code's built-in prompts either (handy for working around false positives in its compound-command checker). A single allow-listed *segment* of a compound command does not green-light the whole command — the explicit allow only fires on a full-command match.
 
+### Default decision — make clawband the sole gatekeeper
+
+By default, a command that matches **no** pattern falls through to Claude Code's native permission system, which prompts generically for anything not in its own allow list. Set a `default_decision` in `~/.clawband/config` to change that:
+
+```toml
+# ~/.clawband/config
+default_decision = passthrough   # (default) let Claude Code's native check handle unmatched commands
+# default_decision = allow       # emit `allow` for unmatched commands — clawband becomes the sole gatekeeper
+# default_decision = ask         # review everything not explicitly allowed
+```
+
+With `default_decision = allow`, only your `deny`/`ask` patterns stop or prompt; everything else runs with no native prompt. This is what makes clawband useful **without** `bypassPermissions` mode: instead of Claude Code asking about every command, clawband silently allows the safe ones, **prompts** on `ask`-tier commands (e.g. `git reset --hard`, so you approve it only when it's a safe moment), and **hard-blocks** the dangerous ones.
+
+> Mode note: a hook `ask` decision only produces a prompt when you are **not** in `bypassPermissions`/YOLO mode. In YOLO mode an `ask` runs without prompting, so `default_decision = ask` and the `ask` tier only gate when bypass mode is off. A project-level `.clawband/config` overrides the global one.
+
 **Project** (`.clawband/` in the current working directory) — loaded in addition to global patterns when the directory exists. Useful for per-repo restrictions or allowances without affecting other projects:
 
 | File | Effect |
