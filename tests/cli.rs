@@ -204,3 +204,43 @@ fn e2e_version_flag() {
     let s = String::from_utf8_lossy(&v.stdout);
     assert!(s.starts_with("clawband v"), "got: {s}");
 }
+
+// ── Item #3: variable-indirection ask (e2e) ───────────────────────────────────
+
+#[test]
+fn e2e_var_indirection_asks() {
+    // `cmd=rm; $cmd -rf /tmp/x` — the $cmd token leads the second segment
+    let out = run(&bash("cmd=rm; $cmd -rf /tmp/x"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "variable-indirection pattern should trigger ask"
+    );
+}
+
+#[test]
+fn e2e_echo_dollar_home_no_false_positive() {
+    // `echo $HOME` has a real command word first — must not trigger ask
+    let out = run(&bash("echo $HOME"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "echo $HOME must not be flagged as variable-indirection"
+    );
+}
+
+// ── Item #4: script-scan non-regular file does not hang (e2e) ────────────────
+
+#[test]
+fn e2e_scan_nonregular_file_no_hang() {
+    // Ask clawband to evaluate `bash /dev/stdin` — the hook must not hang trying
+    // to read the non-regular file and must return no decision (safe skip).
+    let out = run(&bash("bash /dev/stdin"), &[]);
+    // No hang means we reach this assertion. The decision should be None
+    // (no pattern fires on the command itself; script scan skips /dev/stdin).
+    assert_eq!(
+        decision(&out),
+        None,
+        "non-regular script path should be skipped without hanging"
+    );
+}

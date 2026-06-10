@@ -45,8 +45,40 @@ fn tail_lines(content: &str, n: usize) -> Vec<&str> {
     lines[start..].to_vec()
 }
 
+/// Rotate the log file when it exceeds this size. The current log is renamed to
+/// `~/.clawband.log.1` (replacing any existing backup). Best-effort — any I/O
+/// error is silently ignored so that a rotation failure never blocks the hook.
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
+
+/// Rotate `~/.clawband.log` → `~/.clawband.log.1` if the log exceeds
+/// `LOG_MAX_BYTES`. Wrapped in a catch-all so any error is silently swallowed —
+/// a panic here would fail the hook open (the exact bug fixed in v2.25.0).
+fn maybe_rotate_log(path: &std::path::Path) {
+    // Guard: only rotate when file exists and is over the cap.
+    let size = match fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if size < LOG_MAX_BYTES {
+        return;
+    }
+    let backup = {
+        let mut b = path.to_path_buf();
+        let name = b
+            .file_name()
+            .map(|n| format!("{}.1", n.to_string_lossy()))
+            .unwrap_or_else(|| "clawband.log.1".to_string());
+        b.set_file_name(name);
+        b
+    };
+    // Rename current → backup (replaces any existing .1).
+    let _ = fs::rename(path, backup);
+}
+
 fn log_action(decision: &str, reason: &str, command: &str) {
     let path = log_path();
+    // Rotate before appending if the log is oversized.
+    maybe_rotate_log(&path);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -414,6 +446,16 @@ fn builtin_ask() -> Vec<Pattern> {
             "chmod (sensitive path)",
             r"\bchmod\b.*(/etc/|/usr/|~/\.ssh)",
         ),
+        // ── Variable-indirection command execution ────────────────────────────
+        // Catches assign-then-execute patterns where a variable is the FIRST word
+        // of a command segment, e.g. `cmd=rm; $cmd -rf /tmp/x` or `$X arg`.
+        // ASK (not deny) — heuristic with false-positive risk; commands like
+        // `echo $VAR` or `git $subcmd` have a real command word first and do NOT
+        // match because the pattern requires $VAR to be the leading token.
+        (
+            "variable-indirection command execution",
+            r"(^|;|\|\|?|&&)\s*\$\{?\w+\}?\s",
+        ),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -508,6 +550,12 @@ fn strip_sqz(cmd: &str) -> String {
 // deny/ask patterns. Handles shell, Python, JS/TS, Perl, and Lua files.
 // Skips inline-execution flags (-c, -m, -e). Unreadable paths fail gracefully.
 
+/// Maximum script file size to scan. Files larger than this are skipped (no
+/// decision) so the hook never reads an unbounded file into memory. Non-regular
+/// files (FIFOs, devices, sockets) are also skipped so the hook never hangs
+/// trying to read from a blocking special file.
+const SCRIPT_SCAN_MAX_BYTES: u64 = 1024 * 1024; // 1 MiB
+
 fn path_basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -587,6 +635,16 @@ fn scan_script_file(
     ask_pats: &[Pattern],
     allow_pats: &[Pattern],
 ) -> Option<(String, String)> {
+    // Skip non-regular files (FIFOs, devices, sockets, /dev/stdin, etc.) to
+    // avoid hanging the hook on a blocking read.  Also skip files over the size
+    // cap so we never pull a huge file into memory.
+    let meta = fs::metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    if meta.len() > SCRIPT_SCAN_MAX_BYTES {
+        return None;
+    }
     let content = fs::read_to_string(path).ok()?;
     let is_js = path.ends_with(".js")
         || path.ends_with(".mjs")
@@ -1022,7 +1080,11 @@ const PROTECT_PATHS_TEMPLATE: &str =
 ~/.claude/hooks/clawband$\n\
 ~/.clawband/.*\n\
 # Shell startup files — block injecting CLAWBAND_SKIP=1 (or hook removal) here.\n\
-~/\\.(bash_profile|bashrc|profile|zshrc|zprofile|zshenv)$\n";
+~/\\.(bash_profile|bashrc|profile|zshrc|zprofile|zshenv)$\n\
+# Auto-executed files — protect git hooks and direnv config from silent injection.\n\
+# Add conftest.py, package.json, Makefile, etc. manually if your project warrants it.\n\
+\\.git/hooks/\n\
+(^|/)\\.envrc$\n";
 
 fn settings_path() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_default()).join(".claude/settings.json")
@@ -3021,9 +3083,9 @@ mod tests {
         raw_lines
             .iter()
             .filter_map(|l| {
-                let expanded = if l.starts_with("~/") {
+                let expanded = if let Some(rest) = l.strip_prefix("~/") {
                     // In tests we don't have a real HOME — substitute a fixed prefix
-                    format!("/home/testuser/{}", &l[2..])
+                    format!("/home/testuser/{}", rest)
                 } else {
                     l.to_string()
                 };
@@ -3872,5 +3934,128 @@ mod tests {
     fn chmod_plus_x_user_file_passes() {
         // chmod +x on a local file — safe
         assert_eq!(decision("chmod +x ./build.sh"), None);
+    }
+
+    // ── Item #3: variable-indirection command execution ───────────────────────
+
+    #[test]
+    fn var_indirection_cmd_rm_asks() {
+        // `cmd=rm; $cmd -rf /tmp/x` — $cmd is the first token after the semicolon
+        assert_eq!(decision("cmd=rm; $cmd -rf /tmp/x"), Some("ask".into()));
+    }
+
+    #[test]
+    fn var_indirection_bare_dollar_asks() {
+        // `$X arg` — bare variable as first command word
+        assert_eq!(decision("$X dangerous"), Some("ask".into()));
+    }
+
+    #[test]
+    fn var_indirection_echo_dollar_no_false_positive() {
+        // `echo $HOME` — real command word first, $HOME is just an argument
+        assert_eq!(decision("echo $HOME"), None);
+    }
+
+    #[test]
+    fn var_indirection_cd_dollar_no_false_positive() {
+        // `cd $HOME` — real command word first
+        assert_eq!(decision("cd $HOME"), None);
+    }
+
+    #[test]
+    fn var_indirection_git_dollar_no_false_positive() {
+        // `git $cmd` — real command word first, $cmd is a subcommand arg
+        assert_eq!(decision("git $cmd"), None);
+    }
+
+    // ── Item #4: scan_script_file robustness ──────────────────────────────────
+
+    #[test]
+    fn scan_script_file_nonregular_skipped() {
+        // /dev/stdin is a non-regular file — the scanner must skip it silently
+        // without hanging. (If the machine doesn't have /dev/stdin this is a
+        // no-op pass, which is also acceptable behaviour.)
+        let result = scan_script_file("/dev/stdin", &deny_pats(), &ask_pats(), &no_allow());
+        // Must not hang and must return None (no decision on non-regular file).
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn scan_script_oversized_file_skipped() {
+        use std::io::Write;
+        let path = format!("/tmp/clawband_test_{}_oversized.sh", std::process::id());
+        // Write a file larger than SCRIPT_SCAN_MAX_BYTES (1 MiB).
+        // Fill with benign content so the only reason to skip is size.
+        let mut f = fs::File::create(&path).unwrap();
+        let line = b"echo hello\n";
+        let needed = (SCRIPT_SCAN_MAX_BYTES as usize / line.len()) + 1;
+        for _ in 0..needed {
+            f.write_all(line).unwrap();
+        }
+        drop(f);
+        let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            result, None,
+            "oversized file should be skipped (no decision)"
+        );
+    }
+
+    // ── Item #7: log rotation ─────────────────────────────────────────────────
+
+    #[test]
+    fn log_rotation_creates_backup_and_resets_live_log() {
+        use std::io::Write;
+        // Set up a temp HOME so we can control the log path.
+        let home = std::env::temp_dir().join(format!("cb_logrot_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+
+        // Write a log file that exceeds LOG_MAX_BYTES.
+        let log = home.join(".clawband.log");
+        let mut f = fs::File::create(&log).unwrap();
+        // Write just over the cap using 1-byte chunks to avoid big allocation.
+        let chunk = b"x";
+        for _ in 0..(LOG_MAX_BYTES + 1) {
+            f.write_all(chunk).unwrap();
+        }
+        drop(f);
+        assert!(log.metadata().unwrap().len() > LOG_MAX_BYTES);
+
+        // Call maybe_rotate_log directly.
+        maybe_rotate_log(&log);
+
+        // The backup should now exist.
+        let backup = home.join(".clawband.log.1");
+        assert!(
+            backup.exists(),
+            ".clawband.log.1 backup should be created after rotation"
+        );
+        // The live log should be gone (renamed to backup, not yet recreated).
+        assert!(
+            !log.exists(),
+            ".clawband.log should be gone after rotation (renamed)"
+        );
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    // ── Item #2: PROTECT_PATHS_TEMPLATE contains auto-executed-file patterns ──
+
+    #[test]
+    fn protect_paths_template_contains_git_hooks() {
+        assert!(
+            PROTECT_PATHS_TEMPLATE.contains(".git/hooks/"),
+            "PROTECT_PATHS_TEMPLATE should include .git/hooks/ pattern"
+        );
+    }
+
+    #[test]
+    fn protect_paths_template_contains_envrc() {
+        assert!(
+            PROTECT_PATHS_TEMPLATE.contains(".envrc"),
+            "PROTECT_PATHS_TEMPLATE should include .envrc pattern"
+        );
     }
 }
