@@ -931,7 +931,9 @@ const PROTECT_PATHS_TEMPLATE: &str =
 # A leading ~/ is expanded to your home directory.\n\
 ~/.claude/settings\\.json$\n\
 ~/.claude/hooks/clawband$\n\
-~/.clawband/.*\n";
+~/.clawband/.*\n\
+# Shell startup files — block injecting CLAWBAND_SKIP=1 (or hook removal) here.\n\
+~/\\.(bash_profile|bashrc|profile|zshrc|zprofile|zshenv)$\n";
 
 fn settings_path() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_default()).join(".claude/settings.json")
@@ -1088,6 +1090,61 @@ fn register_edit_hook(settings: &mut serde_json::Value, command: &str) -> bool {
     *pre_val != before
 }
 
+/// True if a command is the clawband PostToolUse companion (`clawband post`).
+fn is_clawband_post_command(cmd: &str) -> bool {
+    let mut toks = cmd.split_whitespace();
+    let Some(first) = toks.next() else {
+        return false;
+    };
+    let base = first.rsplit('/').next().unwrap_or(first);
+    base == "clawband" && toks.next() == Some("post")
+}
+
+/// True if the PostToolUse `clawband post` hook is registered.
+fn post_hook_present(settings: &serde_json::Value) -> bool {
+    settings["hooks"]["PostToolUse"]
+        .as_array()
+        .map(|entries| {
+            entries.iter().any(|e| {
+                e["hooks"].as_array().is_some_and(|hooks| {
+                    hooks
+                        .iter()
+                        .any(|h| h["command"].as_str().is_some_and(is_clawband_post_command))
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Register the PostToolUse `clawband post` hook (matcher Bash). Idempotent.
+fn register_post_hook(settings: &mut serde_json::Value, command: &str) -> bool {
+    use serde_json::json;
+    if post_hook_present(settings) {
+        return false;
+    }
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let obj = settings.as_object_mut().unwrap();
+    let hooks_obj = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks_obj.is_object() {
+        *hooks_obj = json!({});
+    }
+    let post_val = hooks_obj
+        .as_object_mut()
+        .unwrap()
+        .entry("PostToolUse")
+        .or_insert_with(|| json!([]));
+    if !post_val.is_array() {
+        *post_val = json!([]);
+    }
+    post_val
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}));
+    true
+}
+
 /// Returns true if the Write|Edit|MultiEdit|NotebookEdit protect hook is registered.
 fn edit_hook_present(settings: &serde_json::Value) -> bool {
     settings["hooks"]["PreToolUse"]
@@ -1108,6 +1165,7 @@ fn edit_hook_present(settings: &serde_json::Value) -> bool {
 
 fn cmd_install(extra_args: &[String]) {
     let protect = extra_args.iter().any(|a| a == "--protect");
+    let post = extra_args.iter().any(|a| a == "--post");
 
     let g = "\x1b[32m";
     let y = "\x1b[33m";
@@ -1210,6 +1268,34 @@ fn cmd_install(extra_args: &[String]) {
             cfg.display(),
             r = r
         );
+    }
+
+    // 4. PostToolUse companion (--post flag)
+    if post {
+        println!("\n{bold}PostToolUse companion{r}");
+        let post_cmd = format!("{} post", command);
+        let mut settings_p: serde_json::Value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if register_post_hook(&mut settings_p, &post_cmd) {
+            match serde_json::to_string_pretty(&settings_p) {
+                Ok(out) => {
+                    if fs::write(&path, out + "\n").is_ok() {
+                        println!("  {g}registered{r} PostToolUse hook → {d}{}{r}", post_cmd);
+                        println!(
+                            "  {d}After you approve a prompted command, clawband suggests the exact{r}"
+                        );
+                        println!("  {d}`clawband allow` to stop being asked again.{r}");
+                    } else {
+                        println!("  {y}failed to write {}{r}", path.display());
+                    }
+                }
+                Err(_) => println!("  {y}failed to serialize settings{r}"),
+            }
+        } else {
+            println!("  {d}post hook already registered{r}");
+        }
     }
 
     println!("\n{g}Done.{r} Run {bold}/hooks{r} in Claude Code (or restart) to activate.");
@@ -1571,7 +1657,7 @@ fn cmd_help() {
     println!("{bold}Commands{r}");
     println!("  {g}allow{r} {d}[--project] '<pattern>'{r}   Append a regex to allow.patterns");
     println!("  {y}deny{r}  {d}[--project] '<pattern>'{r}   Append a regex to deny.patterns");
-    println!("  {b}install{r}                     Wire the hook into ~/.claude/settings.json + seed config");
+    println!("  {b}install{r} {d}[--protect][--post]{r}   Wire the hook into ~/.claude/settings.json + seed config");
     println!("  {b}install --protect{r}           Also enable self-protect (guard clawband files from edits)");
     println!(
         "  {b}verify{r}                      Check the hook is registered and the engine works"
@@ -2747,6 +2833,42 @@ mod tests {
             }
         });
         assert!(!clawband_hook_present(&s));
+    }
+
+    #[test]
+    fn register_post_hook_adds_and_is_idempotent() {
+        let mut s = serde_json::json!({});
+        assert!(register_post_hook(&mut s, "clawband post"));
+        assert!(post_hook_present(&s));
+        // second call is a no-op
+        assert!(!register_post_hook(&mut s, "clawband post"));
+        let arr = s["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[test]
+    fn register_post_hook_preserves_existing_post_hooks() {
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": "", "hooks": [{"type": "command", "command": "/x/icm hook post"}]}
+                ]
+            }
+        });
+        assert!(register_post_hook(&mut s, "clawband post"));
+        let arr = s["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr
+            .iter()
+            .any(|e| e["hooks"][0]["command"].as_str() == Some("/x/icm hook post")));
+    }
+
+    #[test]
+    fn is_clawband_post_command_cases() {
+        assert!(is_clawband_post_command("clawband post"));
+        assert!(is_clawband_post_command("~/.claude/hooks/clawband post"));
+        assert!(!is_clawband_post_command("clawband")); // main hook, not post
+        assert!(!is_clawband_post_command("/x/icm hook post"));
     }
 
     // ── self-protect: edit_protected helper ───────────────────────────────────
