@@ -788,3 +788,35 @@ fn e2e_opencode_ask_fallback_deny_config() {
     );
     let _ = fs::remove_dir_all(&home);
 }
+
+// ── kill / killall / pkill e2e tests ─────────────────────────────────────────
+
+#[test]
+fn e2e_kill_minus9_minus1_deny() {
+    let out = run(&bash("kill -9 -1"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "kill -9 -1 must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_killall_node_ask() {
+    let out = run(&bash("killall node"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "killall node must prompt for confirmation: {out}"
+    );
+}
+
+#[test]
+fn e2e_kill_specific_pid_pass() {
+    let out = run(&bash("kill 1234"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "plain kill <pid> must pass through: {out}"
+    );
+}

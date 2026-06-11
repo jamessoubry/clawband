@@ -126,6 +126,9 @@ clawband upgrade --check  # report whether an update is available (no download)
 | Pipe to system tools | `\| patch`, `\| crontab`, `\| at` |
 | find / xargs escalation | `find ... -delete`, `-exec bash`, `-exec rm`, `xargs sh`, `xargs python`, etc. |
 | git force push | `git push --force` / `-f` (allows `--force-with-lease`) |
+| kill -1 (all processes) | `kill -9 -1`, `kill -- -1`, `kill -s KILL -1`, `kill -SIGKILL -1` — sends a signal to PID `-1`, which targets every process the user can signal |
+| pkill/killall -u (all of a user's processes) | `pkill -u $USER`, `killall -u jsoubry` — terminates every process owned by the specified user |
+| killall5 | `killall5` — kills all processes regardless of owner (used in shutdown sequences) |
 
 ### Prompted (ask)
 
@@ -143,6 +146,8 @@ clawband upgrade --check  # report whether an update is available (no download)
 | base64 decode | `base64 -d`, `base64 --decode` piped or redirected — decoding obfuscated content is an anti-inspection vector |
 | xxd reverse | `xxd -r` piped or redirected — hex-decode used to smuggle binary payloads |
 | openssl decode | `openssl base64 -d`, `openssl enc -d` — SSL-tool decoding to evade text scanning |
+| killall \<name\> | `killall node`, `killall python3` — kills every process matching a name; broad but often legitimate |
+| pkill \<pattern\> | `pkill python`, `pkill -f someserver` — kills every process matching a name or pattern |
 
 ### Safe patterns preserved
 
@@ -150,6 +155,7 @@ clawband upgrade --check  # report whether an update is available (no download)
 - `| python3 -m module` — module invocation is allowed
 - `--force-with-lease` — safe alternative to force push
 - `find . -exec cmd {} \;` — the `\;` terminator is not treated as a command separator
+- `kill <pid>`, `kill -9 <pid>`, `kill -1 <pid>` — plain kill with a specific PID is always allowed; `-1` is only blocked when it appears as the final (target) argument with no PID following it
 
 ## Custom patterns
 
