@@ -439,6 +439,16 @@ fn suggestion_for(label: &str) -> Option<&'static str> {
         "base64 decode piped" => {
             "If the payload is trusted, decode to a file first so clawband can scan it before it runs."
         }
+        "kill -1 (signals every process)" => {
+            "Target a specific PID or process group instead of -1 (which signals every process)."
+        }
+        "pkill/killall -u (all of a user's processes)" => {
+            "Narrow to a specific process by name or PID instead of killing every process for a user."
+        }
+        "killall (kills all processes matching a name)"
+        | "pkill (kills all processes matching a pattern)" => {
+            "Prefer `kill <pid>` for a specific process; killall/pkill match every process by name."
+        }
         _ => return None,
     };
     Some(s)
@@ -587,6 +597,25 @@ fn builtin_deny() -> Vec<Pattern> {
             "node fs.rmdirSync (root/home)",
             r#"(?:fs\.)?rmdirSync\s*\(\s*['"](?:/|~)"#,
         ),
+        // ── kill signal to PID -1 (nukes every process the user can signal) ──
+        // `kill -9 -1`, `kill -- -1`, `kill -s KILL -1`, `kill -SIGKILL -1`, `kill -1`
+        // Regex: `kill` followed by any flags, ending with ` -1` at EOL.
+        // MUST NOT match `kill -1 1234` (-1 is the *signal* there, not the target PID)
+        // or `kill -9 -1234` (process *group* 1234, a targeted operation).
+        // The `$` anchor ensures -1 is the final (target) argument, not a flag/signal.
+        (
+            "kill -1 (signals every process)",
+            r"\bkill\s+(?:\S+\s+)*-1\s*$",
+        ),
+        // ── pkill/killall -u <user> (kills every process owned by a user) ──────
+        // `pkill -u $USER`, `killall -u jsoubry`, `pkill -9 -u me`
+        // `-u` may appear with `=` (long-opt style) or whitespace or at EOL.
+        (
+            "pkill/killall -u (all of a user's processes)",
+            r"\b(?:pkill|killall)\b[^;|&]*\s-u(?:[=\s]|$)",
+        ),
+        // ── killall5 — kills all processes (used in shutdown sequences) ──────
+        ("killall5 (kills all processes)", r"\bkillall5\b"),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -736,6 +765,21 @@ fn builtin_ask() -> Vec<Pattern> {
         (
             "variable-indirection command execution",
             r"(^|;|\|\|?|&&)\s*\$\{?\w+\}?\s",
+        ),
+        // ── killall <name> — kills ALL processes matching a name ──────────────
+        // ASK (not deny): `killall node`, `killall python3` are often legitimate
+        // but broad. Deny patterns for killall5 and killall -u hit deny first.
+        // `\bkillall\b` does NOT match `killall5` (no word boundary before `5`).
+        (
+            "killall (kills all processes matching a name)",
+            r"\bkillall\b",
+        ),
+        // ── pkill <name/pattern> — kills ALL matching processes ───────────────
+        // ASK (not deny): `pkill python`, `pkill -f someserver` are often
+        // intentional but broad. `pkill -u x` hits deny #2 first.
+        (
+            "pkill (kills all processes matching a pattern)",
+            r"\bpkill\b",
         ),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
@@ -5409,5 +5453,146 @@ mod tests {
     fn emit_decision_opencode_allow_unchanged() {
         let result = emit_decision(Mode::Opencode, AskFallback::Deny, "allow", "allowed");
         assert_eq!(result, "allow");
+    }
+
+    // ── kill / killall / pkill tiered patterns ────────────────────────────────
+
+    // DENY: kill -1 variants (signals every process)
+    #[test]
+    fn kill_minus9_minus1_denied() {
+        assert_eq!(decision("kill -9 -1"), Some("deny".into()));
+    }
+
+    #[test]
+    fn kill_double_dash_minus1_denied() {
+        assert_eq!(decision("kill -- -1"), Some("deny".into()));
+    }
+
+    #[test]
+    fn kill_s_kill_minus1_denied() {
+        assert_eq!(decision("kill -s KILL -1"), Some("deny".into()));
+    }
+
+    #[test]
+    fn kill_sigkill_minus1_denied() {
+        assert_eq!(decision("kill -SIGKILL -1"), Some("deny".into()));
+    }
+
+    #[test]
+    fn kill_bare_minus1_denied() {
+        // bare `kill -1` — -1 is both the signal (HUP) and the target PID;
+        // target -1 = all processes the user can signal
+        assert_eq!(decision("kill -1"), Some("deny".into()));
+    }
+
+    // DENY: pkill/killall -u (all of a user's processes)
+    #[test]
+    fn pkill_u_user_denied() {
+        assert_eq!(decision("pkill -u $USER"), Some("deny".into()));
+    }
+
+    #[test]
+    fn killall_u_username_denied() {
+        assert_eq!(decision("killall -u jsoubry"), Some("deny".into()));
+    }
+
+    #[test]
+    fn pkill_9_u_denied() {
+        assert_eq!(decision("pkill -9 -u me"), Some("deny".into()));
+    }
+
+    // DENY: killall5
+    #[test]
+    fn killall5_denied() {
+        assert_eq!(decision("killall5"), Some("deny".into()));
+    }
+
+    #[test]
+    fn killall5_with_signal_denied() {
+        assert_eq!(decision("killall5 -9"), Some("deny".into()));
+    }
+
+    // ASK: killall <name> — broad but often legitimate
+    #[test]
+    fn killall_node_asks() {
+        assert_eq!(decision("killall node"), Some("ask".into()));
+    }
+
+    #[test]
+    fn killall_python3_asks() {
+        assert_eq!(decision("killall python3"), Some("ask".into()));
+    }
+
+    // ASK: pkill <name/pattern> — broad but often legitimate
+    #[test]
+    fn pkill_python_asks() {
+        assert_eq!(decision("pkill python"), Some("ask".into()));
+    }
+
+    #[test]
+    fn pkill_f_someserver_asks() {
+        assert_eq!(decision("pkill -f someserver"), Some("ask".into()));
+    }
+
+    // PASS: plain kill with a specific PID — must NOT be blocked
+    #[test]
+    fn kill_specific_pid_passes() {
+        assert_eq!(decision("kill 1234"), None);
+    }
+
+    #[test]
+    fn kill_9_specific_pid_passes() {
+        assert_eq!(decision("kill -9 1234"), None);
+    }
+
+    // PASS: kill -1 <pid> — here -1 is the *signal* (SIGHUP), not the target PID
+    #[test]
+    fn kill_signal_1_to_specific_pid_passes() {
+        assert_eq!(decision("kill -1 1234"), None);
+    }
+
+    // PASS: kill %1 — job control, targets a specific job, not PID -1
+    #[test]
+    fn kill_job_spec_passes() {
+        assert_eq!(decision("kill %1"), None);
+    }
+
+    // PASS: kill -9 -1234 — negative number is a process *group* 1234 (targeted)
+    #[test]
+    fn kill_9_process_group_passes() {
+        assert_eq!(decision("kill -9 -1234"), None);
+    }
+
+    // Compound: `foo && kill -9 -1` must DENY via segment splitting
+    #[test]
+    fn compound_kill_minus1_denied() {
+        assert_eq!(decision("echo hi && kill -9 -1"), Some("deny".into()));
+    }
+
+    // Compound: `ls; killall node` must ASK
+    #[test]
+    fn compound_killall_asks() {
+        assert_eq!(decision("ls; killall node"), Some("ask".into()));
+    }
+
+    // Suggestions present for kill labels
+    #[test]
+    fn kill_minus1_suggestion_present() {
+        assert!(reason("kill -9 -1").contains("Safe alternative:"));
+    }
+
+    #[test]
+    fn pkill_killall_u_suggestion_present() {
+        assert!(reason("pkill -u $USER").contains("Safe alternative:"));
+    }
+
+    #[test]
+    fn killall_name_suggestion_present() {
+        assert!(reason("killall node").contains("Safe alternative:"));
+    }
+
+    #[test]
+    fn pkill_name_suggestion_present() {
+        assert!(reason("pkill python").contains("Safe alternative:"));
     }
 }
