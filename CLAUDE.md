@@ -45,6 +45,24 @@ Run `cargo test` to verify — all tests must pass before committing.
 
 Run one tick at a time: wait for the previous PR to be merged before running `/backlog` again. Most backlog items touch the same files (`src/main.rs`, `Cargo.toml`, `tests/cli.rs`) so concurrent open PRs will conflict. There is no automation to prevent this — it relies on the human running `/backlog` manually after each merge.
 
+## Backlog pipeline — tag at tick start
+
+At the very start of each tick (before creating a new branch), check if master's current version already has a release tag. If not, create and push it so release CI fires:
+
+```bash
+cd /home/ubuntu/clawband
+git checkout master && git pull origin master
+CURRENT_VERSION=$(grep '^version' Cargo.toml | head -1 | grep -oP '[\d.]+')
+if ! git tag | grep -q "^v${CURRENT_VERSION}$"; then
+  git tag "v${CURRENT_VERSION}" && git push origin "v${CURRENT_VERSION}"
+  echo "Tagged v${CURRENT_VERSION}"
+else
+  echo "v${CURRENT_VERSION} already tagged — skipping"
+fi
+```
+
+This handles the one-tick lag: user merges PR → runs `/backlog` → orchestrator tags the merged version → branches for the next issue.
+
 ## Backlog pipeline (releaser override)
 
 When the backlog pipeline runs a releaser agent for this project:
