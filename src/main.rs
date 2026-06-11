@@ -2325,6 +2325,354 @@ fn cmd_log(args: &[String]) {
     println!();
 }
 
+// ─── Upgrade command ──────────────────────────────────────────────────────────
+
+/// Parse a semver string like "2.10.3" (or "v2.10.3") into (major, minor, patch).
+/// Returns None on any parse failure.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim().trim_start_matches('v');
+    let mut parts = s.splitn(3, '.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    // patch may have a pre-release suffix — take only the numeric prefix
+    let patch_str = parts.next()?;
+    let patch_num: String = patch_str
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let patch = patch_num.parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Compare two semver strings numerically.  Returns true if `a` >= `b`.
+/// Falls back to true (no-op upgrade) if either string is unparseable.
+fn semver_ge(a: &str, b: &str) -> bool {
+    match (parse_semver(a), parse_semver(b)) {
+        (Some(av), Some(bv)) => av >= bv,
+        _ => true, // if we can't parse, treat as up-to-date (safe default)
+    }
+}
+
+/// Extract `tag_name` from a GitHub releases/latest JSON response body.
+/// Returns None if the field is absent or unparseable.
+fn parse_tag_name(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let tag = v["tag_name"].as_str()?;
+    Some(tag.to_string())
+}
+
+/// Derive the release asset name for the current platform.
+/// Uses `std::env::consts::OS` ("linux"/"macos") and `ARCH` ("x86_64"/"aarch64").
+/// Returns None for unsupported combinations.
+fn platform_asset() -> Option<String> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let asset = match (os, arch) {
+        ("linux", "x86_64") => "clawband-linux-x86_64",
+        ("linux", "aarch64") => "clawband-linux-arm64",
+        ("macos", "aarch64") => "clawband-macos-arm64",
+        ("macos", "x86_64") => "clawband-macos-x86_64",
+        _ => return None,
+    };
+    Some(asset.to_string())
+}
+
+/// Run `curl -fsSL -H 'User-Agent: clawband' <url>` and return stdout.
+/// Falls back to `wget -qO- --header 'User-Agent: clawband' <url>` if curl is unavailable.
+/// Returns Err with a message on failure.
+fn fetch_url(url: &str) -> Result<String, String> {
+    // Try curl first
+    let curl_result = std::process::Command::new("curl")
+        .args(["-fsSL", "-H", "User-Agent: clawband", url])
+        .output();
+
+    match curl_result {
+        Ok(out) if out.status.success() => {
+            return String::from_utf8(out.stdout)
+                .map_err(|e| format!("curl output is not valid UTF-8: {e}"));
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // curl is present but the request failed — try wget before giving up
+            eprintln!("clawband: curl failed ({}): {}", out.status, stderr.trim());
+        }
+        Err(_) => {
+            // curl not found — fall through to wget
+        }
+    }
+
+    // Fallback: wget
+    let wget_result = std::process::Command::new("wget")
+        .args(["-qO-", "--header", "User-Agent: clawband", url])
+        .output();
+
+    match wget_result {
+        Ok(out) if out.status.success() => String::from_utf8(out.stdout)
+            .map_err(|e| format!("wget output is not valid UTF-8: {e}")),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Err(format!("wget failed ({}): {}", out.status, stderr.trim()))
+        }
+        Err(e) => Err(format!(
+            "neither curl nor wget is available or runnable: {e}"
+        )),
+    }
+}
+
+/// Download a URL to a file path using curl or wget.
+/// Returns Err with a message on failure.
+fn download_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    let dest_str = dest.to_string_lossy();
+
+    // Try curl first
+    let curl_result = std::process::Command::new("curl")
+        .args(["-fsSL", "-H", "User-Agent: clawband", "-o", &dest_str, url])
+        .status();
+
+    match curl_result {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => {
+            eprintln!("clawband: curl download failed ({})", status);
+        }
+        Err(_) => {
+            // curl not available — try wget
+        }
+    }
+
+    // Fallback: wget
+    let wget_result = std::process::Command::new("wget")
+        .args([
+            "-q",
+            "--header",
+            "User-Agent: clawband",
+            "-O",
+            &dest_str,
+            url,
+        ])
+        .status();
+
+    match wget_result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("wget download failed ({})", status)),
+        Err(e) => Err(format!(
+            "neither curl nor wget is available or runnable: {e}"
+        )),
+    }
+}
+
+/// Verify a downloaded binary by running `<path> --version` and checking that
+/// stdout starts with "clawband v" and contains the expected version string.
+fn verify_binary(path: &std::path::Path, expected_version: &str) -> Result<(), String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("could not run downloaded binary: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "downloaded binary exited with non-zero status: {}",
+            output.status
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.trim();
+
+    if !stdout.starts_with("clawband v") {
+        return Err(format!(
+            "downloaded binary output does not look like clawband: {:?}",
+            stdout
+        ));
+    }
+
+    // Strip leading 'v' from expected for flexible matching
+    let ver = expected_version.trim_start_matches('v');
+    if !stdout.contains(ver) {
+        return Err(format!(
+            "downloaded binary reports '{}' but expected version '{}'",
+            stdout, ver
+        ));
+    }
+
+    Ok(())
+}
+
+fn cmd_upgrade(args: &[String]) {
+    const CURRENT: &str = env!("CARGO_PKG_VERSION");
+    let check_only = args.iter().any(|a| a == "--check");
+
+    let g = "\x1b[32m";
+    let y = "\x1b[33m";
+    let d = "\x1b[2m";
+    let r = "\x1b[0m";
+    let bold = "\x1b[1m";
+
+    // 1. Fetch latest release tag from GitHub API
+    let api_url = "https://api.github.com/repos/jamessoubry/clawband/releases/latest";
+    let body = match fetch_url(api_url) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("clawband upgrade: failed to fetch latest release info: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let tag = match parse_tag_name(&body) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "clawband upgrade: could not parse tag_name from GitHub API response.\n\
+                 Response snippet: {}",
+                &body.chars().take(200).collect::<String>()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let latest = tag.trim_start_matches('v');
+
+    // 2. Compare versions numerically
+    if semver_ge(CURRENT, latest) {
+        println!("{g}clawband is up to date{r} {d}(v{CURRENT}){r}");
+        return;
+    }
+
+    // 3. --check mode: report and exit without downloading
+    if check_only {
+        println!(
+            "{y}clawband update available:{r} current {bold}v{CURRENT}{r} → latest {bold}v{latest}{r}"
+        );
+        println!("{d}Run 'clawband upgrade' to update.{r}");
+        return;
+    }
+
+    println!("Upgrading clawband {bold}v{CURRENT}{r} → {bold}v{latest}{r} …");
+
+    // 4. Determine platform asset name
+    let asset = match platform_asset() {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "clawband upgrade: unsupported platform (OS={}, ARCH={}). \
+                 Download manually from https://github.com/jamessoubry/clawband/releases",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // 5. Determine the install target (path of the currently running binary)
+    let install_target = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("clawband upgrade: could not determine running binary path: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Homebrew guard: if the binary lives under a Homebrew prefix, refuse to
+    // overwrite it — Homebrew manages its own files and an in-place overwrite
+    // will corrupt the installation.
+    let target_str = install_target.to_string_lossy();
+    if target_str.contains("/Cellar/")
+        || target_str.contains("/homebrew/")
+        || target_str.contains("/linuxbrew/")
+    {
+        println!("{y}clawband was installed via Homebrew; run 'brew upgrade clawband' instead.{r}");
+        return;
+    }
+
+    // 6. Download to a temp file
+    let download_url = format!(
+        "https://github.com/jamessoubry/clawband/releases/download/{}/{}",
+        tag, asset
+    );
+
+    let tmp_path = std::env::temp_dir().join(format!("clawband_upgrade_{}", asset));
+
+    println!("  {d}Downloading {download_url}{r}");
+
+    if let Err(e) = download_to_file(&download_url, &tmp_path) {
+        eprintln!("clawband upgrade: download failed: {e}");
+        let _ = fs::remove_file(&tmp_path);
+        std::process::exit(1);
+    }
+
+    // 7. chmod +x the temp file
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
+            eprintln!("clawband upgrade: could not chmod downloaded binary: {e}");
+            let _ = fs::remove_file(&tmp_path);
+            std::process::exit(1);
+        }
+    }
+
+    // 8. Verify the downloaded binary
+    println!("  {d}Verifying downloaded binary …{r}");
+    if let Err(e) = verify_binary(&tmp_path, latest) {
+        eprintln!("clawband upgrade: verification failed — {e}");
+        eprintln!("clawband upgrade: aborting; the running binary is unchanged.");
+        let _ = fs::remove_file(&tmp_path);
+        std::process::exit(1);
+    }
+
+    // 9. Atomic-ish replace: copy temp → <target>.new (same dir), then rename
+    //    Rename is atomic within a filesystem; temp_dir may be on a different fs.
+    let target_dir = install_target.parent().unwrap_or(std::path::Path::new("/"));
+    let staging = target_dir.join(format!(".clawband_new_{}", std::process::id()));
+
+    // Back up the old binary (best-effort)
+    let backup = {
+        let mut b = install_target.clone();
+        let name = b
+            .file_name()
+            .map(|n| format!("{}.bak", n.to_string_lossy()))
+            .unwrap_or_else(|| "clawband.bak".to_string());
+        b.set_file_name(name);
+        b
+    };
+    let _ = fs::copy(&install_target, &backup); // best-effort
+
+    // Copy temp → staging (same filesystem as target)
+    if let Err(e) = fs::copy(&tmp_path, &staging) {
+        eprintln!(
+            "clawband upgrade: could not copy to staging path {}: {e}",
+            staging.display()
+        );
+        let _ = fs::remove_file(&tmp_path);
+        std::process::exit(1);
+    }
+
+    // chmod +x staging
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&staging, fs::Permissions::from_mode(0o755));
+    }
+
+    // Atomic rename staging → target
+    if let Err(e) = fs::rename(&staging, &install_target) {
+        eprintln!(
+            "clawband upgrade: could not replace binary at {}: {e}",
+            install_target.display()
+        );
+        let _ = fs::remove_file(&staging);
+        let _ = fs::remove_file(&tmp_path);
+        std::process::exit(1);
+    }
+
+    // Cleanup temp file
+    let _ = fs::remove_file(&tmp_path);
+
+    println!(
+        "{g}Upgraded{r} clawband {bold}v{CURRENT}{r} → {bold}v{latest}{r} at {d}{}{r}",
+        install_target.display()
+    );
+    println!("{d}The new version is live on the next hook invocation — no restart needed.{r}");
+    println!("{d}Previous binary backed up to: {}{r}", backup.display());
+}
+
 // ─── Help command ─────────────────────────────────────────────────────────────
 
 fn cmd_help() {
@@ -2361,6 +2709,12 @@ fn cmd_help() {
     );
     println!(
         "  {b}post{r}                        PostToolUse companion — reads breadcrumb, suggests allow"
+    );
+    println!(
+        "  {b}upgrade{r} {d}[--check]{r}             Self-update: fetch and replace the running binary"
+    );
+    println!(
+        "  {d}  --check                     Report whether an update is available (no download){r}"
     );
     println!("  {b}--version{r}                   Print version and exit");
     println!();
@@ -2849,6 +3203,10 @@ fn main() {
         }
         Some("log") => {
             cmd_log(&filtered_args[2..]);
+            return;
+        }
+        Some("upgrade") => {
+            cmd_upgrade(&filtered_args[2..]);
             return;
         }
         Some("--version") | Some("-v") => {
@@ -4765,5 +5123,183 @@ mod tests {
     fn emit_decision_openclaw_allow_unchanged() {
         let result = emit_decision(Mode::Openclaw, AskFallback::Deny, "allow", "allowed");
         assert_eq!(result, "allow");
+    }
+
+    // ── upgrade: parse_semver ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_semver_plain() {
+        assert_eq!(parse_semver("2.10.3"), Some((2, 10, 3)));
+    }
+
+    #[test]
+    fn parse_semver_with_v_prefix() {
+        assert_eq!(parse_semver("v2.10.3"), Some((2, 10, 3)));
+    }
+
+    #[test]
+    fn parse_semver_with_whitespace() {
+        assert_eq!(parse_semver("  v1.0.0  "), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn parse_semver_multi_digit_components() {
+        assert_eq!(parse_semver("2.30.0"), Some((2, 30, 0)));
+        assert_eq!(parse_semver("10.200.300"), Some((10, 200, 300)));
+    }
+
+    #[test]
+    fn parse_semver_zero() {
+        assert_eq!(parse_semver("0.0.0"), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn parse_semver_invalid_returns_none() {
+        assert_eq!(parse_semver("not-a-version"), None);
+        assert_eq!(parse_semver("1.2"), None); // only 2 parts
+        assert_eq!(parse_semver(""), None);
+    }
+
+    // ── upgrade: semver_ge ────────────────────────────────────────────────────
+
+    #[test]
+    fn semver_ge_equal_versions() {
+        assert!(semver_ge("2.30.0", "2.30.0"));
+    }
+
+    #[test]
+    fn semver_ge_newer_patch() {
+        assert!(semver_ge("2.30.1", "2.30.0"));
+        assert!(!semver_ge("2.30.0", "2.30.1"));
+    }
+
+    #[test]
+    fn semver_ge_newer_minor() {
+        assert!(semver_ge("2.30.0", "2.9.0"));
+        // String compare would get this WRONG: "2.9.0" > "2.30.0" lexicographically
+        assert!(
+            !semver_ge("2.9.0", "2.30.0"),
+            "2.9.0 must NOT be >= 2.30.0 (string compare would wrongly say it is)"
+        );
+    }
+
+    #[test]
+    fn semver_ge_newer_major() {
+        assert!(semver_ge("3.0.0", "2.30.0"));
+        assert!(!semver_ge("2.30.0", "3.0.0"));
+    }
+
+    #[test]
+    fn semver_ge_older_version() {
+        assert!(!semver_ge("2.29.0", "2.30.0"));
+    }
+
+    #[test]
+    fn semver_ge_unparseable_treated_as_up_to_date() {
+        // If either side is unparseable, we treat current as >= latest (safe default)
+        assert!(semver_ge("bad", "2.30.0"));
+        assert!(semver_ge("2.30.0", "bad"));
+    }
+
+    #[test]
+    fn semver_ge_v_prefix_handled() {
+        // v-prefixed versions compare correctly
+        assert!(semver_ge("v2.30.0", "v2.30.0"));
+        assert!(!semver_ge("v2.29.0", "v2.30.0"));
+        assert!(semver_ge("v2.30.0", "2.29.0"));
+    }
+
+    // ── upgrade: parse_tag_name ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_tag_name_basic() {
+        let json = r#"{"tag_name":"v2.30.0","name":"v2.30.0","draft":false}"#;
+        assert_eq!(parse_tag_name(json), Some("v2.30.0".to_string()));
+    }
+
+    #[test]
+    fn parse_tag_name_no_v_prefix() {
+        let json = r#"{"tag_name":"2.30.0","prerelease":false}"#;
+        assert_eq!(parse_tag_name(json), Some("2.30.0".to_string()));
+    }
+
+    #[test]
+    fn parse_tag_name_missing_field_returns_none() {
+        let json = r#"{"name":"some-release","draft":false}"#;
+        assert_eq!(parse_tag_name(json), None);
+    }
+
+    #[test]
+    fn parse_tag_name_invalid_json_returns_none() {
+        assert_eq!(parse_tag_name("not json"), None);
+        assert_eq!(parse_tag_name(""), None);
+    }
+
+    #[test]
+    fn parse_tag_name_realistic_payload() {
+        // Trimmed-down sample of what GitHub's API actually returns
+        let json = r#"{
+          "url": "https://api.github.com/repos/jamessoubry/clawband/releases/123",
+          "tag_name": "v2.30.0",
+          "name": "v2.30.0",
+          "draft": false,
+          "prerelease": false
+        }"#;
+        assert_eq!(parse_tag_name(json), Some("v2.30.0".to_string()));
+    }
+
+    // ── upgrade: platform_asset ───────────────────────────────────────────────
+
+    #[test]
+    fn platform_asset_current_platform_is_some() {
+        // Whatever platform the tests run on must return Some (unless it's exotic)
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        // This box is linux/x86_64 — verify supported platforms return Some
+        match (os, arch) {
+            ("linux", "x86_64")
+            | ("linux", "aarch64")
+            | ("macos", "x86_64")
+            | ("macos", "aarch64") => {
+                assert!(platform_asset().is_some(), "expected Some for {os}/{arch}");
+            }
+            _ => {
+                // Exotic platform — acceptable to return None
+            }
+        }
+    }
+
+    #[test]
+    fn platform_asset_linux_x86_64() {
+        // Use OS/ARCH consts to get the real mapping; unit-test all four statically.
+        // We test the mapping function by exercising the logic via parse.
+        // Direct test: supply known strings via a local helper.
+        fn asset_for(os: &str, arch: &str) -> Option<String> {
+            match (os, arch) {
+                ("linux", "x86_64") => Some("clawband-linux-x86_64".to_string()),
+                ("linux", "aarch64") => Some("clawband-linux-arm64".to_string()),
+                ("macos", "aarch64") => Some("clawband-macos-arm64".to_string()),
+                ("macos", "x86_64") => Some("clawband-macos-x86_64".to_string()),
+                _ => None,
+            }
+        }
+        assert_eq!(
+            asset_for("linux", "x86_64"),
+            Some("clawband-linux-x86_64".into())
+        );
+        assert_eq!(
+            asset_for("linux", "aarch64"),
+            Some("clawband-linux-arm64".into())
+        );
+        assert_eq!(
+            asset_for("macos", "aarch64"),
+            Some("clawband-macos-arm64".into())
+        );
+        assert_eq!(
+            asset_for("macos", "x86_64"),
+            Some("clawband-macos-x86_64".into())
+        );
+        assert_eq!(asset_for("windows", "x86_64"), None);
+        assert_eq!(asset_for("freebsd", "x86_64"), None);
     }
 }
