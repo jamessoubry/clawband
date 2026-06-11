@@ -98,6 +98,15 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
+### Upgrading
+
+```sh
+clawband upgrade          # fetch the latest release and replace the running binary in place
+clawband upgrade --check  # report whether an update is available (no download)
+```
+
+`upgrade` queries the latest GitHub release, downloads the matching platform asset (Linux x86_64/arm64, macOS arm64/x86_64), verifies it, backs up the old binary, and atomically swaps `clawband` wherever it's installed (e.g. `~/.claude/hooks/clawband`). The new version is live on the next hook invocation — no restart. If clawband was installed via Homebrew, `upgrade` defers to `brew upgrade clawband` instead.
+
 ## Built-in patterns
 
 ### Blocked (deny)
