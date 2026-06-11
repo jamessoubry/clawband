@@ -17,6 +17,7 @@ enum Mode {
     Gemini,
     Hermes,
     Openclaw,
+    Opencode,
 }
 
 impl Mode {
@@ -27,6 +28,7 @@ impl Mode {
             "gemini" => Some(Self::Gemini),
             "hermes" => Some(Self::Hermes),
             "openclaw" => Some(Self::Openclaw),
+            "opencode" => Some(Self::Opencode),
             _ => None,
         }
     }
@@ -38,6 +40,7 @@ impl Mode {
             Self::Gemini => "gemini",
             Self::Hermes => "hermes",
             Self::Openclaw => "openclaw",
+            Self::Opencode => "opencode",
         }
     }
 }
@@ -195,6 +198,28 @@ fn output_hermes(decision: &str, reason: &str) {
     }
 }
 
+/// OpenCode-mode output.
+/// DENY  → `{"decision":"block","reason":"[CLAWBAND] <reason>"}`
+/// ALLOW → `{}`
+/// Pass  = no output (caller must not invoke for pass)
+///
+/// OpenCode has no native ask/approval path in the `tool.execute.before` hook.
+/// Ask-tier commands are folded via `ask_fallback` (same as Hermes) — NOT
+/// excluded from folding.  Output shape is identical to Hermes: deny →
+/// `{"decision":"block",...}`, allow → `{}`.
+fn output_opencode(decision: &str, reason: &str) {
+    if decision == "allow" {
+        println!("{{}}");
+    } else {
+        // deny (or ask-turned-deny via ask_fallback)
+        let prefixed = format!("[CLAWBAND] {}", reason);
+        println!(
+            r#"{{"decision":"block","reason":"{}"}}"#,
+            json_escape(&prefixed)
+        );
+    }
+}
+
 /// Openclaw-mode output.
 /// DENY  → `{"decision":"block","reason":"[CLAWBAND] <reason>"}`
 /// ASK   → `{"decision":"ask","reason":"[CLAWBAND] <reason>"}`
@@ -234,6 +259,7 @@ fn output_for_mode(mode: Mode, decision: &str, reason: &str) {
         Mode::Gemini => output_gemini(decision, reason),
         Mode::Hermes => output_hermes(decision, reason),
         Mode::Openclaw => output_openclaw(decision, reason),
+        Mode::Opencode => output_opencode(decision, reason),
     }
 }
 
@@ -1327,13 +1353,13 @@ const CONFIG_TEMPLATE: &str = "# clawband config\n\
 # Note: a hook `ask` only prompts when NOT in bypassPermissions mode; in YOLO mode `ask` runs.\n\
 default_decision = passthrough\n\
 #\n\
-# Which agent's hook protocol to speak: claude (default) | codex | gemini | hermes.\n\
+# Which agent's hook protocol to speak: claude (default) | codex | gemini | hermes | opencode.\n\
 # Usually set by `clawband install --mode <agent>`; overridable per-invocation\n\
 # with `--mode` or the CLAWBAND_MODE env var.\n\
 # mode = claude\n\
 #\n\
 # How to treat an `ask`-tier command on agents with no interactive ask\n\
-# (codex/gemini/hermes; claude is unaffected):\n\
+# (codex/gemini/hermes/opencode; claude and openclaw are unaffected):\n\
 #   allow (default) — let it through; only hard deny patterns block\n\
 #   deny            — hard-block ask-tier commands too\n\
 # ask_fallback = allow\n";
@@ -1788,6 +1814,49 @@ fn install_hermes(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str
     );
 }
 
+/// Print OpenCode install instructions.  OpenCode uses an in-process JS plugin
+/// (`tool.execute.before` hook) — clawband cannot auto-wire it via a config
+/// file.  Seed the same ~/.clawband pattern files and print clear manual steps.
+fn install_opencode(hook_cmd: &str, _g: &str, _y: &str, d: &str, r: &str, bold: &str) {
+    println!("\n{bold}OpenCode wiring{r}");
+    println!(
+        "  OpenCode is a {bold}JS plugin{r} agent — clawband cannot auto-wire it via a config file."
+    );
+    println!();
+    println!("  {bold}Step 1{r} — ensure the clawband binary is installed and on PATH (or at");
+    println!("  {d}~/.claude/hooks/clawband{r}):");
+    println!("    {d}brew install jamessoubry/clawband/clawband{r}");
+    println!("    {d}# or: bash install.sh{r}");
+    println!();
+    println!("  {bold}Step 2{r} — copy the plugin file to OpenCode's global plugin directory:");
+    println!(
+        "    {d}cp <path-to-clawband>/integrations/opencode/clawband.js ~/.config/opencode/plugin/{r}"
+    );
+    println!("    {d}# or for a project-local plugin:{r}");
+    println!("    {d}cp <path-to-clawband>/integrations/opencode/clawband.js .opencode/plugin/{r}");
+    println!("    {d}# or register via opencode.json:{r}");
+    println!(
+        "    {d}# {{ \"plugin\": [\"<path-to-clawband>/integrations/opencode/clawband.js\"] }}{r}"
+    );
+    println!();
+    println!(
+        "  {bold}Step 3{r} — the plugin spawns {d}{hook_cmd} --mode opencode{r} for every bash"
+    );
+    println!("  tool call. No further config is needed.");
+    println!();
+    println!("  {bold}Ask tier{r} — OpenCode has no native approval in tool.execute.before.");
+    println!("  Ask-tier commands fold via {bold}ask_fallback{r} (default: allow).");
+    println!(
+        "  Set {d}ask_fallback = deny{r} in {d}~/.clawband/config{r} to hard-block ask-tier too."
+    );
+    println!();
+    println!("  {bold}CLAWBAND_BIN override{r} — set this env var to point the plugin at a");
+    println!("  non-PATH binary location.");
+    println!();
+    println!("  {bold}Known limitation{r} — OpenCode plugin hooks do not intercept subagent tool");
+    println!("  calls (see sst/opencode#5894). This is an upstream limitation, not ours.");
+}
+
 /// Print OpenClaw install instructions.  Unlike config-file agents (Codex/Gemini/Hermes),
 /// OpenClaw uses an in-process TypeScript plugin — clawband cannot auto-wire it.
 /// Instead we seed the same ~/.clawband pattern files and print clear manual steps.
@@ -1971,12 +2040,13 @@ fn cmd_install(extra_args: &[String]) {
         }
     }
 
-    // 5. Agent-specific wiring (--mode codex|gemini|hermes|openclaw)
+    // 5. Agent-specific wiring (--mode codex|gemini|hermes|openclaw|opencode)
     match install_mode {
         Some(Mode::Codex) => install_codex(&command, g, y, d, r, bold),
         Some(Mode::Gemini) => install_gemini(&command, g, y, d, r, bold),
         Some(Mode::Hermes) => install_hermes(&command, g, y, d, r, bold),
         Some(Mode::Openclaw) => install_openclaw(&command, g, y, d, r, bold),
+        Some(Mode::Opencode) => install_opencode(&command, g, y, d, r, bold),
         Some(Mode::Claude) | None => {}
     }
 
@@ -1985,6 +2055,7 @@ fn cmd_install(extra_args: &[String]) {
         Some(Mode::Gemini) => "Done. Restart Gemini CLI to activate the hook.",
         Some(Mode::Hermes) => "Done. Restart Hermes Agent to activate the hook.",
         Some(Mode::Openclaw) => "Done. Follow the steps above to install the OpenClaw plugin shim.",
+        Some(Mode::Opencode) => "Done. Follow the steps above to install the OpenCode plugin.",
         _ => "Done. Run /hooks in Claude Code (or restart) to activate.",
     };
     println!("\n{g}{done_msg}{r}");
@@ -5005,6 +5076,9 @@ mod tests {
         assert_eq!(Mode::from_str("openclaw"), Some(Mode::Openclaw));
         assert_eq!(Mode::from_str("OPENCLAW"), Some(Mode::Openclaw));
         assert_eq!(Mode::from_str("OpenClaw"), Some(Mode::Openclaw));
+        assert_eq!(Mode::from_str("opencode"), Some(Mode::Opencode));
+        assert_eq!(Mode::from_str("OPENCODE"), Some(Mode::Opencode));
+        assert_eq!(Mode::from_str("OpenCode"), Some(Mode::Opencode));
         assert_eq!(Mode::from_str("unknown"), None);
         assert_eq!(Mode::from_str(""), None);
     }
@@ -5017,6 +5091,7 @@ mod tests {
             Mode::Gemini,
             Mode::Hermes,
             Mode::Openclaw,
+            Mode::Opencode,
         ] {
             assert_eq!(Mode::from_str(mode.as_str()), Some(mode));
         }
@@ -5301,5 +5376,38 @@ mod tests {
         );
         assert_eq!(asset_for("windows", "x86_64"), None);
         assert_eq!(asset_for("freebsd", "x86_64"), None);
+    }
+
+    // ── OpenCode ask-folding unit tests ───────────────────────────────────────
+
+    #[test]
+    fn emit_decision_opencode_ask_folds_to_deny_with_deny_fallback() {
+        // OpenCode has no native approval — ask must fold via ask_fallback.
+        let result = emit_decision(Mode::Opencode, AskFallback::Deny, "ask", "some reason");
+        assert_eq!(
+            result, "deny",
+            "opencode ask with ask_fallback=deny must become deny"
+        );
+    }
+
+    #[test]
+    fn emit_decision_opencode_ask_folds_to_allow_with_allow_fallback() {
+        let result = emit_decision(Mode::Opencode, AskFallback::Allow, "ask", "some reason");
+        assert_eq!(
+            result, "allow",
+            "opencode ask with ask_fallback=allow must become allow"
+        );
+    }
+
+    #[test]
+    fn emit_decision_opencode_deny_unchanged() {
+        let result = emit_decision(Mode::Opencode, AskFallback::Allow, "deny", "bad command");
+        assert_eq!(result, "deny");
+    }
+
+    #[test]
+    fn emit_decision_opencode_allow_unchanged() {
+        let result = emit_decision(Mode::Opencode, AskFallback::Deny, "allow", "allowed");
+        assert_eq!(result, "allow");
     }
 }
