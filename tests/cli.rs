@@ -820,3 +820,35 @@ fn e2e_kill_specific_pid_pass() {
         "plain kill <pid> must pass through: {out}"
     );
 }
+
+// ── issue #66: rm -rf bypass via -- separator and quoted paths ────────────────
+
+#[test]
+fn e2e_rm_rf_double_dash_root_deny() {
+    let out = run(&bash("rm -rf -- /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -rf -- / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_rm_rf_single_quoted_root_deny() {
+    let out = run(&bash("rm -rf '/'"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -rf '/' must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_rm_rf_double_quoted_root_deny() {
+    let out = run(&bash(r#"rm -rf "/""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        r#"rm -rf "/" must be denied: {out}"#
+    );
+}
