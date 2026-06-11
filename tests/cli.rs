@@ -698,3 +698,93 @@ fn e2e_openclaw_allow_path_emits_allow() {
     );
     let _ = fs::remove_dir_all(&home);
 }
+
+// ── OpenCode mode ─────────────────────────────────────────────────────────────
+
+/// Parse OpenCode plugin output.
+/// Block → `{"decision":"block","reason":"..."}` (plugin throws this).
+/// Allow → `{}` (plugin returns normally).
+/// Pass  → empty stdout.
+fn opencode_decision(stdout: &str) -> Option<&'static str> {
+    if stdout.contains("\"decision\":\"block\"") {
+        Some("block")
+    } else if stdout.trim() == "{}" {
+        Some("allow")
+    } else {
+        None
+    }
+}
+
+#[test]
+fn e2e_opencode_deny_uses_block_json() {
+    // OpenCode: denied command → {"decision":"block","reason":"[CLAWBAND] ..."}
+    let out = run(
+        &bash("docker system prune"),
+        &[("CLAWBAND_MODE", "opencode")],
+    );
+    assert_eq!(
+        opencode_decision(&out),
+        Some("block"),
+        "opencode must block: {out}"
+    );
+    assert!(
+        out.contains("[CLAWBAND]"),
+        "must carry [CLAWBAND] prefix: {out}"
+    );
+    assert!(
+        !out.contains("hookSpecificOutput"),
+        "opencode must not use hookSpecificOutput: {out}"
+    );
+}
+
+#[test]
+fn e2e_opencode_safe_command_no_output() {
+    // OpenCode: a safe command produces no output (pass-through, plugin allows).
+    let out = run(&bash("ls -la"), &[("CLAWBAND_MODE", "opencode")]);
+    assert_eq!(
+        opencode_decision(&out),
+        None,
+        "opencode must produce no output for safe command: {out}"
+    );
+}
+
+#[test]
+fn e2e_opencode_ask_fallback_default_allow() {
+    // OpenCode: ask tier → allow by default (ask_fallback=allow; rendered as `{}`).
+    // git reset --hard is an ask-tier command.
+    let out = run(
+        &bash("git reset --hard HEAD~1"),
+        &[("CLAWBAND_MODE", "opencode")],
+    );
+    assert_eq!(
+        opencode_decision(&out),
+        Some("allow"),
+        "opencode ask-tier must fall back to allow by default (rendered as {{}}): {out}"
+    );
+}
+
+#[test]
+fn e2e_opencode_ask_fallback_deny_config() {
+    // OpenCode with ask_fallback=deny in config: ask tier → block.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_ocode_dn_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    fs::write(home.join(".clawband/config"), "ask_fallback = deny\n").unwrap();
+    let h = home.to_str().unwrap();
+
+    let out = run(
+        &bash("git reset --hard HEAD~1"),
+        &[("CLAWBAND_MODE", "opencode"), ("HOME", h)],
+    );
+    assert_eq!(
+        opencode_decision(&out),
+        Some("block"),
+        "opencode ask-tier with ask_fallback=deny must block: {out}"
+    );
+    assert!(
+        out.contains("ask_fallback=allow to permit"),
+        "fallback reason must mention ask_fallback=allow: {out}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
