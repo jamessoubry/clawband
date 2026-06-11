@@ -1,0 +1,11 @@
+{
+  "name": "clawband-openclaw",
+  "version": "2.29.0",
+  "description": "clawband guardrail as an OpenClaw before_tool_call hook",
+  "type": "module",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "compat": { "pluginApi": ">=2026.3.24" }
+  }
+}

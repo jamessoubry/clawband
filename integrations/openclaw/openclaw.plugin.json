@@ -1,0 +1,7 @@
+{
+  "id": "clawband",
+  "name": "clawband",
+  "description": "Blocks destructive shell commands via the clawband guardrail before they execute",
+  "activation": { "onStartup": true },
+  "configSchema": { "type": "object", "additionalProperties": false }
+}

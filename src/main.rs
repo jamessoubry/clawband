@@ -16,6 +16,7 @@ enum Mode {
     Codex,
     Gemini,
     Hermes,
+    Openclaw,
 }
 
 impl Mode {
@@ -25,6 +26,7 @@ impl Mode {
             "codex" => Some(Self::Codex),
             "gemini" => Some(Self::Gemini),
             "hermes" => Some(Self::Hermes),
+            "openclaw" => Some(Self::Openclaw),
             _ => None,
         }
     }
@@ -35,6 +37,7 @@ impl Mode {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::Hermes => "hermes",
+            Self::Openclaw => "openclaw",
         }
     }
 }
@@ -192,6 +195,36 @@ fn output_hermes(decision: &str, reason: &str) {
     }
 }
 
+/// Openclaw-mode output.
+/// DENY  → `{"decision":"block","reason":"[CLAWBAND] <reason>"}`
+/// ASK   → `{"decision":"ask","reason":"[CLAWBAND] <reason>"}`
+/// ALLOW → `{"decision":"allow"}`
+/// Pass  = no output (caller must not invoke for pass)
+///
+/// Unlike Codex/Gemini/Hermes, OpenClaw has a native approval path so the
+/// "ask" decision is emitted as-is and mapped to `requireApproval` by the
+/// TypeScript plugin shim in `integrations/openclaw/`.
+fn output_openclaw(decision: &str, reason: &str) {
+    match decision {
+        "allow" => println!(r#"{{"decision":"allow"}}"#),
+        "ask" => {
+            let prefixed = format!("[CLAWBAND] {}", reason);
+            println!(
+                r#"{{"decision":"ask","reason":"{}"}}"#,
+                json_escape(&prefixed)
+            );
+        }
+        _ => {
+            // deny (or any unrecognised value)
+            let prefixed = format!("[CLAWBAND] {}", reason);
+            println!(
+                r#"{{"decision":"block","reason":"{}"}}"#,
+                json_escape(&prefixed)
+            );
+        }
+    }
+}
+
 /// Dispatch to the correct output renderer based on mode.
 /// Only call this for non-pass decisions; pass (no output) is handled by caller.
 fn output_for_mode(mode: Mode, decision: &str, reason: &str) {
@@ -200,6 +233,7 @@ fn output_for_mode(mode: Mode, decision: &str, reason: &str) {
         Mode::Codex => output_codex(decision, reason),
         Mode::Gemini => output_gemini(decision, reason),
         Mode::Hermes => output_hermes(decision, reason),
+        Mode::Openclaw => output_openclaw(decision, reason),
     }
 }
 
@@ -221,14 +255,20 @@ fn apply_ask_fallback(mode: Mode, reason: &str, fallback: AskFallback) -> (Strin
 }
 
 /// Top-level output helper used by the hook body.  Handles ask-fallback for
-/// non-Claude modes and dispatches to the right renderer.
+/// non-Claude, non-Openclaw modes and dispatches to the right renderer.
+///
+/// Claude and Openclaw both have a native approval path, so "ask" is emitted
+/// unchanged for both.  Codex/Gemini/Hermes have no interactive ask and fold
+/// "ask" to allow or deny via `ask_fallback`.
+///
 /// Returns the effective decision string (for logging).
 fn emit_decision(mode: Mode, fallback: AskFallback, decision: &str, reason: &str) -> String {
-    let (final_decision, final_reason) = if decision == "ask" && mode != Mode::Claude {
-        apply_ask_fallback(mode, reason, fallback)
-    } else {
-        (decision.to_string(), reason.to_string())
-    };
+    let (final_decision, final_reason) =
+        if decision == "ask" && mode != Mode::Claude && mode != Mode::Openclaw {
+            apply_ask_fallback(mode, reason, fallback)
+        } else {
+            (decision.to_string(), reason.to_string())
+        };
     output_for_mode(mode, &final_decision, &final_reason);
     final_decision
 }
@@ -1748,6 +1788,36 @@ fn install_hermes(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str
     );
 }
 
+/// Print OpenClaw install instructions.  Unlike config-file agents (Codex/Gemini/Hermes),
+/// OpenClaw uses an in-process TypeScript plugin — clawband cannot auto-wire it.
+/// Instead we seed the same ~/.clawband pattern files and print clear manual steps.
+fn install_openclaw(hook_cmd: &str, g: &str, _y: &str, d: &str, r: &str, bold: &str) {
+    println!("\n{bold}OpenClaw wiring{r}");
+    println!(
+        "  OpenClaw is a {bold}TypeScript plugin{r} agent — clawband cannot auto-wire it via a config file."
+    );
+    println!();
+    println!("  {bold}Step 1{r} — ensure the clawband binary is installed and on PATH (or at");
+    println!("  {d}~/.claude/hooks/clawband{r}):");
+    println!("    {d}brew install jamessoubry/clawband/clawband{r}");
+    println!("    {d}# or: bash install.sh{r}");
+    println!();
+    println!("  {bold}Step 2{r} — install the plugin shim from the clawband repo:");
+    println!("    {d}openclaw plugins install <path-to-clawband>/integrations/openclaw/{r}");
+    println!("    {d}# or, once published to ClawHub:{r}");
+    println!("    {d}openclaw plugins install clawband{r}");
+    println!();
+    println!("  {bold}Step 3{r} — the plugin spawns {d}{hook_cmd} --mode openclaw{r} for every");
+    println!("  tool call. No further config is needed.");
+    println!();
+    println!("  {bold}Ask tier{r} — OpenClaw is the {g}only non-Claude agent{r} where ask-tier");
+    println!("  commands map to OpenClaw's native {bold}approval prompt{r} (requireApproval),");
+    println!("  rather than being folded to allow/deny via ask_fallback.");
+    println!();
+    println!("  {bold}CLAWBAND_BIN override{r} — set this env var in your shell or OpenClaw");
+    println!("  config to point the plugin at a non-PATH binary location.");
+}
+
 fn cmd_install(extra_args: &[String]) {
     let protect = extra_args.iter().any(|a| a == "--protect");
     let post = extra_args.iter().any(|a| a == "--post");
@@ -1901,11 +1971,12 @@ fn cmd_install(extra_args: &[String]) {
         }
     }
 
-    // 5. Agent-specific wiring (--mode codex|gemini|hermes)
+    // 5. Agent-specific wiring (--mode codex|gemini|hermes|openclaw)
     match install_mode {
         Some(Mode::Codex) => install_codex(&command, g, y, d, r, bold),
         Some(Mode::Gemini) => install_gemini(&command, g, y, d, r, bold),
         Some(Mode::Hermes) => install_hermes(&command, g, y, d, r, bold),
+        Some(Mode::Openclaw) => install_openclaw(&command, g, y, d, r, bold),
         Some(Mode::Claude) | None => {}
     }
 
@@ -1913,6 +1984,7 @@ fn cmd_install(extra_args: &[String]) {
         Some(Mode::Codex) => "Done. Review and trust the hook via `/hooks` in Codex.",
         Some(Mode::Gemini) => "Done. Restart Gemini CLI to activate the hook.",
         Some(Mode::Hermes) => "Done. Restart Hermes Agent to activate the hook.",
+        Some(Mode::Openclaw) => "Done. Follow the steps above to install the OpenClaw plugin shim.",
         _ => "Done. Run /hooks in Claude Code (or restart) to activate.",
     };
     println!("\n{g}{done_msg}{r}");
@@ -4572,13 +4644,22 @@ mod tests {
         assert_eq!(Mode::from_str("codex"), Some(Mode::Codex));
         assert_eq!(Mode::from_str("Gemini"), Some(Mode::Gemini));
         assert_eq!(Mode::from_str("HERMES"), Some(Mode::Hermes));
+        assert_eq!(Mode::from_str("openclaw"), Some(Mode::Openclaw));
+        assert_eq!(Mode::from_str("OPENCLAW"), Some(Mode::Openclaw));
+        assert_eq!(Mode::from_str("OpenClaw"), Some(Mode::Openclaw));
         assert_eq!(Mode::from_str("unknown"), None);
         assert_eq!(Mode::from_str(""), None);
     }
 
     #[test]
     fn mode_as_str_matches_from_str() {
-        for mode in [Mode::Claude, Mode::Codex, Mode::Gemini, Mode::Hermes] {
+        for mode in [
+            Mode::Claude,
+            Mode::Codex,
+            Mode::Gemini,
+            Mode::Hermes,
+            Mode::Openclaw,
+        ] {
             assert_eq!(Mode::from_str(mode.as_str()), Some(mode));
         }
     }
@@ -4652,5 +4733,37 @@ mod tests {
         assert_eq!(json_escape("a\nb"), "a\\nb");
         assert_eq!(json_escape("a\rb"), "a\\rb");
         assert_eq!(json_escape("normal"), "normal");
+    }
+
+    // ── Openclaw mode unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn emit_decision_openclaw_ask_unchanged() {
+        // Openclaw has a native approval path — "ask" must NOT be folded by ask_fallback.
+        // Verify that the returned effective decision is "ask" regardless of the fallback
+        // setting (just like Claude mode).
+        let result_deny_fb = emit_decision(Mode::Openclaw, AskFallback::Deny, "ask", "some reason");
+        assert_eq!(
+            result_deny_fb, "ask",
+            "Openclaw ask must not fold to deny even with ask_fallback=deny"
+        );
+        let result_allow_fb =
+            emit_decision(Mode::Openclaw, AskFallback::Allow, "ask", "some reason");
+        assert_eq!(
+            result_allow_fb, "ask",
+            "Openclaw ask must not fold to allow even with ask_fallback=allow"
+        );
+    }
+
+    #[test]
+    fn emit_decision_openclaw_deny_unchanged() {
+        let result = emit_decision(Mode::Openclaw, AskFallback::Allow, "deny", "bad command");
+        assert_eq!(result, "deny");
+    }
+
+    #[test]
+    fn emit_decision_openclaw_allow_unchanged() {
+        let result = emit_decision(Mode::Openclaw, AskFallback::Deny, "allow", "allowed");
+        assert_eq!(result, "allow");
     }
 }
