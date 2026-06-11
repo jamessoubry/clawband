@@ -467,19 +467,20 @@ fn with_suggestion(reason: String, label: &str) -> String {
 fn builtin_deny() -> Vec<Pattern> {
     let specs: &[(&str, &str)] = &[
         // File system destruction — handles any flag ordering: -rf, -fr, -r -f, -f -r
-        // Also handles preceding flags (e.g. --no-preserve-root, -v) and no-space
-        // glob/tilde anchors (e.g. rm -rf/* and rm -rf~).
+        // Also handles preceding flags (e.g. --no-preserve-root, -v), no-space
+        // glob/tilde anchors (e.g. rm -rf/* and rm -rf~), the `--` end-of-options
+        // separator (e.g. rm -rf -- /), and quoted paths (rm -rf '/' or rm -rf "/").
         (
             "rm -rf /",
-            r"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*/",
+            r#"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*(?:--\s+)?["']?/"#,
         ),
         (
             "rm -rf ~",
-            r"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*~",
+            r#"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*(?:--\s+)?["']?~"#,
         ),
         (
             "rm -rf $HOME",
-            r"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*\$HOME",
+            r#"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*(?:--\s+)?["']?\$HOME"#,
         ),
         (
             "sudo rm -rf",
@@ -3623,6 +3624,48 @@ mod tests {
     fn rm_v_rf_root_denied() {
         // preceding short flag before -rf
         assert_eq!(decision("rm -v -rf /"), Some("deny".into()));
+    }
+
+    // ── bypass regression: -- separator and quoted paths (issue #66) ────────────
+
+    #[test]
+    fn rm_rf_double_dash_root_denied() {
+        assert_eq!(decision("rm -rf -- /"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_single_quoted_root_denied() {
+        assert_eq!(decision("rm -rf '/'"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_double_quoted_root_denied() {
+        assert_eq!(decision(r#"rm -rf "/""#), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_double_dash_single_quoted_root_denied() {
+        assert_eq!(decision("rm -rf -- '/'"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_double_dash_tilde_denied() {
+        assert_eq!(decision("rm -rf -- ~/important"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_single_quoted_tilde_denied() {
+        assert_eq!(decision("rm -rf '~/'"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_double_dash_home_denied() {
+        assert_eq!(decision("rm -rf -- $HOME"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_double_quoted_home_denied() {
+        assert_eq!(decision(r#"rm -rf "$HOME""#), Some("deny".into()));
     }
 
     // ── regression: safe rm must still pass ───────────────────────────────────
