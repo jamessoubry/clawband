@@ -598,3 +598,103 @@ fn e2e_mode_from_config_file() {
     );
     let _ = fs::remove_dir_all(&home);
 }
+
+// ── Openclaw mode ─────────────────────────────────────────────────────────────
+
+/// Parse the Openclaw plugin-shim JSON output: `{"decision":"block"|"ask"|"allow",...}`.
+fn openclaw_decision(stdout: &str) -> Option<&'static str> {
+    if stdout.contains("\"decision\":\"block\"") {
+        Some("block")
+    } else if stdout.contains("\"decision\":\"ask\"") {
+        Some("ask")
+    } else if stdout.contains("\"decision\":\"allow\"") {
+        Some("allow")
+    } else {
+        None
+    }
+}
+
+#[test]
+fn e2e_openclaw_deny_uses_block_json() {
+    // Openclaw: denied command → {"decision":"block","reason":"[CLAWBAND] ..."}
+    let out = run(
+        &bash("docker system prune"),
+        &[("CLAWBAND_MODE", "openclaw")],
+    );
+    assert_eq!(
+        openclaw_decision(&out),
+        Some("block"),
+        "openclaw must block: {out}"
+    );
+    assert!(
+        out.contains("[CLAWBAND]"),
+        "must carry [CLAWBAND] prefix: {out}"
+    );
+    assert!(
+        !out.contains("hookSpecificOutput"),
+        "openclaw must not use hookSpecificOutput: {out}"
+    );
+}
+
+#[test]
+fn e2e_openclaw_safe_command_passes() {
+    // Openclaw: a safe command produces no output (pass-through).
+    let out = run(&bash("ls -la"), &[("CLAWBAND_MODE", "openclaw")]);
+    assert_eq!(
+        openclaw_decision(&out),
+        None,
+        "openclaw must pass safe command: {out}"
+    );
+}
+
+#[test]
+fn e2e_openclaw_ask_emits_ask_not_block() {
+    // CRITICAL: Openclaw has a native approval path — ask-tier must NOT fold to
+    // block/allow via ask_fallback, even with ask_fallback=deny in config.
+    // This is the key regression test: confirm ask stays ask for Openclaw.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_oc_ask_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    // Even with ask_fallback=deny, Openclaw must still emit "ask" (not "block").
+    fs::write(home.join(".clawband/config"), "ask_fallback = deny\n").unwrap();
+    let h = home.to_str().unwrap();
+
+    let out = run(
+        &bash("git reset --hard HEAD~1"),
+        &[("CLAWBAND_MODE", "openclaw"), ("HOME", h)],
+    );
+    assert_eq!(
+        openclaw_decision(&out),
+        Some("ask"),
+        "openclaw ask-tier must emit ask (not block), even with ask_fallback=deny: {out}"
+    );
+    assert!(
+        out.contains("[CLAWBAND]"),
+        "openclaw ask must carry [CLAWBAND] prefix: {out}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_openclaw_allow_path_emits_allow() {
+    // Openclaw: a command explicitly allowed via default_decision=allow emits
+    // {"decision":"allow"} so the plugin shim can return {}.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_oc_allow_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    fs::write(home.join(".clawband/config"), "default_decision = allow\n").unwrap();
+    let h = home.to_str().unwrap();
+
+    let out = run(
+        &bash("echo hello world"),
+        &[("CLAWBAND_MODE", "openclaw"), ("HOME", h)],
+    );
+    assert_eq!(
+        openclaw_decision(&out),
+        Some("allow"),
+        "openclaw must emit allow for default_decision=allow unmatched command: {out}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}

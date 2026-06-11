@@ -298,15 +298,15 @@ The variable only takes effect when it is actually exported into the hook's envi
 
 ⚠️ **Footgun:** if you `export CLAWBAND_SKIP=1` globally (shell profile or Claude Code `settings.json` `env` block), clawband is silently disabled for the entire session. `clawband stats` shows a red **ALL CHECKS DISABLED** warning when it detects this, and (with `CLAWBAND_LOG=1`) every bypassed command is recorded as a `SKIP` event in `~/.clawband.log`.
 
-## Using clawband with other agents (Codex, Gemini, Hermes)
+## Using clawband with other agents (Codex, Gemini, Hermes, OpenClaw)
 
-The same core engine — deny/ask/allow tiers, script scanning, protect-paths — works with Codex CLI, Gemini CLI, and Hermes Agent. Only the output JSON format and the install wiring differ per agent.
+The same core engine — deny/ask/allow tiers, script scanning, protect-paths — works with Codex CLI, Gemini CLI, Hermes Agent, and OpenClaw. Only the output JSON format and the install wiring differ per agent.
 
 ### Mode selection
 
 Mode is resolved in priority order:
 
-1. `--mode <claude|codex|gemini|hermes>` CLI flag passed directly to the binary
+1. `--mode <claude|codex|gemini|hermes|openclaw>` CLI flag passed directly to the binary
 2. `CLAWBAND_MODE=<mode>` environment variable
 3. `mode = <value>` line in `~/.clawband/config`
 4. Default: `claude` (existing behaviour, byte-identical)
@@ -317,6 +317,7 @@ Mode is resolved in priority order:
 clawband install --mode codex    # wires ~/.codex/config.toml
 clawband install --mode gemini   # wires ~/.gemini/settings.json
 clawband install --mode hermes   # wires ~/.hermes/config.yaml
+clawband install --mode openclaw # seeds ~/.clawband/ + prints plugin install steps
 clawband install                 # Claude Code (default, unchanged)
 ```
 
@@ -327,18 +328,19 @@ Each command:
 
 ### Output format per agent
 
-| Agent | Deny | Allow | Pass (no match) |
-|-------|------|-------|-----------------|
-| Claude | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[CLAWBAND] ..."}}` | same with `"allow"` | no output |
-| Codex | same JSON shape as Claude | same | no output |
-| Gemini | `{"decision":"block","reason":"[CLAWBAND] ..."}` | `{"decision":"allow"}` | no output |
-| Hermes | `{"decision":"block","reason":"[CLAWBAND] ..."}` | `{}` | no output |
+| Agent | Deny | Ask | Allow | Pass (no match) |
+|-------|------|-----|-------|-----------------|
+| Claude | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[CLAWBAND] ..."}}` | same with `"ask"` | same with `"allow"` | no output |
+| Codex | same JSON shape as Claude | folded via `ask_fallback` | same | no output |
+| Gemini | `{"decision":"block","reason":"[CLAWBAND] ..."}` | folded via `ask_fallback` | `{"decision":"allow"}` | no output |
+| Hermes | `{"decision":"block","reason":"[CLAWBAND] ..."}` | folded via `ask_fallback` | `{}` | no output |
+| Openclaw | `{"decision":"block","reason":"[CLAWBAND] ..."}` | `{"decision":"ask","reason":"..."}` → `requireApproval` | `{"decision":"allow"}` | no output |
 
 All reason strings carry the `[CLAWBAND]` prefix regardless of mode.
 
 ### The `ask` tier in non-Claude modes
 
-Claude's PreToolUse can prompt the user interactively ("ask"). Codex, Gemini, and Hermes have no equivalent. When the engine decides "ask" and mode is not `claude`, clawband applies `ask_fallback`:
+Claude's PreToolUse can prompt the user interactively ("ask"). Codex, Gemini, and Hermes have no equivalent native approval path. When the engine decides "ask" and mode is not `claude` or `openclaw`, clawband applies `ask_fallback`:
 
 - `ask_fallback = allow` (default) — renders as allow (passes the command through). The ask tier is meant to *confirm*, not *forbid*; on agents that can't prompt, hard-blocking it would be surprising. Your hard **deny** patterns still block.
 - `ask_fallback = deny` — renders as a hard deny with the reason:  
@@ -350,9 +352,39 @@ Set it in `~/.clawband/config`:
 ask_fallback = deny
 ```
 
+**OpenClaw exception** — OpenClaw is the only non-Claude agent with a native
+approval prompt. The plugin shim maps `ask` decisions to `requireApproval`,
+giving the user a real choice. `ask_fallback` has no effect in Openclaw mode.
+
 ### OpenClaw
 
-OpenClaw is not yet supported: it has no blocking pre-command hook as of this writing. Track progress at https://github.com/openclaw/openclaw/issues/91922.
+OpenClaw uses an in-process **TypeScript plugin** instead of a config-file
+hook, so the wiring differs from Codex/Gemini/Hermes.
+
+```sh
+clawband install --mode openclaw   # seeds ~/.clawband/ + prints install steps
+```
+
+The plugin shim lives in [`integrations/openclaw/`](integrations/openclaw/).
+Install it with:
+
+```sh
+openclaw plugins install <path-to-clawband>/integrations/openclaw/
+# or, once published to ClawHub:
+openclaw plugins install clawband
+```
+
+**Ask tier** — OpenClaw is the **only non-Claude agent** where ask-tier
+commands map to OpenClaw's native approval prompt (`requireApproval`) rather
+than being folded to allow/deny via `ask_fallback`. The `ask_fallback` config
+key has no effect in Openclaw mode.
+
+| Agent | Deny | Ask | Allow | Pass (no match) |
+|-------|------|-----|-------|-----------------|
+| Openclaw | `{"decision":"block","reason":"[CLAWBAND] ..."}` | `{"decision":"ask","reason":"..."}` → `requireApproval` | `{"decision":"allow"}` | no output |
+
+See [`integrations/openclaw/README.md`](integrations/openclaw/README.md) for
+full details, prerequisites, and the `CLAWBAND_BIN` override.
 
 ## Requirements
 
