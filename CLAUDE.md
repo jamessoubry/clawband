@@ -41,6 +41,10 @@ Run `cargo test` to verify — all tests must pass before committing.
 - **Always open a PR** — never push directly to master, even for trivial changes
 - Tag releases after the user merges: `git tag vX.Y.Z && git push origin vX.Y.Z`
 
+## Backlog pipeline — cadence
+
+Run one tick at a time: wait for the previous PR to be merged before running `/backlog` again. Most backlog items touch the same files (`src/main.rs`, `Cargo.toml`, `tests/cli.rs`) so concurrent open PRs will conflict. There is no automation to prevent this — it relies on the human running `/backlog` manually after each merge.
+
 ## Backlog pipeline (releaser override)
 
 When the backlog pipeline runs a releaser agent for this project:
