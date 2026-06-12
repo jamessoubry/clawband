@@ -893,3 +893,35 @@ fn e2e_rm_rf_double_quoted_root_deny() {
         r#"rm -rf "/" must be denied: {out}"#
     );
 }
+
+// eval ask-pattern: subshell-only idioms must not be blocked (#67).
+// They match builtin_allow() so the binary emits an explicit "allow" response.
+#[test]
+fn e2e_eval_subshell_rbenv_passes() {
+    let out = run(&bash(r#"eval "$(rbenv init -)""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        r#"eval "$(rbenv init -)" must not be denied or asked: {out}"#
+    );
+}
+
+#[test]
+fn e2e_eval_subshell_brew_passes() {
+    let out = run(&bash("eval $(brew shellenv)"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        "eval $(brew shellenv) must not be denied or asked: {out}"
+    );
+}
+
+#[test]
+fn e2e_eval_variable_asks() {
+    let out = run(&bash("eval $SOME_VAR"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "eval $SOME_VAR must still trigger ask: {out}"
+    );
+}

@@ -628,7 +628,8 @@ fn builtin_deny() -> Vec<Pattern> {
 
 fn builtin_ask() -> Vec<Pattern> {
     let specs: &[(&str, &str)] = &[
-        // eval — common in shell init but executes arbitrary strings
+        // eval — executes arbitrary strings; subshell-only idioms like
+        // `eval "$(rbenv init -)"` are exempted via builtin_allow().
         ("eval", r"\beval\s"),
         // Destructive git (local) — legitimate but irreversible without reflog
         ("git reset --hard", r"\bgit\s+reset\s+--hard\b"),
@@ -785,6 +786,21 @@ fn builtin_ask() -> Vec<Pattern> {
             "pkill (kills all processes matching a pattern)",
             r"\bpkill\b",
         ),
+    ];
+    specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
+}
+
+// ─── Built-in allow patterns (exemptions from ask/deny) ──────────────────────
+
+fn builtin_allow() -> Vec<Pattern> {
+    let specs: &[(&str, &str)] = &[
+        // eval with a pure subshell argument is safe — the inner command is
+        // already scanned by the subshell scanner.  Common shell-init idioms:
+        //   eval "$(rbenv init -)"
+        //   eval $(brew shellenv)
+        //   eval "$(direnv hook bash)"
+        //   eval "$(pyenv init -)"
+        ("eval <subshell>", r#"\beval\s+['"]?\$\("#),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -2231,7 +2247,8 @@ fn cmd_test(command_args: &[String]) {
     let cfg = config_dir();
     let mut deny_pats = builtin_deny();
     let mut ask_pats = builtin_ask();
-    let mut allow_pats = load_patterns(&cfg.join("allow.patterns"));
+    let mut allow_pats = builtin_allow();
+    allow_pats.extend(load_patterns(&cfg.join("allow.patterns")));
     deny_pats.extend(load_patterns(&cfg.join("deny.patterns")));
     ask_pats.extend(load_patterns(&cfg.join("ask.patterns")));
     if let Some(proj) = project_config_dir() {
@@ -3538,7 +3555,8 @@ fn main() {
     let cfg = config_dir();
     let mut deny_pats = builtin_deny();
     let mut ask_pats = builtin_ask();
-    let mut allow_pats = load_patterns(&cfg.join("allow.patterns"));
+    let mut allow_pats = builtin_allow();
+    allow_pats.extend(load_patterns(&cfg.join("allow.patterns")));
     deny_pats.extend(load_patterns(&cfg.join("deny.patterns")));
     ask_pats.extend(load_patterns(&cfg.join("ask.patterns")));
     if let Some(proj) = project_config_dir() {
@@ -3635,16 +3653,19 @@ mod tests {
     fn no_allow() -> Vec<Pattern> {
         vec![]
     }
+    fn allow_pats() -> Vec<Pattern> {
+        builtin_allow()
+    }
 
     fn decision(cmd: &str) -> Option<String> {
-        check_command(cmd, &deny_pats(), &ask_pats(), &no_allow()).map(|(d, _)| d.to_string())
+        check_command(cmd, &deny_pats(), &ask_pats(), &allow_pats()).map(|(d, _)| d.to_string())
     }
 
     // Runs the full main()-equivalent pipeline including subshell scanning
     fn full_decision(cmd: &str) -> Option<String> {
         let dp = deny_pats();
         let ap = ask_pats();
-        let al = no_allow();
+        let al = allow_pats();
         if let Some((d, _)) = check_command(cmd, &dp, &ap, &al) {
             return Some(d.to_string());
         }
@@ -3800,6 +3821,19 @@ mod tests {
     #[test]
     fn eval_asks() {
         assert_eq!(decision("eval something"), Some("ask".into()));
+        // Variable expansion still caught
+        assert_eq!(decision("eval $SOME_VAR"), Some("ask".into()));
+        assert_eq!(decision(r#"eval "$SOME_VAR""#), Some("ask".into()));
+    }
+
+    #[test]
+    fn eval_subshell_passes() {
+        // Shell-init idioms with a subshell argument must not trigger ask
+        assert_eq!(decision(r#"eval "$(rbenv init -)""#), None);
+        assert_eq!(decision("eval $(brew shellenv)"), None);
+        assert_eq!(decision(r#"eval "$(direnv hook bash)""#), None);
+        assert_eq!(decision(r#"eval "$(pyenv init -)""#), None);
+        assert_eq!(decision("eval $(pyenv init -)"), None);
     }
 
     #[test]
