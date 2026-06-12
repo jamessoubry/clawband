@@ -205,16 +205,27 @@ fn e2e_version_flag() {
     assert!(s.starts_with("clawband v"), "got: {s}");
 }
 
-// ── Item #3: variable-indirection ask (e2e) ───────────────────────────────────
+// ── Item #3: assign-then-exec detection (e2e) ────────────────────────────────
 
 #[test]
-fn e2e_var_indirection_asks() {
-    // `cmd=rm; $cmd -rf /tmp/x` — the $cmd token leads the second segment
-    let out = run(&bash("cmd=rm; $cmd -rf /tmp/x"), &[]);
+fn e2e_assign_then_exec_asks() {
+    // `cmd=rm; $cmd -rf /` — variable assigned then used as command word
+    let out = run(&bash("cmd=rm; $cmd -rf /"), &[]);
     assert_eq!(
         decision(&out),
         Some("ask"),
-        "variable-indirection pattern should trigger ask"
+        "assign-then-exec pattern should trigger ask"
+    );
+}
+
+#[test]
+fn e2e_dollar_editor_no_false_positive() {
+    // `$EDITOR file.txt` — EDITOR not assigned in the compound command; must pass
+    let out = run(&bash("$EDITOR file.txt"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "$EDITOR without prior assignment must not be flagged"
     );
 }
 
