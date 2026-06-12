@@ -779,6 +779,17 @@ fn builtin_ask() -> Vec<Pattern> {
             "pkill (kills all processes matching a pattern)",
             r"\bpkill\b",
         ),
+        // ── ssh remote interpreter / script execution (issue #74) ─────────────
+        // clawband cannot inspect remote files, so running an interpreter over
+        // ssh is a strong "prompt the user" signal.
+        // ASK (not deny) — `ssh host "make deploy"` is routine; only interpreter
+        // invocations and local-style script paths are flagged.
+        (
+            "ssh + interpreter",
+            r"\bssh\b.+\b(bash|sh|zsh|dash|python3?|node|deno|ruby|perl|lua|php)\b",
+        ),
+        // ssh running a local-style script path (./script.sh forwarded to remote)
+        ("ssh + script path", r"\bssh\b.+\./"),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -5969,5 +5980,56 @@ mod tests {
         let (dec, msg) = r.unwrap();
         assert_eq!(dec, "deny");
         assert!(msg.contains("Safe alternative:"));
+    }
+
+    // ── ssh remote interpreter / script execution (issue #74) ────────────────
+
+    // ASK: ssh + bash interpreter
+    #[test]
+    fn ssh_bash_script_asks() {
+        assert_eq!(decision("ssh host bash /tmp/x.sh"), Some("ask".into()));
+    }
+
+    // ASK: ssh + python3 interpreter
+    #[test]
+    fn ssh_python3_asks() {
+        assert_eq!(decision("ssh host python3 /tmp/e.py"), Some("ask".into()));
+    }
+
+    // DENY: ssh + sh -c with rm -rf / payload — deny patterns fire before ask
+    // (rm -rf /tmp matches the "rm -rf /" deny pattern which covers all /-paths)
+    #[test]
+    fn ssh_sh_c_rm_rf_denied() {
+        assert_eq!(
+            decision("ssh root@192.168.1.1 sh -c 'rm -rf /tmp'"),
+            Some("deny".into())
+        );
+    }
+
+    // ASK: ssh + local-style script path (./deploy.sh forwarded to remote)
+    #[test]
+    fn ssh_local_script_path_asks() {
+        assert_eq!(decision("ssh host ./deploy.sh"), Some("ask".into()));
+    }
+
+    // ASK: ssh with non-default port + bash
+    #[test]
+    fn ssh_port_bash_asks() {
+        assert_eq!(
+            decision("ssh -p 2222 host bash evil.sh"),
+            Some("ask".into())
+        );
+    }
+
+    // PASS: ssh host "make deploy" — not an interpreter, routine remote command
+    #[test]
+    fn ssh_make_deploy_passes() {
+        assert_eq!(decision("ssh host \"make deploy\""), None);
+    }
+
+    // PASS: ssh host ls -la — plain remote ls, not an interpreter
+    #[test]
+    fn ssh_ls_passes() {
+        assert_eq!(decision("ssh host ls -la"), None);
     }
 }
