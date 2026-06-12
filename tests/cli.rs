@@ -980,3 +980,9 @@ fn e2e_aws_s3_cp_dist_passes() {
         "aws s3 cp dist/ must pass (no sensitive path): {out}"
     );
 }
+
+#[test]
+fn e2e_shred_denies() {
+    let out = run(&bash("shred secret.txt"), &[]);
+    assert_eq!(decision(&out), Some("deny"), "shred must be denied: {out}");
+}

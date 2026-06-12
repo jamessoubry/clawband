@@ -533,6 +533,8 @@ fn builtin_deny() -> Vec<Pattern> {
         ("docker system prune", r"\bdocker\s+system\s+prune\b"),
         // find -delete (anchored; avoids matching --delete-protection flags)
         ("find -delete", r"\bfind\b.*\s-delete(\s|$)"),
+        // shred — irreversibly overwrites file contents (no recovery possible)
+        ("shred", r"\bshred\b"),
         // find / xargs execution escalation
         ("-exec rm", r"-exec\s+rm\b"),
         ("-exec sh", r"-exec\s+sh\b"),
@@ -6131,5 +6133,27 @@ mod tests {
     #[test]
     fn ssh_ls_passes() {
         assert_eq!(decision("ssh host ls -la"), None);
+    }
+
+    // DENY: shred — irreversibly overwrites file contents
+    #[test]
+    fn shred_basic_denies() {
+        assert_eq!(decision("shred secret.txt"), Some("deny".into()));
+    }
+
+    #[test]
+    fn shred_u_flag_denies() {
+        assert_eq!(decision("shred -u ~/.ssh/id_rsa"), Some("deny".into()));
+    }
+
+    #[test]
+    fn shred_zun_denies() {
+        assert_eq!(decision("shred -zun 3 file.txt"), Some("deny".into()));
+    }
+
+    // PASS: shredder — word boundary, must not match \bshred\b
+    #[test]
+    fn shredder_passes() {
+        assert_eq!(decision("shredder something"), None);
     }
 }
