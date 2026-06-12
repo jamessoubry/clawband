@@ -3653,8 +3653,9 @@ fn main() {
     let log_enabled = logging_enabled();
 
     if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
-        // Total bypass — leave an audit trail so a forgotten global skip is visible.
-        // We don't have a command string here yet, so use a placeholder for file tools.
+        // Total bypass — emit a prominent warning so the operator knows checks are off,
+        // then leave an audit trail in the log file when logging is enabled.
+        eprintln!("[clawband] WARNING: CLAWBAND_SKIP=1 — all security checks are disabled");
         let cmd_preview = v["tool_input"]["command"]
             .as_str()
             .unwrap_or("<non-bash tool>")
@@ -6435,5 +6436,19 @@ mod tests {
     #[test]
     fn shredder_passes() {
         assert_eq!(decision("shredder something"), None);
+    }
+
+    // ── CLAWBAND_SKIP early-return (#37) ──────────────────────────────────────
+    // Unit tests call check_command() directly, bypassing the env-var guard in
+    // main().  Verify that `find . -delete` is normally denied (so the skip is
+    // meaningful) — the e2e suite verifies that CLAWBAND_SKIP=1 produces no
+    // block JSON and emits the warning to stderr.
+    #[test]
+    fn find_delete_normally_denied() {
+        assert_eq!(
+            decision("find . -delete"),
+            Some("deny".into()),
+            "find . -delete must be denied when CLAWBAND_SKIP is not set"
+        );
     }
 }

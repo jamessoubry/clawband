@@ -33,6 +33,34 @@ fn run(stdin: &str, env: &[(&str, &str)]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Same as `run()` but also returns stderr. Used to assert on warning messages.
+fn run_with_stderr(stdin: &str, env: &[(&str, &str)]) -> (String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_clawband"));
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.env_remove("CLAWBAND_SKIP")
+        .env_remove("RTK_ENABLED")
+        .env_remove("SQZ_ENABLED")
+        .env_remove("CLAWBAND_LOG");
+    cmd.env("HOME", "/nonexistent-clawband-test-home");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn clawband");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait clawband");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 fn decision(stdout: &str) -> Option<&'static str> {
     if stdout.contains("\"permissionDecision\":\"deny\"") {
         Some("deny")
@@ -85,6 +113,22 @@ fn e2e_ask_command() {
 fn e2e_skip_bypasses_everything() {
     let out = run(&bash("docker system prune"), &[("CLAWBAND_SKIP", "1")]);
     assert_eq!(decision(&out), None, "CLAWBAND_SKIP=1 should bypass");
+}
+
+#[test]
+fn e2e_skip_warning_emitted_to_stderr() {
+    // CLAWBAND_SKIP=1 must produce no block JSON (bypass) AND emit a prominent
+    // warning on stderr so the operator knows checks are disabled (#37).
+    let (stdout, stderr) = run_with_stderr(&bash("find . -delete"), &[("CLAWBAND_SKIP", "1")]);
+    assert_eq!(
+        decision(&stdout),
+        None,
+        "CLAWBAND_SKIP=1 must bypass (no block JSON): {stdout}"
+    );
+    assert!(
+        stderr.contains("CLAWBAND_SKIP"),
+        "stderr must contain CLAWBAND_SKIP warning: {stderr:?}"
+    );
 }
 
 #[test]
