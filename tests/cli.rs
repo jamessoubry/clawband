@@ -936,3 +936,25 @@ fn e2e_eval_variable_asks() {
         "eval $SOME_VAR must still trigger ask: {out}"
     );
 }
+
+// ── ssh remote interpreter / script execution (issue #74) ────────────────
+
+#[test]
+fn e2e_ssh_bash_script_asks() {
+    let out = run(&bash("ssh host bash /tmp/x.sh"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "ssh host bash /tmp/x.sh must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_ssh_make_deploy_passes() {
+    let out = run(&bash("ssh host make deploy"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "ssh host make deploy must pass (not an interpreter): {out}"
+    );
+}
