@@ -2185,6 +2185,78 @@ fn cmd_install(extra_args: &[String]) {
     println!("{d}Verify anytime with: clawband verify{r}");
 }
 
+// Remove every clawband main-hook command from hooks.PreToolUse.  Entries
+// whose hooks array becomes empty after removal are also dropped.  Snapshots
+// the array first so the return value accurately reflects whether anything
+// changed.  Returns true if at least one command was removed, false if no
+// clawband hook was present.
+fn remove_clawband_hooks(settings: &mut serde_json::Value) -> bool {
+    let Some(pre) = settings["hooks"]["PreToolUse"].as_array_mut() else {
+        return false;
+    };
+    let snapshot = pre.clone();
+    // Strip clawband main commands from every entry's hooks array.
+    for entry in pre.iter_mut() {
+        if let Some(hs) = entry["hooks"].as_array_mut() {
+            hs.retain(|h| !h["command"].as_str().is_some_and(is_clawband_main_command));
+        }
+    }
+    // Drop entries whose hooks array is now empty.
+    pre.retain(|e| e["hooks"].as_array().map(|h| !h.is_empty()).unwrap_or(true));
+    *pre != snapshot
+}
+
+fn cmd_uninstall() {
+    let g = "\x1b[32m";
+    let d = "\x1b[2m";
+    let r = "\x1b[0m";
+
+    let path = settings_path();
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("[clawband] No clawband hook found in settings — nothing to remove.");
+            return;
+        }
+    };
+    let mut settings: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            println!("[clawband] No clawband hook found in settings — nothing to remove.");
+            return;
+        }
+    };
+
+    if !clawband_hook_present(&settings) {
+        println!("[clawband] No clawband hook found in settings — nothing to remove.");
+        return;
+    }
+
+    let changed = remove_clawband_hooks(&mut settings);
+    if !changed {
+        println!("[clawband] No clawband hook found in settings — nothing to remove.");
+        return;
+    }
+
+    match serde_json::to_string_pretty(&settings) {
+        Ok(out) => {
+            if fs::write(&path, out + "\n").is_ok() {
+                println!(
+                    "{g}[clawband] Uninstalled:{r} removed clawband PreToolUse hook from {d}{}{r}.",
+                    path.display()
+                );
+            } else {
+                eprintln!("[clawband] Failed to write {}", path.display());
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("[clawband] Failed to serialize settings: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_verify() -> i32 {
     let g = "\x1b[32m";
     let y = "\x1b[33m";
@@ -3530,6 +3602,10 @@ fn main() {
             cmd_install(&filtered_args[2..]);
             return;
         }
+        Some("uninstall") => {
+            cmd_uninstall();
+            return;
+        }
         Some("verify") => {
             std::process::exit(cmd_verify());
         }
@@ -4643,6 +4719,93 @@ mod tests {
         assert!(edit_hook_present(&s));
         // Total entries = 2
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    }
+
+    // ── uninstall: remove_clawband_hooks ──────────────────────────────────────
+
+    #[test]
+    fn uninstall_removes_clawband_hook_from_bash_entry() {
+        // Round-trip: install then uninstall; hook is gone, other entries survive.
+        let mut s = serde_json::json!({});
+        assert!(register_hook(&mut s, "clawband"));
+        assert!(clawband_hook_present(&s));
+        assert!(remove_clawband_hooks(&mut s));
+        assert!(!clawband_hook_present(&s));
+    }
+
+    #[test]
+    fn uninstall_leaves_other_hooks_intact() {
+        // Other tools sharing the Bash entry must survive the uninstall.
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [
+                        {"type": "command", "command": "clawband"},
+                        {"type": "command", "command": "/usr/local/bin/icm hook pre"}
+                    ]}
+                ]
+            }
+        });
+        assert!(remove_clawband_hooks(&mut s));
+        assert!(!clawband_hook_present(&s));
+        // The icm hook must still be present.
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "Bash entry should survive (icm still in it)");
+        let hooks = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(
+            hooks[0]["command"].as_str(),
+            Some("/usr/local/bin/icm hook pre")
+        );
+    }
+
+    #[test]
+    fn uninstall_drops_empty_entry_after_removal() {
+        // If clawband was the only hook in an entry, that entry is dropped entirely.
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "clawband"}]}
+                ]
+            }
+        });
+        assert!(remove_clawband_hooks(&mut s));
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(arr.is_empty(), "empty Bash entry should be dropped");
+    }
+
+    #[test]
+    fn uninstall_returns_false_when_no_hook_present() {
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/icm hook pre"}]}
+                ]
+            }
+        });
+        assert!(!remove_clawband_hooks(&mut s));
+    }
+
+    #[test]
+    fn uninstall_removes_all_matchers_including_edit() {
+        // Both the Bash and Write|Edit entries are removed when uninstalling.
+        let mut s = serde_json::json!({});
+        assert!(register_hook(&mut s, "clawband"));
+        assert!(register_edit_hook(&mut s, "clawband"));
+        assert!(clawband_hook_present(&s));
+        assert!(edit_hook_present(&s));
+        assert!(remove_clawband_hooks(&mut s));
+        assert!(!clawband_hook_present(&s));
+        assert!(!edit_hook_present(&s));
+    }
+
+    #[test]
+    fn uninstall_idempotent_second_call_returns_false() {
+        let mut s = serde_json::json!({});
+        assert!(register_hook(&mut s, "clawband"));
+        assert!(remove_clawband_hooks(&mut s));
+        // Second call: nothing left to remove.
+        assert!(!remove_clawband_hooks(&mut s));
     }
 
     // ── base64 / obfuscation ask patterns ─────────────────────────────────────
