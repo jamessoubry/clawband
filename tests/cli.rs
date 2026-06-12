@@ -996,3 +996,25 @@ fn e2e_fork_bomb_denied() {
         "fork bomb must be denied: {out}"
     );
 }
+
+// ── Recursive chmod/chown on dangerous permissions or broad paths (issue #24) ─
+
+#[test]
+fn e2e_chmod_r_000_absolute_asks() {
+    let out = run(&bash("chmod -R 000 /etc"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "chmod -R 000 /etc must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_chmod_r_755_relative_passes() {
+    let out = run(&bash("chmod -R 755 ./dist"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "chmod -R 755 ./dist must pass (relative path, routine): {out}"
+    );
+}
