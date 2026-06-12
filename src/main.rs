@@ -625,6 +625,11 @@ fn builtin_deny() -> Vec<Pattern> {
         ),
         // ── killall5 — kills all processes (used in shutdown sequences) ──────
         ("killall5 (kills all processes)", r"\bkillall5\b"),
+        // ── fork bomb — :(){ :|:& };: exhausts all process slots ─────────────
+        // The colon-as-function-name `:(){ ` and the recursive pipe-to-self
+        // `:|:&` are nearly unique to this attack; neither appears in legitimate
+        // shell scripts.
+        ("fork bomb", r":\(\)\s*\{|:\|:&"),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -5961,6 +5966,38 @@ mod tests {
     #[test]
     fn pkill_name_suggestion_present() {
         assert!(reason("pkill python").contains("Safe alternative:"));
+    }
+
+    // ── fork bomb (issue #23) ─────────────────────────────────────────────────
+
+    // DENY: canonical fork bomb
+    #[test]
+    fn fork_bomb_canonical_denied() {
+        assert_eq!(decision(":(){ :|:& };:"), Some("deny".into()));
+    }
+
+    // DENY: fork bomb without trailing colon
+    #[test]
+    fn fork_bomb_no_trailing_colon_denied() {
+        assert_eq!(decision(":(){ :|:& }"), Some("deny".into()));
+    }
+
+    // DENY: recursive body alone
+    #[test]
+    fn fork_bomb_body_alone_denied() {
+        assert_eq!(decision(":|:&"), Some("deny".into()));
+    }
+
+    // PASS: normal function definition with non-colon name
+    #[test]
+    fn normal_function_def_passes() {
+        assert_eq!(decision("f(){ echo hi; }"), None);
+    }
+
+    // PASS: benign string mentioning fork bombs
+    #[test]
+    fn fork_bomb_in_echo_passes() {
+        assert_eq!(decision("echo \"fork bombs are bad\""), None);
     }
 
     // ── fetch-then-exec detection (issue #73) ─────────────────────────────────

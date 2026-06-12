@@ -986,3 +986,13 @@ fn e2e_shred_denies() {
     let out = run(&bash("shred secret.txt"), &[]);
     assert_eq!(decision(&out), Some("deny"), "shred must be denied: {out}");
 }
+
+#[test]
+fn e2e_fork_bomb_denied() {
+    let out = run(&bash(":(){ :|:& };:"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "fork bomb must be denied: {out}"
+    );
+}
