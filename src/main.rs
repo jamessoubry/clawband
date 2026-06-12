@@ -766,10 +766,25 @@ fn builtin_ask() -> Vec<Pattern> {
         // ASK (not deny) — chmod is legitimate but world-writable or -R on sensitive
         // paths warrants review.
         ("chmod (777)", r"\bchmod\s+777\b"),
-        ("chmod (-R)", r"\bchmod\s+-R\b"),
         (
             "chmod (sensitive path)",
             r"\bchmod\b.*(/etc/|/usr/|~/\.ssh)",
+        ),
+        // ── chmod/chown recursive on dangerous permissions or broad paths (issue #24)
+        // chmod -R 000 — removes all permissions recursively; always dangerous regardless of path
+        (
+            "chmod -R 000",
+            r"\bchmod\b.+(?:-[A-Za-z]*R[A-Za-z]*|--recursive\b).+\b000\b",
+        ),
+        // chmod -R on absolute or home path — broad recursive permission change
+        (
+            "chmod -R (broad path)",
+            r"\bchmod\b.+(?:-[A-Za-z]*R[A-Za-z]*|--recursive\b).+[ \t][/~]",
+        ),
+        // chown -R on absolute or home path — broad recursive ownership change
+        (
+            "chown -R (broad path)",
+            r"\bchown\b.+(?:-[A-Za-z]*R[A-Za-z]*|--recursive\b).+[ \t][/~]",
         ),
         // ── killall <name> — kills ALL processes matching a name ──────────────
         // ASK (not deny): `killall node`, `killall python3` are often legitimate
@@ -5319,6 +5334,71 @@ mod tests {
     fn chmod_plus_x_user_file_passes() {
         // chmod +x on a local file — safe
         assert_eq!(decision("chmod +x ./build.sh"), None);
+    }
+
+    // ── Issue #24: chmod/chown recursive — dangerous permissions or broad paths ─
+
+    #[test]
+    fn chmod_r_000_absolute_asks() {
+        // chmod -R 000 on absolute path — always dangerous
+        assert_eq!(decision("chmod -R 000 /etc"), Some("ask".into()));
+    }
+
+    #[test]
+    fn chmod_r_000_relative_asks() {
+        // chmod -R 000 is always dangerous regardless of path
+        assert_eq!(decision("chmod -R 000 ./secret"), Some("ask".into()));
+    }
+
+    #[test]
+    fn chmod_r_777_absolute_asks() {
+        // chmod -R 777 on absolute path — broad recursive permission change
+        assert_eq!(decision("chmod -R 777 /var/www"), Some("ask".into()));
+    }
+
+    #[test]
+    fn chown_r_absolute_asks() {
+        // chown -R on absolute path — broad recursive ownership change
+        assert_eq!(decision("chown -R root:root /home"), Some("ask".into()));
+    }
+
+    #[test]
+    fn chown_r_home_tilde_asks() {
+        // chown -R on home-relative path — broad recursive ownership change
+        assert_eq!(
+            decision("chown -R www-data:www-data ~/app"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn chmod_recursive_long_flag_000_asks() {
+        // --recursive long form with 000
+        assert_eq!(decision("chmod --recursive 000 /tmp"), Some("ask".into()));
+    }
+
+    #[test]
+    fn chmod_r_relative_755_passes() {
+        // chmod -R on relative path with routine permissions — safe
+        assert_eq!(decision("chmod -R 755 ./dist"), None);
+    }
+
+    #[test]
+    fn chmod_r_relative_644_passes() {
+        // chmod -R on relative path — safe
+        assert_eq!(decision("chmod -R 644 src/"), None);
+    }
+
+    #[test]
+    fn chown_r_relative_passes() {
+        // chown -R on relative path — safe
+        assert_eq!(decision("chown -R user:group ./project"), None);
+    }
+
+    #[test]
+    fn chmod_not_recursive_non_sensitive_passes() {
+        // chmod without -R on a non-sensitive absolute path — not recursive, not in sensitive list
+        assert_eq!(decision("chmod 755 /opt/myapp/bin/myapp"), None);
     }
 
     // ── Item #3: assign-then-exec detection ──────────────────────────────────
