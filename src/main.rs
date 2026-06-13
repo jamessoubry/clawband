@@ -1274,6 +1274,67 @@ fn split_segments(cmd: &str) -> Vec<String> {
         .collect()
 }
 
+// ─── Segment normalization (issue #70) ───────────────────────────────────────
+// Strips leading shell noise so pattern matching fires reliably regardless of
+// how a command is prefixed. Applied in check_command before deny/ask checks.
+
+/// Strips leading shell noise from a segment so pattern matching is reliable
+/// regardless of prefix style:
+///   - backslash-escaped first token: `\rm` → `rm`
+///   - leading VAR=value assignments: `A=1 B=2 IFS=, rm -rf /` → `rm -rf /`
+///   - command modifier builtins: `command rm -rf /` → `rm -rf /`
+///
+/// Does NOT strip `sudo`, `exec`, or `time` — those have their own patterns
+/// or overloaded meanings. Does NOT alter pipe contents or compound structure.
+fn normalize_segment(segment: &str) -> String {
+    const MODIFIERS: &[&str] = &["command", "builtin", "env", "nice", "nohup"];
+    // VAR=value: identifier chars, `=`, non-whitespace value, then whitespace
+    let var_re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+").unwrap();
+
+    let mut s = segment.trim().to_string();
+
+    // Strip backslash prefix from first word: `\rm` → `rm`
+    if s.starts_with('\\') {
+        let rest = &s[1..];
+        if rest
+            .chars()
+            .next()
+            .map(|c| c.is_alphabetic() || c == '_')
+            .unwrap_or(false)
+        {
+            s = rest.to_string();
+        }
+    }
+
+    loop {
+        let trimmed = s.trim_start().to_string();
+
+        // Strip leading VAR=value
+        if let Some(m) = var_re.find(&trimmed) {
+            s = trimmed[m.end()..].to_string();
+            continue;
+        }
+
+        // Strip leading modifier keyword (must be full word, followed by space)
+        let mut stripped = false;
+        for &modifier in MODIFIERS {
+            if trimmed.starts_with(modifier)
+                && trimmed[modifier.len()..].starts_with(|c: char| c.is_whitespace())
+            {
+                s = trimmed[modifier.len()..].trim_start().to_string();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            s = trimmed;
+            break;
+        }
+    }
+
+    s
+}
+
 // ─── PostToolUse breadcrumb ───────────────────────────────────────────────────
 // Written by PreToolUse when decision is "ask". Read and deleted by `clawband post`
 // (PostToolUse hook). If the command ran, PostToolUse fires and we know the user
@@ -3562,7 +3623,21 @@ fn check_command<'a>(
     let segments = split_segments(&clean);
 
     for segment in &segments {
-        if allow_pats.iter().any(|p| p.matches(segment)) {
+        let norm = normalize_segment(segment);
+        // Build list of forms to check: always try original; add normalized if different.
+        // Checking both preserves backward compat for allow patterns while ensuring
+        // future anchor-based deny patterns fire on normalized form too.
+        let forms: &[&str] = if norm != segment.trim() {
+            &[segment.as_str(), norm.as_str()]
+        } else {
+            &[segment.as_str()]
+        };
+
+        // allow_pats: if ANY form is allowed, skip this segment entirely
+        if forms
+            .iter()
+            .any(|f| allow_pats.iter().any(|p| p.matches(f)))
+        {
             continue;
         }
 
@@ -3570,30 +3645,36 @@ fn check_command<'a>(
             return Some(("deny", reason));
         }
 
-        for pat in deny_pats {
-            if pat.matches(segment) {
-                return Some((
-                    "deny",
-                    with_suggestion(
-                        format!("Blocked: '{}' matched in: {}", pat.label, segment),
-                        &pat.label,
-                    ),
-                ));
+        // Check deny patterns against all forms; reason shows original segment
+        for &form in forms {
+            for pat in deny_pats {
+                if pat.matches(form) {
+                    return Some((
+                        "deny",
+                        with_suggestion(
+                            format!("Blocked: '{}' matched in: {}", pat.label, segment),
+                            &pat.label,
+                        ),
+                    ));
+                }
             }
         }
 
-        for pat in ask_pats {
-            if pat.matches(segment) {
-                return Some((
-                    "ask",
-                    with_suggestion(
-                        format!(
-                            "Review before running — '{}' matched in: {}\nTo always allow:\n  ! {} allow '{}'\n",
-                            pat.label, segment, hook_command_string(), pat.label
+        // Check ask patterns against all forms; reason shows original segment
+        for &form in forms {
+            for pat in ask_pats {
+                if pat.matches(form) {
+                    return Some((
+                        "ask",
+                        with_suggestion(
+                            format!(
+                                "Review before running — '{}' matched in: {}\nTo always allow:\n  ! {} allow '{}'\n",
+                                pat.label, segment, hook_command_string(), pat.label
+                            ),
+                            &pat.label,
                         ),
-                        &pat.label,
-                    ),
-                ));
+                    ));
+                }
             }
         }
 
@@ -6702,5 +6783,49 @@ mod tests {
         assert_eq!(variable_name_from_path("/tmp/script.py"), None);
         assert_eq!(variable_name_from_path("script.py"), None);
         assert_eq!(variable_name_from_path("./run.sh"), None);
+    }
+
+    // ── normalize_segment (issue #70) ──────────────────────────────────────────
+
+    #[test]
+    fn normalize_strips_backslash_prefix() {
+        assert_eq!(normalize_segment(r"\rm -rf /"), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_strips_single_var_assignment() {
+        assert_eq!(normalize_segment("A=1 rm -rf /"), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_strips_multiple_var_assignments() {
+        assert_eq!(normalize_segment("A=1 B=2 IFS=, rm -rf /"), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_strips_command_modifier() {
+        assert_eq!(normalize_segment("command rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment("builtin rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment("env rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment("nice rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment("nohup rm -rf /"), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_strips_chained_modifier_and_var() {
+        assert_eq!(normalize_segment("env A=1 rm -rf /"), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_leaves_exec_and_sudo_intact() {
+        // exec and sudo have their own patterns — don't strip
+        assert_eq!(normalize_segment("exec rm -rf /"), "exec rm -rf /");
+        assert_eq!(normalize_segment("sudo rm -rf /"), "sudo rm -rf /");
+    }
+
+    #[test]
+    fn normalize_plain_command_unchanged() {
+        assert_eq!(normalize_segment("git status"), "git status");
+        assert_eq!(normalize_segment("ls -la"), "ls -la");
     }
 }

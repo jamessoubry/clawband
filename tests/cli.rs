@@ -1154,3 +1154,65 @@ fn e2e_var_script_dangerous_content_denies() {
         "reason must mention variable resolution: {out}"
     );
 }
+
+// ── Leading assignment / modifier normalization (issue #70) ─────────────────
+
+#[test]
+fn e2e_backslash_rm_denied() {
+    let out = run(&bash(r"\rm -rf /tmp"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        r"\rm must still be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_var_assignment_rm_denied() {
+    let out = run(&bash("IFS=, rm -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "IFS=, rm -rf / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_multi_var_rm_denied() {
+    let out = run(&bash("A=1 B=2 rm -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "A=1 B=2 rm -rf / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_env_rm_denied() {
+    let out = run(&bash("env rm -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "env rm -rf / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_command_rm_denied() {
+    let out = run(&bash("command rm -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "command rm -rf / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_nice_rm_denied() {
+    let out = run(&bash("nice rm -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "nice rm -rf / must be denied: {out}"
+    );
+}
