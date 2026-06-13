@@ -949,6 +949,20 @@ fn e2e_rm_rf_double_quoted_root_deny() {
     );
 }
 
+// ── issue #80: rm -rf . (bare dot) — cd-then-wipe pattern ───────────────────
+
+#[test]
+fn e2e_rm_rf_bare_dot_asks() {
+    let out = run(&bash("rm -rf ."), &[]);
+    assert_eq!(decision(&out), Some("ask"), "rm -rf . must ask: {out}");
+}
+
+#[test]
+fn e2e_rm_rf_relative_subdir_passes() {
+    let out = run(&bash("rm -rf ./dist"), &[]);
+    assert_eq!(decision(&out), None, "rm -rf ./dist must pass: {out}");
+}
+
 // eval ask-pattern: subshell-only idioms must not be blocked (#67).
 // They match builtin_allow() so the binary emits an explicit "allow" response.
 #[test]

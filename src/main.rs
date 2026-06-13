@@ -849,6 +849,12 @@ fn builtin_ask() -> Vec<Pattern> {
         ),
         // ssh running a local-style script path (./script.sh forwarded to remote)
         ("ssh + script path", r"\bssh\b.+\./"),
+        // rm -rf . (bare dot) — resolves to cwd, which may be anywhere after a cd
+        // The trailing \.(\s|$) anchor ensures rm -rf ./subdir and rm -rf .config are NOT caught
+        (
+            "rm -rf . (bare dot)",
+            r"\brm\b.*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s+\.(\s|$)",
+        ),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -3983,6 +3989,21 @@ mod tests {
     fn rm_rf_specific_file_passes() {
         // No dangerous path anchor — must not be blocked
         assert_eq!(decision("rm -rf file.txt"), None);
+    }
+
+    #[test]
+    fn rm_rf_bare_dot_asks() {
+        assert_eq!(decision("rm -rf ."), Some("ask".into()));
+        assert_eq!(decision("rm -fr ."), Some("ask".into()));
+        assert_eq!(decision("rm -r -f ."), Some("ask".into()));
+    }
+
+    #[test]
+    fn rm_rf_relative_subdir_passes() {
+        // bare dot only — explicit relative paths should pass
+        assert_eq!(decision("rm -rf ./dist"), None);
+        assert_eq!(decision("rm -rf .config"), None);
+        assert_eq!(decision("rm -rf ./subdir/"), None);
     }
 
     #[test]
