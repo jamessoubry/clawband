@@ -674,7 +674,10 @@ fn builtin_ask() -> Vec<Pattern> {
         // or persistence is a common supply-chain and C2 technique.
         //
         // base64 decode piped onward — decoded payload fed to another command
-        ("base64 decode piped", r"\bbase64\s+(-d|-D|--decode)\b.*\|"),
+        (
+            "base64 decode piped",
+            r"\bbase64\s+(-d|-D|--decode)\b.*\|\s*(sh|bash|zsh|dash|fish|python3?|node|deno|ruby|perl|lua|php)\b",
+        ),
         // base64 decode redirected to a file — writing a decoded binary or script
         (
             "base64 decode redirect",
@@ -4822,9 +4825,9 @@ mod tests {
     }
 
     #[test]
-    fn base64_decode_piped_to_non_interpreter_asks() {
-        // base64 -d piped to cat — not a deny (no interpreter), but still ask
-        assert_eq!(decision("base64 -d payload.b64 | cat"), Some("ask".into()));
+    fn base64_decode_piped_to_non_interpreter_passes() {
+        // base64 -d piped to cat — not an interpreter, should pass
+        assert_eq!(decision("base64 -d payload.b64 | cat"), None);
     }
 
     #[test]
@@ -4847,9 +4850,9 @@ mod tests {
 
     #[test]
     fn base64_long_decode_flag_asks() {
-        // --decode long form
+        // --decode long form piped to interpreter (deno — not in deny tier) — should ask
         assert_eq!(
-            decision("base64 --decode payload.b64 | cat"),
+            decision("base64 --decode payload.b64 | deno"),
             Some("ask".into())
         );
     }
@@ -4859,6 +4862,34 @@ mod tests {
         // Plain encode (no -d/-D/--decode) — safe, no ask
         assert_eq!(decision("base64 file.txt"), None);
         assert_eq!(decision("base64 -e file.txt"), None);
+    }
+
+    #[test]
+    fn base64_decode_piped_to_cat_passes() {
+        assert_eq!(decision("base64 -d payload.b64 | cat"), None);
+        assert_eq!(decision("base64 --decode payload.b64 | cat"), None);
+    }
+
+    #[test]
+    fn base64_decode_piped_to_grep_passes() {
+        assert_eq!(decision("base64 -d encoded.txt | grep secret"), None);
+    }
+
+    #[test]
+    fn base64_decode_piped_to_interpreter_asks() {
+        // deno and php are not in the deny-tier pipe patterns, so base64 piped to
+        // them reaches the ask tier via the narrowed base64-decode-piped pattern
+        assert_eq!(decision("base64 -d payload.b64 | deno"), Some("ask".into()));
+        assert_eq!(decision("base64 -d payload.b64 | php"), Some("ask".into()));
+    }
+
+    #[test]
+    fn base64_decode_at_end_of_pipeline_passes() {
+        // base64 -d at END of pipeline (nothing piped after) — just decoding to stdout
+        assert_eq!(
+            decision("aws ssm get-parameter --with-decryption | base64 -d"),
+            None
+        );
     }
 
     #[test]
