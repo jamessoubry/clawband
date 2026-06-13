@@ -1371,3 +1371,93 @@ fn e2e_pipe_to_grep_bash_no_false_positive() {
         "ls | grep bash must not be denied (false positive): {out}"
     );
 }
+
+// ── dd disk-wipe: of= anywhere in operand list (#113) ────────────────────────
+
+#[test]
+fn e2e_dd_of_dev_sda_denies() {
+    // Regression: classic operand order must still be denied
+    let out = run(&bash("dd if=/dev/zero of=/dev/sda"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "dd if=/dev/zero of=/dev/sda must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_dd_bs_before_if_of_denies() {
+    // Extra operand before if=/of= — previously bypassed positional pattern
+    let out = run(&bash("dd bs=4M if=/dev/zero of=/dev/sda"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "dd bs=4M if=/dev/zero of=/dev/sda must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_dd_of_before_if_denies() {
+    // of= appears before if= — previously bypassed positional pattern
+    let out = run(&bash("dd status=progress of=/dev/sda if=/dev/zero"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "dd status=progress of=/dev/sda if=/dev/zero must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_dd_of_dev_null_passes() {
+    // /dev/null is a safe pseudo-device — must not be blocked
+    let out = run(&bash("dd if=/dev/zero of=/dev/null"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "dd if=/dev/zero of=/dev/null must not be denied (safe pseudo-device): {out}"
+    );
+}
+
+// ── redirect to block device: NVMe / virtio / Xen (#121) ─────────────────────
+
+#[test]
+fn e2e_redirect_to_nvme_denies() {
+    let out = run(&bash("cat /dev/zero > /dev/nvme0n1"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "redirect to /dev/nvme0n1 must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_redirect_to_vda_denies() {
+    let out = run(&bash("cat /dev/zero > /dev/vda"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "redirect to /dev/vda must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_redirect_to_sda_still_denies() {
+    // Regression: SCSI/SATA must still be caught
+    let out = run(&bash("cat /dev/zero > /dev/sda"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "redirect to /dev/sda must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_redirect_to_dev_null_passes() {
+    // /dev/null is safe — redirect must not be blocked
+    let out = run(&bash("echo foo > /dev/null"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "redirect to /dev/null must not be denied: {out}"
+    );
+}

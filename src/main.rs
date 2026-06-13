@@ -542,9 +542,23 @@ fn builtin_deny() -> Vec<Pattern> {
             r"\bsudo\s+rm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)",
         ),
         ("mkfs", r"\bmkfs\b"),
-        ("dd if=", r"\bdd\s+if="),
-        ("dd of=", r"\bdd\s+of="),
-        ("> /dev/sd", r">\s*/dev/sd"),
+        // dd writing to a real block device — of= may appear anywhere in the
+        // operand list (dd accepts operands in any order, not just after dd).
+        // Matches known real block-device prefixes: SCSI/SATA (sd), IDE (hd),
+        // NVMe (nvme), virtio (vd), Xen (xvd), eMMC (mmcblk), device-mapper
+        // (dm), loop devices. Safe pseudo-devices (null, zero, urandom, etc.)
+        // don't start with these prefixes and are therefore excluded implicitly.
+        (
+            "dd of=/dev/<device>",
+            r"\bdd\b.*\bof=/dev/(sd|hd|nvme|vd|xvd|mmcblk|loop|dm)[a-z0-9]",
+        ),
+        // Redirect (> or >>) to a real block device — covers SCSI/SATA (sd*),
+        // IDE (hd*), NVMe (nvme*), virtio (vd*), Xen (xvd*), eMMC (mmcblk*),
+        // device-mapper (dm*), and loop devices.
+        (
+            "> /dev/<device>",
+            r">\s*/dev/(sd|hd|nvme|vd|xvd|mmcblk|loop|dm)[a-z0-9]",
+        ),
         // Silent file truncation
         ("truncate -s 0", r"\btruncate\b.*-s\s+0\b"),
         // Infrastructure destruction
@@ -7115,6 +7129,88 @@ mod tests {
             decision("ls | grep bash"),
             None,
             "ls | grep bash must not be denied (false positive)"
+        );
+    }
+
+    // ── dd disk-wipe: of= anywhere in operand list (#113) ────────────────────
+
+    #[test]
+    fn dd_of_dev_sda_denies() {
+        // Regression: classic operand order must still be denied
+        assert_eq!(
+            decision("dd if=/dev/zero of=/dev/sda"),
+            Some("deny".into()),
+            "dd if=/dev/zero of=/dev/sda must be denied"
+        );
+    }
+
+    #[test]
+    fn dd_bs_before_if_of_denies() {
+        // Operands before if=/of= must still be caught
+        assert_eq!(
+            decision("dd bs=4M if=/dev/zero of=/dev/sda"),
+            Some("deny".into()),
+            "dd bs=4M if=/dev/zero of=/dev/sda must be denied"
+        );
+    }
+
+    #[test]
+    fn dd_of_before_if_denies() {
+        // of= before if= — previously bypassed the old positional pattern
+        assert_eq!(
+            decision("dd status=progress of=/dev/sda if=/dev/zero"),
+            Some("deny".into()),
+            "dd status=progress of=/dev/sda if=/dev/zero must be denied"
+        );
+    }
+
+    #[test]
+    fn dd_of_dev_null_passes() {
+        // /dev/null is a safe pseudo-device — must not be blocked
+        assert_eq!(
+            decision("dd if=/dev/zero of=/dev/null"),
+            None,
+            "dd if=/dev/zero of=/dev/null must not be denied (safe pseudo-device)"
+        );
+    }
+
+    // ── redirect to block device: NVMe / virtio / Xen (#121) ─────────────────
+
+    #[test]
+    fn redirect_to_nvme_denies() {
+        assert_eq!(
+            decision("cat /dev/zero > /dev/nvme0n1"),
+            Some("deny".into()),
+            "redirect to /dev/nvme0n1 must be denied"
+        );
+    }
+
+    #[test]
+    fn redirect_to_vda_denies() {
+        assert_eq!(
+            decision("cat /dev/zero > /dev/vda"),
+            Some("deny".into()),
+            "redirect to /dev/vda must be denied"
+        );
+    }
+
+    #[test]
+    fn redirect_to_sda_still_denies() {
+        // Regression: SCSI/SATA must still be caught
+        assert_eq!(
+            decision("cat /dev/zero > /dev/sda"),
+            Some("deny".into()),
+            "redirect to /dev/sda must be denied"
+        );
+    }
+
+    #[test]
+    fn redirect_to_dev_null_passes() {
+        // /dev/null is safe — redirect must not be blocked
+        assert_eq!(
+            decision("echo foo > /dev/null"),
+            None,
+            "redirect to /dev/null must not be denied"
         );
     }
 }
