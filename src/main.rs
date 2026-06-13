@@ -1141,7 +1141,7 @@ fn scan_script_file(
                         "ask".into(),
                         with_suggestion(
                             format!(
-                                "Review before running — '{}' in {}:{}: {}\nTo always allow:\n  ! clawband allow '{}'",
+                                "Review before running — '{}' in {}:{}: {}\nTo always allow:\n  ! clawband allow '{}'\n",
                                 pat.label, path, lineno + 1, segment, pat.label
                             ),
                             &pat.label,
@@ -3228,7 +3228,7 @@ fn check_echo_to_script(
             return Some((
                 false,
                 format!(
-                    "Review before running — '{}' found in echo content written to script file: {}\nTo always allow:\n  ! clawband allow '{}'",
+                    "Review before running — '{}' found in echo content written to script file: {}\nTo always allow:\n  ! clawband allow '{}'\n",
                     pat.label, content, pat.label
                 ),
             ));
@@ -3513,7 +3513,7 @@ fn check_command<'a>(
                     "ask",
                     with_suggestion(
                         format!(
-                            "Review before running — '{}' matched in: {}\nTo always allow:\n  ! clawband allow '{}'",
+                            "Review before running — '{}' matched in: {}\nTo always allow:\n  ! clawband allow '{}'\n",
                             pat.label, segment, pat.label
                         ),
                         &pat.label,
