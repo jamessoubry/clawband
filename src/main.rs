@@ -1043,6 +1043,24 @@ fn extract_script_path(command: &str) -> Option<String> {
     Some(path.to_string())
 }
 
+/// If `path` looks like a shell variable reference (`$VAR` or `${VAR}`, optionally
+/// double-quoted), returns the variable name.  Returns `None` for literal paths.
+fn variable_name_from_path(path: &str) -> Option<String> {
+    let s = path.trim_matches('"').trim_matches('\'');
+    if !s.starts_with('$') {
+        return None;
+    }
+    let inner = s
+        .trim_start_matches('$')
+        .trim_start_matches('{')
+        .trim_end_matches('}');
+    if !inner.is_empty() && inner.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Some(inner.to_string())
+    } else {
+        None
+    }
+}
+
 fn scan_script_file(
     path: &str,
     deny_pats: &[Pattern],
@@ -3796,7 +3814,45 @@ fn main() {
     }
 
     // Script file scanning: if command is `bash ./foo.sh`, read and check the file.
+    // If the path is a variable reference, attempt to resolve from env and warn TOCTOU.
     if let Some(script_path) = extract_script_path(&command) {
+        if let Some(var_name) = variable_name_from_path(&script_path) {
+            let (decision, reason) = match std::env::var(&var_name) {
+                Ok(resolved) => {
+                    let header = format!(
+                        "Script path resolved from variable {} \u{2192} {}\n\
+                         File content was scanned at check time; it may change before execution (TOCTOU).\n",
+                        script_path, resolved
+                    );
+                    if let Some((d, r)) =
+                        scan_script_file(&resolved, &deny_pats, &ask_pats, &allow_pats)
+                    {
+                        (d, format!("{}{}", header, r))
+                    } else {
+                        (
+                            "ask".into(),
+                            format!(
+                                "{}No dangerous patterns found \u{2014} but confirm the file has not been modified.\n",
+                                header
+                            ),
+                        )
+                    }
+                }
+                Err(_) => (
+                    "ask".into(),
+                    format!(
+                        "Script path is a variable ({}) that could not be resolved at check time.\n\
+                         The file cannot be scanned. Review the command before running.\n",
+                        script_path
+                    ),
+                ),
+            };
+            if decision == "ask" && mode == Mode::Claude {
+                write_ask_breadcrumb(&reason);
+            }
+            emit(&decision, &reason);
+            return;
+        }
         if let Some((decision, reason)) =
             scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
         {
@@ -6550,5 +6606,35 @@ mod tests {
             Some("deny".into()),
             "find . -delete must be denied when CLAWBAND_SKIP is not set"
         );
+    }
+
+    // ── variable_name_from_path (issue #52) ───────────────────────────────────
+
+    #[test]
+    fn variable_name_from_bare_dollar() {
+        assert_eq!(
+            variable_name_from_path("$FILE_PATH"),
+            Some("FILE_PATH".into())
+        );
+    }
+
+    #[test]
+    fn variable_name_from_braced() {
+        assert_eq!(variable_name_from_path("${SCRIPT}"), Some("SCRIPT".into()));
+    }
+
+    #[test]
+    fn variable_name_from_quoted() {
+        assert_eq!(
+            variable_name_from_path("\"$FILE_PATH\""),
+            Some("FILE_PATH".into())
+        );
+    }
+
+    #[test]
+    fn variable_name_literal_returns_none() {
+        assert_eq!(variable_name_from_path("/tmp/script.py"), None);
+        assert_eq!(variable_name_from_path("script.py"), None);
+        assert_eq!(variable_name_from_path("./run.sh"), None);
     }
 }
