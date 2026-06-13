@@ -6031,8 +6031,14 @@ mod tests {
         // Values depend on the test environment so we only check they are valid.
         let cfg = load_config();
         assert!(cfg.file_mode.is_none() || cfg.file_mode.is_some());
-        assert!(matches!(cfg.ask_fallback, AskFallback::Allow | AskFallback::Deny));
-        assert!(matches!(cfg.default_decision, "allow" | "ask" | "passthrough"));
+        assert!(matches!(
+            cfg.ask_fallback,
+            AskFallback::Allow | AskFallback::Deny
+        ));
+        assert!(matches!(
+            cfg.default_decision,
+            "allow" | "ask" | "passthrough"
+        ));
     }
 
     #[test]
