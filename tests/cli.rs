@@ -1537,3 +1537,37 @@ fn e2e_backslash_newline_pipe_bash_denied() {
         "multi-line curl | bash must be denied: {out}"
     );
 }
+
+// ── issue #128: shell comment stripping — false-positive blocks ───────────────
+
+#[test]
+fn e2e_comment_with_deny_pattern_passes() {
+    // "echo hi # rm -rf /" — shell ignores the comment; clawband must too
+    let out = run(&bash("echo hi # rm -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "benign command with deny-pattern comment must not be blocked: {out}"
+    );
+}
+
+#[test]
+fn e2e_comment_dd_pattern_passes() {
+    let out = run(&bash("ls -la # dd if=/dev/zero of=/dev/sda"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "ls with dd comment must not be blocked: {out}"
+    );
+}
+
+#[test]
+fn e2e_dangerous_command_with_comment_still_denied() {
+    // The live part of the command is still dangerous — comment doesn't excuse it
+    let out = run(&bash("rm -rf / # just tidying"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -rf / with trailing comment must still be denied: {out}"
+    );
+}

