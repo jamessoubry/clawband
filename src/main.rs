@@ -1141,8 +1141,8 @@ fn scan_script_file(
                         "ask".into(),
                         with_suggestion(
                             format!(
-                                "Review before running — '{}' in {}:{}: {}\nTo always allow:\n  ! clawband allow '{}'\n",
-                                pat.label, path, lineno + 1, segment, pat.label
+                                "Review before running — '{}' in {}:{}: {}\nTo always allow:\n  ! {} allow '{}'\n",
+                                pat.label, path, lineno + 1, segment, hook_command_string(), pat.label
                             ),
                             &pat.label,
                         ),
@@ -1253,9 +1253,17 @@ fn cmd_post() {
 
     let reason: String = lines.collect::<Vec<_>>().join("\n");
 
-    // Extract "clawband allow '<label>'" from the hint line if present.
-    if let Some(pos) = reason.find("clawband allow '") {
-        let snippet = reason[pos..].lines().next().unwrap_or("").trim();
+    // Extract "<exe> allow '<label>'" from the hint line if present.
+    // The exe may be "clawband" (PATH users) or an absolute path (install.sh users),
+    // so search for the path-agnostic " allow '" marker and then walk back to the
+    // start of the exe token (after the "! " prefix on that line).
+    if let Some(allow_pos) = reason.find(" allow '") {
+        let line_start = reason[..allow_pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let token_start = reason[line_start..allow_pos]
+            .rfind("! ")
+            .map(|p| line_start + p + 2)
+            .unwrap_or(allow_pos);
+        let snippet = reason[token_start..].lines().next().unwrap_or("").trim();
         println!(
             "The user approved a clawband-prompted command. \
              Suggest they run `{}` to stop being prompted for this in future.",
@@ -3228,8 +3236,8 @@ fn check_echo_to_script(
             return Some((
                 false,
                 format!(
-                    "Review before running — '{}' found in echo content written to script file: {}\nTo always allow:\n  ! clawband allow '{}'\n",
-                    pat.label, content, pat.label
+                    "Review before running — '{}' found in echo content written to script file: {}\nTo always allow:\n  ! {} allow '{}'\n",
+                    pat.label, content, hook_command_string(), pat.label
                 ),
             ));
         }
@@ -3513,8 +3521,8 @@ fn check_command<'a>(
                     "ask",
                     with_suggestion(
                         format!(
-                            "Review before running — '{}' matched in: {}\nTo always allow:\n  ! clawband allow '{}'\n",
-                            pat.label, segment, pat.label
+                            "Review before running — '{}' matched in: {}\nTo always allow:\n  ! {} allow '{}'\n",
+                            pat.label, segment, hook_command_string(), pat.label
                         ),
                         &pat.label,
                     ),
@@ -3923,8 +3931,21 @@ mod tests {
         let (dec, r) = check_command("git checkout -- .", &dp, &ap, &al).unwrap();
         assert_eq!(dec, "ask");
         assert!(
-            r.contains("To always allow:\n  ! clawband allow '"),
-            "hint should be multi-line with ! prefix, got: {r}"
+            r.contains(" allow '"),
+            "hint should contain 'allow' command, got: {r}"
+        );
+    }
+
+    #[test]
+    fn allow_hint_uses_binary_path() {
+        let dp = deny_pats();
+        let ap = ask_pats();
+        let al = allow_pats();
+        let (_, reason) = check_command("git checkout -- .", &dp, &ap, &al).unwrap();
+        let exe = hook_command_string();
+        assert!(
+            reason.contains(&format!("! {} allow '", exe)),
+            "hint should use hook_command_string(), got: {reason}"
         );
     }
 
