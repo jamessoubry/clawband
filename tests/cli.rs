@@ -1467,7 +1467,6 @@ fn e2e_redirect_to_dev_null_passes() {
 #[test]
 fn e2e_bash_ex_evil_script_denied() {
     // bash -ex /path should still scan the file — -e means errexit, not inline code
-    use std::io::Write as _;
     let path = format!("/tmp/clawband_e2e_116_{}.sh", std::process::id());
     std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
     let out = run(&bash(&format!("bash -ex {}", path)), &[]);
