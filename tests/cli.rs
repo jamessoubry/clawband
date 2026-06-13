@@ -1041,6 +1041,30 @@ fn e2e_fork_bomb_denied() {
     );
 }
 
+// ── base64 false positive fix (issue #83) ─────────────────────────────────────
+
+#[test]
+fn e2e_base64_decode_piped_to_cat_passes() {
+    let out = run(&bash("base64 -d payload.b64 | cat"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "base64 -d piped to cat should pass (non-interpreter): {out}"
+    );
+}
+
+#[test]
+fn e2e_base64_decode_piped_to_interpreter_asks() {
+    // deno is not in the deny-tier pipe patterns, so this reaches ask via the
+    // narrowed base64-decode-piped pattern
+    let out = run(&bash("base64 -d payload.b64 | deno"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "base64 -d piped to deno should ask: {out}"
+    );
+}
+
 // ── Recursive chmod/chown on dangerous permissions or broad paths (issue #24) ─
 
 #[test]
