@@ -3705,13 +3705,13 @@ fn check_command<'a>(
             &[segment.as_str()]
         };
 
-        // allow_pats: if ANY form is allowed, skip this segment entirely
-        if forms
+        // allow_pats suppress the ASK tier only — DENY tier always fires.
+        // A segment is "allowed" when any of its forms matches an allow pattern.
+        let is_allowed = forms
             .iter()
-            .any(|f| allow_pats.iter().any(|p| p.matches(f)))
-        {
-            continue;
-        }
+            .any(|f| allow_pats.iter().any(|p| p.matches(f)));
+
+        // ── Deny tier (always runs, allow cannot suppress) ────────────────────
 
         if let Some(reason) = check_force_push(segment) {
             return Some(("deny", reason));
@@ -3732,48 +3732,55 @@ fn check_command<'a>(
             }
         }
 
-        // Check ask patterns against all forms; reason shows original segment
-        for &form in forms {
-            for pat in ask_pats {
-                if pat.matches(form) {
-                    return Some((
-                        "ask",
-                        with_suggestion(
-                            format!(
-                                "Review before running — '{}' matched in: {}\nTo always allow:\n  ! {} allow '{}'\n",
-                                pat.label, segment, hook_command_string(), pat.label
+        // ── Ask tier (suppressed when segment is allow-listed) ────────────────
+
+        if !is_allowed {
+            // Check ask patterns against all forms; reason shows original segment
+            for &form in forms {
+                for pat in ask_pats {
+                    if pat.matches(form) {
+                        return Some((
+                            "ask",
+                            with_suggestion(
+                                format!(
+                                    "Review before running — '{}' matched in: {}\nTo always allow:\n  ! {} allow '{}'\n",
+                                    pat.label, segment, hook_command_string(), pat.label
+                                ),
+                                &pat.label,
                             ),
-                            &pat.label,
-                        ),
-                    ));
+                        ));
+                    }
+                }
+            }
+
+            // Same-segment variable re-use: a variable assigned in the prefix
+            // (stripped by normalize_segment) is referenced in the remaining command.
+            // e.g. `BAD="/" rm -rf $BAD` — the prefix assignment is the attack vector.
+            if !stripped_vars.is_empty() {
+                for var in &stripped_vars {
+                    let plain = format!("${}", var);
+                    let braced = format!("${{{}}}", var);
+                    if norm.contains(&plain) || norm.contains(&braced) {
+                        return Some((
+                            "ask",
+                            format!(
+                                "Variable '{}' assigned in the command prefix is referenced as an argument — \
+                                 the prefix assignment may be masking a dangerous value.\n\
+                                 Review: {}\n",
+                                var, segment
+                            ),
+                        ));
+                    }
                 }
             }
         }
 
-        // Same-segment variable re-use: a variable assigned in the prefix
-        // (stripped by normalize_segment) is referenced in the remaining command.
-        // e.g. `BAD="/" rm -rf $BAD` — the prefix assignment is the attack vector.
-        if !stripped_vars.is_empty() {
-            for var in &stripped_vars {
-                let plain = format!("${}", var);
-                let braced = format!("${{{}}}", var);
-                if norm.contains(&plain) || norm.contains(&braced) {
-                    return Some((
-                        "ask",
-                        format!(
-                            "Variable '{}' assigned in the command prefix is referenced as an argument — \
-                             the prefix assignment may be masking a dangerous value.\n\
-                             Review: {}\n",
-                            var, segment
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // Echo/printf content written to a script file
+        // Echo/printf content written to a script file — deny outcome always
+        // fires; ask outcome is suppressed when the segment is allow-listed.
         if let Some((is_deny, reason)) = check_echo_to_script(segment, deny_pats, ask_pats) {
-            return Some((if is_deny { "deny" } else { "ask" }, reason));
+            if is_deny || !is_allowed {
+                return Some((if is_deny { "deny" } else { "ask" }, reason));
+            }
         }
     }
 
@@ -4226,6 +4233,64 @@ mod tests {
         assert!(
             reason.contains(&format!("! {} allow '", exe)),
             "hint should use hook_command_string(), got: {reason}"
+        );
+    }
+
+    // ── allow-tier semantics (#120) ──────────────────────────────────────────
+
+    // Helper: build a Pattern from a literal string (no-regex mode for simplicity)
+    fn user_allow(pat: &str) -> Pattern {
+        Pattern {
+            label: pat.to_string(),
+            re: regex::Regex::new(&format!("(?i){}", regex::escape(pat))).unwrap(),
+        }
+    }
+
+    #[test]
+    fn allow_suppresses_ask_but_not_deny_in_compound() {
+        // "test-allow-deny && rm -rf /" — the first segment matches an allow
+        // pattern; the second segment must still fire deny.
+        let dp = deny_pats();
+        let ap = ask_pats();
+        let al = vec![user_allow("test-allow-deny")];
+        let result = check_command("test-allow-deny && rm -rf /", &dp, &ap, &al);
+        assert_eq!(
+            result.map(|(d, _)| d),
+            Some("deny"),
+            "deny must fire even when a preceding segment is allow-listed"
+        );
+    }
+
+    #[test]
+    fn allow_still_suppresses_ask() {
+        // A segment matching an allow pattern that would otherwise trigger ask
+        // must be silently passed through (existing semantics must be preserved).
+        let dp = deny_pats();
+        let ap = ask_pats();
+        // "git reset --hard" is in builtin ask patterns; wrap it in a user allow
+        let al = vec![user_allow("git reset --hard")];
+        // Command that only contains the allowed segment
+        let result = check_command("git reset --hard", &dp, &ap, &al);
+        assert!(
+            result.is_none(),
+            "allow must still suppress ask for a matching segment, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn allow_does_not_suppress_deny_on_same_segment() {
+        // A segment that matches BOTH an allow pattern AND a deny pattern
+        // must still produce deny (deny wins over allow).
+        let dp = deny_pats();
+        let ap = ask_pats();
+        // "rm -rf /" is in builtin deny; add it to allow too
+        let al = vec![user_allow("rm -rf /")];
+        let result = check_command("rm -rf /", &dp, &ap, &al);
+        assert_eq!(
+            result.map(|(d, _)| d),
+            Some("deny"),
+            "deny must fire even when the same segment is also allow-listed"
         );
     }
 
