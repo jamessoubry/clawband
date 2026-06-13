@@ -1141,7 +1141,7 @@ fn scan_script_file(
                         "ask".into(),
                         with_suggestion(
                             format!(
-                                "Review before running — '{}' in {}:{}: {}\nTo always allow: clawband allow '{}'",
+                                "Review before running — '{}' in {}:{}: {}\nTo always allow:\n  ! clawband allow '{}'\n",
                                 pat.label, path, lineno + 1, segment, pat.label
                             ),
                             &pat.label,
@@ -3228,7 +3228,7 @@ fn check_echo_to_script(
             return Some((
                 false,
                 format!(
-                    "Review before running — '{}' found in echo content written to script file: {}\nTo always allow: clawband allow '{}'",
+                    "Review before running — '{}' found in echo content written to script file: {}\nTo always allow:\n  ! clawband allow '{}'\n",
                     pat.label, content, pat.label
                 ),
             ));
@@ -3513,7 +3513,7 @@ fn check_command<'a>(
                     "ask",
                     with_suggestion(
                         format!(
-                            "Review before running — '{}' matched in: {}\nTo always allow: clawband allow '{}'",
+                            "Review before running — '{}' matched in: {}\nTo always allow:\n  ! clawband allow '{}'\n",
                             pat.label, segment, pat.label
                         ),
                         &pat.label,
@@ -3911,6 +3911,21 @@ mod tests {
         // dropdb has no suggestion entry → reason has no "Safe alternative" line
         assert!(!reason("dropdb mydb").contains("Safe alternative:"));
         assert_eq!(suggestion_for("dropdb"), None);
+    }
+
+    #[test]
+    fn allow_hint_is_multiline() {
+        // The "To always allow" hint should put the command on its own indented line
+        // so users can copy just the command without trimming [settings] from the end.
+        let dp = deny_pats();
+        let ap = ask_pats();
+        let al = allow_pats();
+        let (dec, r) = check_command("git checkout -- .", &dp, &ap, &al).unwrap();
+        assert_eq!(dec, "ask");
+        assert!(
+            r.contains("To always allow:\n  ! clawband allow '"),
+            "hint should be multi-line with ! prefix, got: {r}"
+        );
     }
 
     // ── bypass regression: no-space glob/tilde (Bug 1 & 2) ────────────────────
