@@ -45,12 +45,79 @@ impl Mode {
     }
 }
 
+struct Config {
+    /// mode from config file (None = use CLI/env/default).
+    /// global config only — not overridden by project config.
+    file_mode: Option<Mode>,
+    ask_fallback: AskFallback,
+    default_decision: &'static str,
+}
+
+/// Read ~/.clawband/config and .clawband/config once and return a Config.
+/// Project config takes precedence over global for ask_fallback and default_decision;
+/// mode only reads global config (matching existing behaviour).
+fn load_config() -> Config {
+    let parse = |path: std::path::PathBuf| -> std::collections::HashMap<String, String> {
+        fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let l = line.trim();
+                if l.is_empty() || l.starts_with('#') {
+                    return None;
+                }
+                let (k, v) = l.split_once('=')?;
+                Some((
+                    k.trim().to_string(),
+                    v.trim().trim_matches('"').trim_matches('\'').to_string(),
+                ))
+            })
+            .collect()
+    };
+
+    let global = parse(config_dir().join("config"));
+    let project = project_config_dir()
+        .map(|d| parse(d.join("config")))
+        .unwrap_or_default();
+
+    // mode: global only (no project override — matches existing behaviour)
+    let file_mode = global.get("mode").and_then(|v| Mode::from_str(v));
+
+    // ask_fallback: project overrides global
+    let ask_fallback = project
+        .get("ask_fallback")
+        .or_else(|| global.get("ask_fallback"))
+        .and_then(|v| match v.to_ascii_lowercase().as_str() {
+            "deny" => Some(AskFallback::Deny),
+            "allow" => Some(AskFallback::Allow),
+            _ => None,
+        })
+        .unwrap_or(AskFallback::Allow);
+
+    // default_decision: project overrides global
+    let default_decision = project
+        .get("default_decision")
+        .or_else(|| global.get("default_decision"))
+        .map(|v| match v.to_ascii_lowercase().as_str() {
+            "allow" => "allow",
+            "ask" => "ask",
+            _ => "passthrough",
+        })
+        .unwrap_or("passthrough");
+
+    Config {
+        file_mode,
+        ask_fallback,
+        default_decision,
+    }
+}
+
 /// Resolve mode in priority order:
 ///   1. `--mode <value>` CLI flag (passed in as already-extracted string)
 ///   2. `CLAWBAND_MODE` environment variable
-///   3. `mode = <value>` line in `~/.clawband/config`
+///   3. `file_mode` from pre-loaded Config (global config only)
 ///   4. Default: Claude
-fn resolve_mode(flag: Option<&str>) -> Mode {
+fn resolve_mode(flag: Option<&str>, file_mode: Option<Mode>) -> Mode {
     // 1. CLI flag
     if let Some(s) = flag {
         if let Some(m) = Mode::from_str(s) {
@@ -63,27 +130,8 @@ fn resolve_mode(flag: Option<&str>) -> Mode {
             return m;
         }
     }
-    // 3. Config file
-    let read_config = |dir: std::path::PathBuf| -> Option<Mode> {
-        let text = fs::read_to_string(dir.join("config")).ok()?;
-        for line in text.lines() {
-            let l = line.trim();
-            if l.is_empty() || l.starts_with('#') {
-                continue;
-            }
-            if let Some((k, v)) = l.split_once('=') {
-                if k.trim() == "mode" {
-                    return Mode::from_str(v.trim().trim_matches('"').trim_matches('\''));
-                }
-            }
-        }
-        None
-    };
-    if let Some(m) = read_config(config_dir()) {
-        return m;
-    }
-    // 4. Default
-    Mode::Claude
+    // 3. Config file (pre-loaded)
+    file_mode.unwrap_or(Mode::Claude)
 }
 
 /// What to do when the engine says "ask" but the agent has no interactive ask.
@@ -98,6 +146,7 @@ enum AskFallback {
     Allow,
 }
 
+#[allow(dead_code)]
 fn resolve_ask_fallback() -> AskFallback {
     let read = |dir: std::path::PathBuf| -> Option<AskFallback> {
         let text = fs::read_to_string(dir.join("config")).ok()?;
@@ -3674,8 +3723,9 @@ fn main() {
 
     // Resolve mode and ask-fallback before reading stdin so they're available
     // for all subsequent output calls.
-    let mode = resolve_mode(mode_flag.as_deref());
-    let ask_fallback = resolve_ask_fallback();
+    let config = load_config();
+    let mode = resolve_mode(mode_flag.as_deref(), config.file_mode);
+    let ask_fallback = config.ask_fallback;
 
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
@@ -3892,7 +3942,7 @@ fn main() {
     //    passthrough → stay silent and let the agent's native check handle it;
     //    allow → make clawband the sole gatekeeper (suppress native prompts);
     //    ask → review everything not explicitly allowed.
-    match default_decision() {
+    match config.default_decision {
         "allow" => emit("allow", "no clawband rule matched (default_decision=allow)"),
         "ask" => emit(
             "ask",
@@ -5963,16 +6013,32 @@ mod tests {
 
     #[test]
     fn resolve_mode_env_var() {
-        // Temporarily set CLAWBAND_MODE via env; resolve_mode(None) should pick it up.
+        // Temporarily set CLAWBAND_MODE via env; resolve_mode(None, None) should pick it up.
         // We can't actually set env vars in a safe test without side effects, so we
         // verify the flag-priority path instead.
-        assert_eq!(resolve_mode(Some("codex")), Mode::Codex);
-        assert_eq!(resolve_mode(Some("gemini")), Mode::Gemini);
-        assert_eq!(resolve_mode(Some("hermes")), Mode::Hermes);
-        assert_eq!(resolve_mode(Some("claude")), Mode::Claude);
+        assert_eq!(resolve_mode(Some("codex"), None), Mode::Codex);
+        assert_eq!(resolve_mode(Some("gemini"), None), Mode::Gemini);
+        assert_eq!(resolve_mode(Some("hermes"), None), Mode::Hermes);
+        assert_eq!(resolve_mode(Some("claude"), None), Mode::Claude);
         // Unknown flag value → falls through to env/config/default (default = Claude
         // when no env var is set in the test environment).
-        // We don't assert on resolve_mode(Some("badval")) because it depends on ambient env.
+        // We don't assert on resolve_mode(Some("badval"), None) because it depends on ambient env.
+    }
+
+    #[test]
+    fn load_config_does_not_panic() {
+        // Verify load_config() handles missing or present config files gracefully.
+        // Values depend on the test environment so we only check they are valid.
+        let cfg = load_config();
+        assert!(cfg.file_mode.is_none() || cfg.file_mode.is_some());
+        assert!(matches!(
+            cfg.ask_fallback,
+            AskFallback::Allow | AskFallback::Deny
+        ));
+        assert!(matches!(
+            cfg.default_decision,
+            "allow" | "ask" | "passthrough"
+        ));
     }
 
     #[test]
