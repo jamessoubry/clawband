@@ -1461,3 +1461,47 @@ fn e2e_redirect_to_dev_null_passes() {
         "redirect to /dev/null must not be denied: {out}"
     );
 }
+
+// ── issue #116: combined interpreter flags must not suppress script scanning ──
+
+#[test]
+fn e2e_bash_ex_evil_script_denied() {
+    // bash -ex /path should still scan the file — -e means errexit, not inline code
+    use std::io::Write as _;
+    let path = format!("/tmp/clawband_e2e_116_{}.sh", std::process::id());
+    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
+    let out = run(&bash(&format!("bash -ex {}", path)), &[]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "bash -ex <evil-script> must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_bash_eu_evil_script_denied() {
+    let path = format!("/tmp/clawband_e2e_116_eu_{}.sh", std::process::id());
+    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
+    let out = run(&bash(&format!("bash -eu {}", path)), &[]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "bash -eu <evil-script> must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_bash_no_flags_evil_script_denied() {
+    // Baseline regression: unflagged invocation must still be caught
+    let path = format!("/tmp/clawband_e2e_116_base_{}.sh", std::process::id());
+    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
+    let out = run(&bash(&format!("bash {}", path)), &[]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "bash <evil-script> (no flags) must be denied: {out}"
+    );
+}

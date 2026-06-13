@@ -1127,19 +1127,36 @@ fn extract_script_path(command: &str) -> Option<String> {
     }
 
     // Standard: interpreter [optional-flags] <path>
-    let re = Regex::new(&format!(r"(?i)^\s*{}\s+((?:-[a-zA-Z]+\s+)*)(.+)$", interp)).unwrap();
+    // Capture the interpreter name so we can apply interpreter-specific inline-code flags.
+    let interp_capture =
+        r"(?i)(?:sudo\s+)?(bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua[0-9.]*)";
+    let re = Regex::new(&format!(
+        r"(?i)^\s*{}\s+((?:(?:-[a-zA-Z]+|--[a-zA-Z][-a-zA-Z]*)\s+)*)(.+)$",
+        interp_capture
+    ))
+    .unwrap();
     let caps = re.captures(command)?;
-    let flags = &caps[1];
-    // -c  → shell/python inline command string
-    // -m  → python module (e.g. python3 -m pytest)
-    // -e / --eval → node inline eval
-    if Regex::new(r"(?:^|\s)-[a-zA-Z]*[cme][a-zA-Z]*(\s|$)")
-        .unwrap()
-        .is_match(flags)
-    {
-        return None;
+    let interp_name = caps[1].to_ascii_lowercase();
+    let flags = &caps[2];
+    // Determine which exact standalone flag tokens mean "inline code" for this interpreter.
+    // Only exact tokens should suppress scanning — combined flags like -ex or -eu are NOT
+    // inline-code flags (e.g. -e means errexit in bash, a perfectly valid script flag).
+    // Issue #116: the previous check matched any flag cluster CONTAINING 'c', 'm', or 'e',
+    // which caused `bash -ex script.sh` and `bash -eu script.sh` to skip file scanning.
+    let inline_flags: &[&str] = match interp_name.as_str() {
+        n if n == "bash" || n == "sh" || n == "zsh" || n == "dash" => &["-c", "--command"],
+        n if n.starts_with("python") => &["-c", "-m"],
+        n if n == "node" || n == "nodejs" || n == "deno" => &["-e", "--eval", "--input-type"],
+        n if n == "perl" || n == "ruby" => &["-e"],
+        _ => &["-c"],
+    };
+    // Split flags on whitespace and check each token individually.
+    for flag_token in flags.split_whitespace() {
+        if inline_flags.contains(&flag_token) {
+            return None;
+        }
     }
-    let path_str = caps[2].trim().trim_matches('"').trim_matches('\'');
+    let path_str = caps[3].trim().trim_matches('"').trim_matches('\'');
     // First token only — ignore script arguments after the path
     let path = path_str.split_whitespace().next()?;
     Some(path.to_string())
@@ -5819,6 +5836,84 @@ mod tests {
             .map(|(d, _)| d);
         let _ = fs::remove_file(&path);
         assert_eq!(result, Some("deny".into()));
+    }
+
+    // ── H. interpreter flag cluster scan (issue #116) ────────────────────────
+
+    /// Combined flags like -ex / -eu / -xe must NOT suppress file scanning.
+    /// Previously the check matched any cluster containing 'e', 'c', or 'm'.
+    #[test]
+    fn bash_ex_flag_script_path_extracted() {
+        // -ex is errexit+xtrace, NOT inline code — path must be returned
+        assert_eq!(
+            extract_script_path("bash -ex /tmp/evil_116.sh"),
+            Some("/tmp/evil_116.sh".into())
+        );
+    }
+
+    #[test]
+    fn bash_eu_flag_script_path_extracted() {
+        assert_eq!(
+            extract_script_path("bash -eu /tmp/evil_116.sh"),
+            Some("/tmp/evil_116.sh".into())
+        );
+    }
+
+    #[test]
+    fn bash_xe_flag_script_path_extracted() {
+        assert_eq!(
+            extract_script_path("bash -xe /tmp/evil_116.sh"),
+            Some("/tmp/evil_116.sh".into())
+        );
+    }
+
+    #[test]
+    fn bash_ex_evil_script_denied() {
+        // Full pipeline: -ex flag should not skip scanning, evil file should deny
+        let path = format!("/tmp/clawband_test_{}_116_ex.sh", std::process::id());
+        fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
+        let result = extract_script_path(&format!("bash -ex {}", path))
+            .and_then(|p| scan_script_file(&p, &deny_pats(), &ask_pats(), &no_allow()))
+            .map(|(d, _)| d);
+        let _ = fs::remove_file(&path);
+        assert_eq!(result, Some("deny".into()));
+    }
+
+    #[test]
+    fn bash_eu_evil_script_denied() {
+        let path = format!("/tmp/clawband_test_{}_116_eu.sh", std::process::id());
+        fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
+        let result = extract_script_path(&format!("bash -eu {}", path))
+            .and_then(|p| scan_script_file(&p, &deny_pats(), &ask_pats(), &no_allow()))
+            .map(|(d, _)| d);
+        let _ = fs::remove_file(&path);
+        assert_eq!(result, Some("deny".into()));
+    }
+
+    /// Standalone -c still suppresses scanning (it's inline code, no file).
+    #[test]
+    fn bash_c_no_path_extracted() {
+        assert_eq!(extract_script_path("bash -c 'echo hello'"), None);
+    }
+
+    #[test]
+    fn python3_c_no_path_extracted() {
+        assert_eq!(extract_script_path("python3 -c 'import os'"), None);
+    }
+
+    #[test]
+    fn python3_m_no_path_extracted() {
+        assert_eq!(extract_script_path("python3 -m mymodule"), None);
+    }
+
+    #[test]
+    fn node_e_no_path_extracted() {
+        assert_eq!(extract_script_path("node -e 'console.log(1)'"), None);
+    }
+
+    #[test]
+    fn node_eval_no_path_extracted() {
+        assert_eq!(extract_script_path("node --eval 'console.log(1)'"), None);
     }
 
     // ── G. chmod on sensitive paths / broad permissions (issue #31) ──────────
