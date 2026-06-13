@@ -1286,12 +1286,13 @@ fn split_segments(cmd: &str) -> Vec<String> {
 ///
 /// Does NOT strip `sudo`, `exec`, or `time` — those have their own patterns
 /// or overloaded meanings. Does NOT alter pipe contents or compound structure.
-fn normalize_segment(segment: &str) -> String {
+fn normalize_segment(segment: &str) -> (String, Vec<String>) {
     const MODIFIERS: &[&str] = &["command", "builtin", "env", "nice", "nohup"];
     // VAR=value: identifier chars, `=`, non-whitespace value, then whitespace
-    let var_re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+").unwrap();
+    let var_re = Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)=\S*\s+").unwrap();
 
     let mut s = segment.trim().to_string();
+    let mut stripped_vars: Vec<String> = Vec::new();
 
     // Strip backslash prefix from first word: `\rm` → `rm`
     if s.starts_with('\\') {
@@ -1309,9 +1310,10 @@ fn normalize_segment(segment: &str) -> String {
     loop {
         let trimmed = s.trim_start().to_string();
 
-        // Strip leading VAR=value
-        if let Some(m) = var_re.find(&trimmed) {
-            s = trimmed[m.end()..].to_string();
+        // Strip leading VAR=value — capture the variable name
+        if let Some(caps) = var_re.captures(&trimmed) {
+            stripped_vars.push(caps[1].to_string());
+            s = trimmed[caps[0].len()..].to_string();
             continue;
         }
 
@@ -1332,7 +1334,7 @@ fn normalize_segment(segment: &str) -> String {
         }
     }
 
-    s
+    (s, stripped_vars)
 }
 
 // ─── PostToolUse breadcrumb ───────────────────────────────────────────────────
@@ -3623,7 +3625,7 @@ fn check_command<'a>(
     let segments = split_segments(&clean);
 
     for segment in &segments {
-        let norm = normalize_segment(segment);
+        let (norm, stripped_vars) = normalize_segment(segment);
         // Build list of forms to check: always try original; add normalized if different.
         // Checking both preserves backward compat for allow patterns while ensuring
         // future anchor-based deny patterns fire on normalized form too.
@@ -3672,6 +3674,27 @@ fn check_command<'a>(
                                 pat.label, segment, hook_command_string(), pat.label
                             ),
                             &pat.label,
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Same-segment variable re-use: a variable assigned in the prefix
+        // (stripped by normalize_segment) is referenced in the remaining command.
+        // e.g. `BAD="/" rm -rf $BAD` — the prefix assignment is the attack vector.
+        if !stripped_vars.is_empty() {
+            for var in &stripped_vars {
+                let plain = format!("${}", var);
+                let braced = format!("${{{}}}", var);
+                if norm.contains(&plain) || norm.contains(&braced) {
+                    return Some((
+                        "ask",
+                        format!(
+                            "Variable '{}' assigned in the command prefix is referenced as an argument — \
+                             the prefix assignment may be masking a dangerous value.\n\
+                             Review: {}\n",
+                            var, segment
                         ),
                     ));
                 }
@@ -6789,43 +6812,108 @@ mod tests {
 
     #[test]
     fn normalize_strips_backslash_prefix() {
-        assert_eq!(normalize_segment(r"\rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment(r"\rm -rf /").0, "rm -rf /");
     }
 
     #[test]
     fn normalize_strips_single_var_assignment() {
-        assert_eq!(normalize_segment("A=1 rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment("A=1 rm -rf /").0, "rm -rf /");
     }
 
     #[test]
     fn normalize_strips_multiple_var_assignments() {
-        assert_eq!(normalize_segment("A=1 B=2 IFS=, rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment("A=1 B=2 IFS=, rm -rf /").0, "rm -rf /");
     }
 
     #[test]
     fn normalize_strips_command_modifier() {
-        assert_eq!(normalize_segment("command rm -rf /"), "rm -rf /");
-        assert_eq!(normalize_segment("builtin rm -rf /"), "rm -rf /");
-        assert_eq!(normalize_segment("env rm -rf /"), "rm -rf /");
-        assert_eq!(normalize_segment("nice rm -rf /"), "rm -rf /");
-        assert_eq!(normalize_segment("nohup rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment("command rm -rf /").0, "rm -rf /");
+        assert_eq!(normalize_segment("builtin rm -rf /").0, "rm -rf /");
+        assert_eq!(normalize_segment("env rm -rf /").0, "rm -rf /");
+        assert_eq!(normalize_segment("nice rm -rf /").0, "rm -rf /");
+        assert_eq!(normalize_segment("nohup rm -rf /").0, "rm -rf /");
     }
 
     #[test]
     fn normalize_strips_chained_modifier_and_var() {
-        assert_eq!(normalize_segment("env A=1 rm -rf /"), "rm -rf /");
+        assert_eq!(normalize_segment("env A=1 rm -rf /").0, "rm -rf /");
     }
 
     #[test]
     fn normalize_leaves_exec_and_sudo_intact() {
         // exec and sudo have their own patterns — don't strip
-        assert_eq!(normalize_segment("exec rm -rf /"), "exec rm -rf /");
-        assert_eq!(normalize_segment("sudo rm -rf /"), "sudo rm -rf /");
+        assert_eq!(normalize_segment("exec rm -rf /").0, "exec rm -rf /");
+        assert_eq!(normalize_segment("sudo rm -rf /").0, "sudo rm -rf /");
     }
 
     #[test]
     fn normalize_plain_command_unchanged() {
-        assert_eq!(normalize_segment("git status"), "git status");
-        assert_eq!(normalize_segment("ls -la"), "ls -la");
+        assert_eq!(normalize_segment("git status").0, "git status");
+        assert_eq!(normalize_segment("ls -la").0, "ls -la");
+    }
+
+    #[test]
+    fn normalize_returns_stripped_var_names() {
+        let (norm, vars) = normalize_segment("BAD=/ rm -rf /");
+        assert_eq!(norm, "rm -rf /");
+        assert!(vars.contains(&"BAD".to_string()));
+    }
+
+    #[test]
+    fn normalize_returns_stripped_var_names_quoted() {
+        // BAD="/" — the regex \S* stops at the first space, which is after the closing quote
+        let (norm, vars) = normalize_segment("BAD=\"/\" rm -rf $BAD");
+        assert_eq!(norm, "rm -rf $BAD");
+        assert!(vars.contains(&"BAD".to_string()));
+    }
+
+    #[test]
+    fn normalize_no_vars_when_no_prefix() {
+        let (_, vars) = normalize_segment("rm -rf /");
+        assert!(vars.is_empty());
+    }
+
+    // ── same-segment variable re-use (issue #102) ─────────────────────────────
+
+    #[test]
+    fn same_segment_var_reuse_asks() {
+        // BAD=/ rm -rf $BAD — variable assigned in prefix, referenced as argument
+        let deny = builtin_deny();
+        let ask = builtin_ask();
+        let result = check_command("BAD=/ rm -rf $BAD", &deny, &ask, &[]);
+        assert!(
+            matches!(result, Some(("ask", _))),
+            "same-segment var reuse should ask, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn same_segment_var_reuse_braced_asks() {
+        // DEST="/" rm -rf ${DEST} — braced reference form
+        let deny = builtin_deny();
+        let ask = builtin_ask();
+        let result = check_command("DEST=\"/\" rm -rf ${DEST}", &deny, &ask, &[]);
+        assert!(
+            matches!(result, Some(("ask", _))),
+            "braced same-segment var reuse should ask, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn unrelated_var_rm_no_same_segment_check() {
+        // rm -rf $BUILD_DIR — no prefix assignment, should NOT trigger same-segment check
+        // (may still ask/deny from other patterns, but reason should not mention prefix)
+        let deny = builtin_deny();
+        let ask = builtin_ask();
+        let result = check_command("rm -rf $BUILD_DIR", &deny, &ask, &[]);
+        if let Some((_, ref reason)) = result {
+            assert!(
+                !reason.contains("assigned in the command prefix"),
+                "unrelated var should not trigger same-segment check, got reason: {}",
+                reason
+            );
+        }
     }
 }
