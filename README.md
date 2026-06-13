@@ -446,6 +446,24 @@ full details, prerequisites, and the `CLAWBAND_BIN` override.
 - `bash install.sh`: `jq` (always), Rust toolchain (`cargo`) only if no pre-built binary is available for your platform
 - Runtime: none (single static binary)
 
+## Troubleshooting
+
+**Command silently blocked with no clawband output?**
+
+Claude Code evaluates permissions in this order:
+
+1. **Claude Code's built-in deny list** (`settings.json → permissions.deny`) — blocks immediately; clawband's hook never fires
+2. **clawband PreToolUse hook** — deny blocks, ask prompts, allow passes
+3. **Claude Code's built-in allow list** (`settings.json → permissions.allow`) — allows without prompting
+
+If a command is being silently blocked and clawband shows nothing, check your Claude Code deny list first:
+
+```bash
+cat ~/.claude/settings.json | jq '.permissions.deny'
+```
+
+Removing the entry from that list lets clawband's ask/deny patterns take over as intended.
+
 ## Limitations
 
 - **Subshells are prompted, not blocked** — `$(...)` and backtick expressions embed commands that can't be safely split. The hook asks for confirmation rather than hard-blocking.
