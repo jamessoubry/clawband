@@ -1099,3 +1099,58 @@ fn e2e_chmod_r_755_relative_passes() {
         "chmod -R 755 ./dist must pass (relative path, routine): {out}"
     );
 }
+
+// ── Variable script path / TOCTOU (issue #52) ──────────────────────────────
+
+#[test]
+fn e2e_var_script_unresolvable_asks() {
+    // $CLAWBAND_NONEXISTENT_99 is not set in the test env — should trigger ask
+    let out = run(&bash("python3 $CLAWBAND_NONEXISTENT_99"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "python3 $UNSET_VAR must ask: {out}"
+    );
+    assert!(
+        out.contains("could not be resolved"),
+        "reason must mention unresolvable: {out}"
+    );
+}
+
+#[test]
+fn e2e_var_script_clean_file_asks_with_toctou() {
+    use std::io::Write;
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/usr/bin/env python3\nprint('hello')").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash("python3 $MY_SCRIPT"), &[("MY_SCRIPT", &path)]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "clean variable script must still ask (TOCTOU): {out}"
+    );
+    assert!(out.contains("TOCTOU"), "reason must mention TOCTOU: {out}");
+}
+
+#[test]
+fn e2e_var_script_dangerous_content_denies() {
+    use std::io::Write;
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        f,
+        "#!/usr/bin/env python3\nimport os; os.system('rm -rf /')"
+    )
+    .unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash("python3 $MY_SCRIPT"), &[("MY_SCRIPT", &path)]);
+    // Should deny (rm -rf / in script) and still include TOCTOU header
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "dangerous content in variable script must deny: {out}"
+    );
+    assert!(
+        out.contains("TOCTOU") || out.contains("resolved"),
+        "reason must mention variable resolution: {out}"
+    );
+}
