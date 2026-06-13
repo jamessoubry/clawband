@@ -32,7 +32,12 @@ All pattern changes must include:
 1. Unit tests in `src/main.rs` inside `#[cfg(test)] mod tests`
 2. E2e tests in `tests/cli.rs` using the `run()` / `bash()` / `decision()` helpers
 
-Run `cargo test` to verify — all tests must pass before committing.
+Run these in order before committing:
+```bash
+cargo fmt              # auto-format (NOT --check — actually apply it)
+cargo test             # all tests must pass
+cargo clippy --all-targets -- -D warnings  # no warnings
+```
 
 ## Commit & PR conventions
 
@@ -52,3 +57,4 @@ When the backlog pipeline runs a releaser agent for this project:
 - Instead, push the branch and open a PR: `git push -u origin <branch> && gh pr create --title "..." --body-file /tmp/pr-body.md`
 - Do NOT run the deploy command (`cargo build --release && clawband install`) — that runs after the user merges
 - Mark the release step as SUCCESS once the PR is open
+- After opening the PR, run `unset GITHUB_TOKEN && gh pr checks --watch --repo jamessoubry/clawband` to verify CI passes; if checks fail, fix them before declaring SUCCESS
