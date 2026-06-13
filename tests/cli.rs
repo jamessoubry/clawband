@@ -1216,3 +1216,42 @@ fn e2e_nice_rm_denied() {
         "nice rm -rf / must be denied: {out}"
     );
 }
+
+// ── Same-segment variable re-use (issue #102) ────────────────────────────────
+
+#[test]
+fn e2e_same_segment_var_reuse_asks() {
+    // BAD=/ rm -rf $BAD — variable assigned in prefix, referenced as rm argument
+    let out = run(&bash("BAD=/ rm -rf $BAD"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "same-segment var reuse must ask: {out}"
+    );
+    assert!(
+        out.contains("BAD") && out.contains("prefix"),
+        "reason must mention variable and prefix: {out}"
+    );
+}
+
+#[test]
+fn e2e_unrelated_var_rm_passes_through() {
+    // rm -rf $BUILD_DIR where BUILD_DIR not assigned in this segment — should NOT
+    // trigger the same-segment prefix check
+    let out = run(&bash("rm -rf $BUILD_DIR"), &[]);
+    assert!(
+        !out.contains("assigned in the command prefix"),
+        "unrelated var should not trigger same-segment check: {out}"
+    );
+}
+
+#[test]
+fn e2e_same_var_braced_asks() {
+    // DEST="/" rm -rf ${DEST} — braced variable form
+    let out = run(&bash("DEST=\"/\" rm -rf ${DEST}"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "braced variable form must also ask: {out}"
+    );
+}
