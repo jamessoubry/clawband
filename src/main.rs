@@ -442,7 +442,7 @@ fn suggestion_for(label: &str) -> Option<&'static str> {
             "git stash keeps your changes recoverable; or reset to a ref you have verified."
         }
         "git clean" => "Preview first with git clean -n (dry run) before deleting untracked files.",
-        "base64 decode piped" => {
+        "base64 decode | interpreter" => {
             "If the payload is trusted, decode to a file first so clawband can scan it before it runs."
         }
         "kill -1 (signals every process)" => {
@@ -630,6 +630,12 @@ fn builtin_deny() -> Vec<Pattern> {
         // `:|:&` are nearly unique to this attack; neither appears in legitimate
         // shell scripts.
         ("fork bomb", r":\(\)\s*\{|:\|:&"),
+        // base64 decode piped to interpreter — canonical obfuscation/RCE vector
+        // independent deny so allow.patterns for plain base64 decode can't bypass it
+        (
+            "base64 decode | interpreter",
+            r"\bbase64\s+(-d|-D|--decode)\b.*\|\s*(sh|bash|zsh|dash|fish|python3?|node|deno|ruby|perl|lua|php)\b",
+        ),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -673,11 +679,6 @@ fn builtin_ask() -> Vec<Pattern> {
         // Obfuscation / anti-inspection vectors — decoding content before execution
         // or persistence is a common supply-chain and C2 technique.
         //
-        // base64 decode piped onward — decoded payload fed to another command
-        (
-            "base64 decode piped",
-            r"\bbase64\s+(-d|-D|--decode)\b.*\|\s*(sh|bash|zsh|dash|fish|python3?|node|deno|ruby|perl|lua|php)\b",
-        ),
         // base64 decode redirected to a file — writing a decoded binary or script
         (
             "base64 decode redirect",
@@ -4812,16 +4813,12 @@ mod tests {
         assert!(!remove_clawband_hooks(&mut s));
     }
 
-    // ── base64 / obfuscation ask patterns ─────────────────────────────────────
+    // ── base64 / obfuscation patterns ────────────────────────────────────────
 
     #[test]
     fn base64_decode_piped_asks() {
-        // base64 -d with output piped to another command — obfuscation vector
-        assert_eq!(
-            decision("base64 -d encoded.txt | sh"),
-            // pipe to sh is DENY (checked before ask), so this particular example is deny
-            Some("deny".into())
-        );
+        // base64 -d with output piped to sh — deny via both pipe-to-sh and base64 deny patterns
+        assert_eq!(decision("base64 -d encoded.txt | sh"), Some("deny".into()));
     }
 
     #[test]
@@ -4849,11 +4846,11 @@ mod tests {
     }
 
     #[test]
-    fn base64_long_decode_flag_asks() {
-        // --decode long form piped to interpreter (deno — not in deny tier) — should ask
+    fn base64_long_decode_flag_denies() {
+        // --decode long form piped to interpreter — promoted to deny tier in #84
         assert_eq!(
             decision("base64 --decode payload.b64 | deno"),
-            Some("ask".into())
+            Some("deny".into())
         );
     }
 
@@ -4876,11 +4873,26 @@ mod tests {
     }
 
     #[test]
-    fn base64_decode_piped_to_interpreter_asks() {
-        // deno and php are not in the deny-tier pipe patterns, so base64 piped to
-        // them reaches the ask tier via the narrowed base64-decode-piped pattern
-        assert_eq!(decision("base64 -d payload.b64 | deno"), Some("ask".into()));
-        assert_eq!(decision("base64 -d payload.b64 | php"), Some("ask".into()));
+    fn base64_decode_piped_to_interpreter_denies() {
+        // piped to deno/php — now deny tier (was ask in #83, promoted in #84)
+        assert_eq!(
+            decision("base64 -d payload.b64 | deno"),
+            Some("deny".into())
+        );
+        assert_eq!(decision("base64 -d payload.b64 | php"), Some("deny".into()));
+    }
+
+    #[test]
+    fn base64_decode_piped_to_interpreter_deny_explicit() {
+        // These are caught by the base64-specific deny (not just pipe-to-sh)
+        assert_eq!(
+            decision("base64 -d encoded.txt | bash"),
+            Some("deny".into())
+        );
+        assert_eq!(
+            decision("base64 --decode payload.txt | python3"),
+            Some("deny".into())
+        );
     }
 
     #[test]
