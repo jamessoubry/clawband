@@ -1876,3 +1876,27 @@ fn e2e_redirect_to_subshell() {
         "response must carry [CLAWBAND] prefix: {out}"
     );
 }
+
+// ── issue #107: normalize_segment applied to echo-to-script and script-path ───
+
+#[test]
+fn e2e_command_echo_to_script() {
+    // `command echo 'rm -rf /' > x.sh` bypassed the ^echo anchor — must deny
+    let out = run(&bash("command echo 'rm -rf /' > x.sh"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "command echo to script must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_var_prefix_echo_to_script() {
+    // `A=1 echo 'rm -rf /' > x.sh` bypassed the ^echo anchor — must deny
+    let out = run(&bash("A=1 echo 'rm -rf /' > x.sh"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "A=1 echo to script must be denied: {out}"
+    );
+}

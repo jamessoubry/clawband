@@ -4024,7 +4024,16 @@ fn check_command<'a>(
 
         // Echo/printf content written to a script file — deny outcome always
         // fires; ask outcome is suppressed when the segment is allow-listed.
-        if let Some((is_deny, reason)) = check_echo_to_script(segment, deny_pats, ask_pats) {
+        // Also check the normalized form so that `command echo ...` and
+        // `A=1 echo ...` variants are caught (issue #107).
+        let echo_result = check_echo_to_script(segment, deny_pats, ask_pats).or_else(|| {
+            if norm != segment.trim() {
+                check_echo_to_script(norm.as_str(), deny_pats, ask_pats)
+            } else {
+                None
+            }
+        });
+        if let Some((is_deny, reason)) = echo_result {
             if is_deny || !is_allowed {
                 return Some((if is_deny { "deny" } else { "ask" }, reason));
             }
@@ -4332,7 +4341,17 @@ fn main() {
 
     // Script file scanning: if command is `bash ./foo.sh`, read and check the file.
     // If the path is a variable reference, attempt to resolve from env and warn TOCTOU.
-    if let Some(script_path) = extract_script_path(&command) {
+    // Also try the normalized form so that `command python3 script.py` is caught
+    // (issue #107): normalize_segment strips `command `, `builtin `, `VAR=val ` prefixes.
+    let (norm_command, _) = normalize_segment(&command);
+    let script_path_opt = extract_script_path(&command).or_else(|| {
+        if norm_command != command.trim() {
+            extract_script_path(&norm_command)
+        } else {
+            None
+        }
+    });
+    if let Some(script_path) = script_path_opt {
         if let Some(var_name) = variable_name_from_path(&script_path) {
             let (decision, reason) = match std::env::var(&var_name) {
                 Ok(resolved) => {
@@ -4889,6 +4908,50 @@ mod tests {
     #[test]
     fn echo_safe_content_to_script_passes() {
         assert_eq!(decision(r#"echo "echo hello" > /tmp/greet.sh"#), None);
+    }
+
+    // ── issue #107: normalize_segment applied to echo-to-script and script-path ─
+
+    #[test]
+    fn command_echo_to_script_is_caught() {
+        // `command echo` prefix bypassed the ^echo anchor — normalize must catch it
+        assert_eq!(
+            decision(r#"command echo 'rm -rf /' > /tmp/bad.sh"#),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn var_prefix_echo_to_script_is_caught() {
+        // `A=1 echo` prefix bypassed the ^echo anchor — normalize must catch it
+        assert_eq!(
+            decision(r#"A=1 echo 'rm -rf /' > /tmp/bad.sh"#),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn command_interpreter_script_is_scanned() {
+        // `command python3 script.py` — the `command` prefix prevented interpreter
+        // recognition; after normalization the script file must be scanned.
+        // We write a temp script with a deny-tier pattern inside so we can assert deny.
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "#!/usr/bin/env python3\nimport os; os.system('rm -rf /')"
+        )
+        .unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        // check_command itself doesn't do the script-scan (that's main()); but we can
+        // verify extract_script_path picks up the normalized form.
+        let (norm, _) = normalize_segment(&format!("command python3 {}", path));
+        let extracted = extract_script_path(&norm);
+        assert_eq!(
+            extracted.as_deref(),
+            Some(path.as_str()),
+            "extract_script_path must find script path after normalizing `command python3 ...`"
+        );
     }
 
     // ── write-then-execute ─────────────────────────────────────────────────────
