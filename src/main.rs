@@ -1393,18 +1393,26 @@ fn check_force_push(cmd: &str) -> Option<String> {
     if !Regex::new(r"(?i)\bgit\s+push\b").unwrap().is_match(cmd) {
         return None;
     }
-    // Strip --force-with-lease (safe alternative) first
-    let strip_fwl = Regex::new(r"(?i)--force-with-lease(?:=\S+)?").unwrap();
-    let cleaned = strip_fwl.replace_all(cmd, "");
-    // Then block --force or -f anywhere in the command
-    if Regex::new(r"(?i)\s--force(\s|$)|\s-f(\s|$)")
+    // Strip --force-with-lease and --force-if-includes (safe alternatives) first
+    let strip_safe = Regex::new(r"(?i)--force-(?:with-lease|if-includes)(?:=\S+)?").unwrap();
+    let cleaned = strip_safe.replace_all(cmd, "");
+    // Block --force or abbreviated prefixes (--forc, --for) or -f
+    if Regex::new(r"(?i)\s--for(?:c(?:e)?)?(\s|$)|\s-f(\s|$)")
         .unwrap()
         .is_match(&cleaned)
     {
-        Some("Blocked: git push --force / -f (use --force-with-lease instead)\n".into())
-    } else {
-        None
+        return Some("Blocked: git push --force / -f (use --force-with-lease instead)\n".into());
     }
+    // Block + refspec prefix: whitespace followed by + and a non-whitespace, non-dash char
+    // (distinguishes +refspec from --flags; skips URLs with ://)
+    if Regex::new(r"\s\+[^\s\-]").unwrap().is_match(&cleaned)
+        && !Regex::new(r"://").unwrap().is_match(&cleaned)
+    {
+        return Some(
+            "Blocked: git push +<refspec> (+ prefix forces the push — use --force-with-lease instead)\n".into(),
+        );
+    }
+    None
 }
 
 // ─── Safe inline pipe stripping ───────────────────────────────────────────────
@@ -4691,6 +4699,46 @@ mod tests {
     #[test]
     fn git_push_force_denied() {
         assert_eq!(decision("git push --force"), Some("deny".into()));
+    }
+
+    #[test]
+    fn force_push_full_flag_still_deny() {
+        // regression: existing --force detection must remain intact
+        assert_eq!(decision("git push --force"), Some("deny".into()));
+    }
+
+    #[test]
+    fn force_push_abbreviated_forc_is_deny() {
+        assert_eq!(decision("git push --forc"), Some("deny".into()));
+    }
+
+    #[test]
+    fn force_push_abbreviated_for_is_deny() {
+        assert_eq!(decision("git push --for"), Some("deny".into()));
+    }
+
+    #[test]
+    fn force_push_plus_refspec_is_deny() {
+        assert_eq!(decision("git push origin +main"), Some("deny".into()));
+    }
+
+    #[test]
+    fn force_push_plus_head_refspec_is_deny() {
+        assert_eq!(decision("git push origin +HEAD:main"), Some("deny".into()));
+    }
+
+    #[test]
+    fn force_push_plus_refs_refspec_is_deny() {
+        assert_eq!(
+            decision("git push upstream +refs/heads/feature:refs/heads/main"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn force_push_lease_still_ask() {
+        // --force-with-lease is the safe alternative — must not be blocked
+        assert_eq!(decision("git push --force-with-lease"), None);
     }
 
     #[test]
