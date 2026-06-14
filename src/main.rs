@@ -512,7 +512,7 @@ fn suggestion_for(label: &str) -> Option<&'static str> {
 /// Append a "Safe alternative" line to a reason if the label has a suggestion.
 fn with_suggestion(reason: String, label: &str) -> String {
     match suggestion_for(label) {
-        Some(s) => format!("{reason}\nSafe alternative: {s}"),
+        Some(s) => format!("{reason}\nSafe alternative: {s}\n"),
         None => reason,
     }
 }
@@ -1344,7 +1344,7 @@ fn check_force_push(cmd: &str) -> Option<String> {
         .unwrap()
         .is_match(&cleaned)
     {
-        Some("Blocked: git push --force / -f (use --force-with-lease instead)".into())
+        Some("Blocked: git push --force / -f (use --force-with-lease instead)\n".into())
     } else {
         None
     }
