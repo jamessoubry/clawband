@@ -1900,3 +1900,31 @@ fn e2e_var_prefix_echo_to_script() {
         "A=1 echo to script must be denied: {out}"
     );
 }
+
+// ── issue #108: split_segments quote-awareness ───────────────────────────────
+
+#[test]
+fn e2e_quoted_semicolon_no_block() {
+    // `echo "hello; world"` — the `;` is inside a quoted argument.
+    // Before the fix, split_segments split on `;` inside the quotes and created
+    // a phantom segment `world"` evaluated as a bare command. After the fix, the
+    // command is a single segment and must not be blocked.
+    let out = run(&bash(r#"echo "hello; world""#), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "quoted semicolon must produce no block decision: {out}"
+    );
+}
+
+#[test]
+fn e2e_python_c_semicolon() {
+    // `python3 -c "import os; print(os.getcwd())"` — the inline script uses `;`
+    // as a Python statement separator inside double quotes. Must not be blocked.
+    let out = run(&bash(r#"python3 -c "import os; print(os.getcwd())""#), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("deny"),
+        "python3 -c with quoted semicolon must not be denied: {out}"
+    );
+}
