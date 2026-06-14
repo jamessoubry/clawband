@@ -1573,6 +1573,28 @@ fn e2e_dangerous_command_with_comment_still_denied() {
     );
 }
 
+// ── issue #103: rm -rf with subshell path must ask ───────────────────────────
+
+#[test]
+fn e2e_rm_subshell_dollar_paren() {
+    let out = run(&bash("rm -rf $(echo /)"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "rm -rf $(subshell) must ask, not deny or allow: {out}"
+    );
+}
+
+#[test]
+fn e2e_rm_subshell_backtick() {
+    let out = run(&bash(r#"rm -rf `echo /`"#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "rm -rf `backtick` must ask, not deny or allow: {out}"
+    );
+}
+
 // ── issue #131: error paths must emit deny, not ask ───────────────────────────
 // ask auto-approves in bypassPermissions mode; deny is the only safe fail-closed
 
