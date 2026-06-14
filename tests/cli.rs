@@ -1721,11 +1721,7 @@ fn post(post_json: &str, home: &str) -> String {
     let mut child = cmd.spawn().expect("spawn clawband post");
     // Ignore BrokenPipe: the post subcommand may exit before reading all stdin
     // (e.g. when no crumb exists), causing a race on CI.
-    let _ = child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(post_json.as_bytes());
+    let _ = child.stdin.take().unwrap().write_all(post_json.as_bytes());
     let out = child.wait_with_output().expect("wait clawband post");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
