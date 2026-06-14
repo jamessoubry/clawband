@@ -465,6 +465,9 @@ impl Pattern {
 /// the right approach instead of a risky workaround. None for labels without one.
 fn suggestion_for(label: &str) -> Option<&'static str> {
     let s = match label {
+        "rm -rf $(subshell)" => {
+            r#"Expand first: TARGET=$(cmd); echo "rm -rf $TARGET" — verify path before running"#
+        }
         l if l.starts_with("rm -rf") || l == "sudo rm -rf" => {
             "If you meant a specific directory, use an explicit path — not / or ~."
         }
@@ -956,6 +959,15 @@ fn builtin_ask() -> Vec<Pattern> {
         (
             "rm -rf . (bare dot)",
             r"\brm\b.*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s+\.(\s|$)",
+        ),
+        // rm -rf $(subshell) / rm -rf `backtick` — path is a subshell expression
+        // that clawband cannot evaluate at hook time. ASK (not deny) because
+        // legitimate uses exist: `rm -rf $(find . -name "*.tmp")`.
+        // Pattern: rm with combined -rf/-fr flags followed by optional preceding flags,
+        // then a subshell expression start: $( or backtick (\x60) or ${ .
+        (
+            "rm -rf $(subshell)",
+            r"\brm\b.*(?:-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*)\s+(?:(?:--|-[a-zA-Z]+)\s+)*(?:\$\(|\x60|\$\{)",
         ),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
@@ -4606,6 +4618,29 @@ mod tests {
         assert_eq!(decision("rm -rf ./dist"), None);
         assert_eq!(decision("rm -rf .config"), None);
         assert_eq!(decision("rm -rf ./subdir/"), None);
+    }
+
+    // ── subshell path in rm -rf (issue #103) ─────────────────────────────────
+
+    #[test]
+    fn rm_subshell_dollar_paren_is_ask() {
+        assert_eq!(decision("rm -rf $(echo /)"), Some("ask".into()));
+    }
+
+    #[test]
+    fn rm_subshell_fr_order_is_ask() {
+        assert_eq!(decision("rm -fr $(find . -name tmp)"), Some("ask".into()));
+    }
+
+    #[test]
+    fn rm_subshell_dollar_brace_is_ask() {
+        assert_eq!(decision("rm -rf ${target}"), Some("ask".into()));
+    }
+
+    #[test]
+    fn rm_literal_path_not_affected() {
+        // literal / path still triggers deny (existing pattern must be unaffected)
+        assert_eq!(decision("rm -rf /tmp/safe"), Some("deny".into()));
     }
 
     #[test]
