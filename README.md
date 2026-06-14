@@ -173,6 +173,8 @@ Extend or override behaviour by editing pattern files. clawband loads two sets:
 
 When a **whole command** matches an `allow.patterns` entry, clawband returns an explicit `permissionDecision: "allow"`. This does two things: it skips clawband's own deny/ask checks, **and** it tells Claude Code to skip its *native* permission check too — so an allow-listed command won't trigger Claude Code's built-in prompts either (handy for working around false positives in its compound-command checker). A single allow-listed *segment* of a compound command does not green-light the whole command — the explicit allow only fires on a full-command match.
 
+> **Anchor your allow patterns.** Patterns are unanchored substring regexes by default. `allow "git push"` also allows `git push --force` because the pattern appears as a substring. Use `^` and `$` to be precise: `^git push origin main$`.
+
 ### Default decision — make clawband the sole gatekeeper
 
 By default, a command that matches **no** pattern falls through to Claude Code's native permission system, which prompts generically for anything not in its own allow list. Set a `default_decision` in `~/.clawband/config` to change that:
@@ -192,9 +194,9 @@ With `default_decision = allow`, only your `deny`/`ask` patterns stop or prompt;
 
 | File | Effect |
 |------|--------|
-| `.clawband/deny.patterns` | Project-specific blocks |
-| `.clawband/ask.patterns` | Project-specific prompts |
-| `.clawband/allow.patterns` | Project-specific overrides |
+| `.clawband/deny.patterns` | Project-specific blocks — auto-loaded |
+| `.clawband/ask.patterns` | Project-specific prompts — auto-loaded |
+| `.clawband/allow.patterns` | Project-specific overrides — **requires `clawband trust`** |
 
 Each file is one **case-insensitive regex** per line. Lines starting with `#` and blank lines are ignored.
 
@@ -204,8 +206,30 @@ See `deny.patterns.example` and `ask.patterns.example` for the format.
 # ~/.clawband/deny.patterns — global blocks for all projects
 my-infra nuke --all
 
-# .clawband/allow.patterns — project-specific override
+# .clawband/allow.patterns — project-specific override (requires clawband trust)
 git reset --hard HEAD$
+```
+
+### Why project allow.patterns requires trust
+
+Project `deny.patterns` and `ask.patterns` auto-load without any prompt — a repo tightening its own rules can only make clawband *stricter*, which is safe. Project `allow.patterns` is different: a single `.*` entry would suppress all deny and ask checks for every command the agent runs in that directory.
+
+This is a supply-chain vector. An attacker commits `.clawband/allow.patterns` containing `.*`, a developer clones the repo and runs an AI agent, and clawband silently stands down for the entire session.
+
+To prevent this, project `allow.patterns` requires explicit opt-in:
+
+```sh
+clawband trust                          # trust .clawband/allow.patterns in the current directory
+clawband trust /path/to/allow.patterns  # trust a specific file
+```
+
+This records the file's path and a content hash in `~/.clawband/trusted`. If the file is later modified (e.g. an upstream commit changes the patterns), the hash no longer matches and clawband warns again — so trust is scoped to the exact content you reviewed, not the file path forever.
+
+Until trusted, clawband loads project deny/ask patterns normally but ignores project allow patterns and prints a warning to stderr:
+
+```
+[CLAWBAND] Project allow.patterns found but not trusted: /path/.clawband/allow.patterns
+  Run `clawband trust` to enable it.
 ```
 
 ## Self-protection
@@ -260,10 +284,13 @@ clawband allow '<pattern>'            # append to ~/.clawband/allow.patterns (gl
 clawband allow --project '<pattern>'  # append to .clawband/allow.patterns (project CWD)
 clawband deny  '<pattern>'            # append to ~/.clawband/deny.patterns (global)
 clawband deny  --project '<pattern>'  # append to .clawband/deny.patterns (project CWD)
+clawband trust                        # trust .clawband/allow.patterns in CWD (records content hash)
+clawband trust <path>                 # trust a specific allow.patterns file
 clawband stats                        # show pattern counts and audit log summary
 clawband test '<command>'             # dry-run: print DENY/ASK/PASS without executing
 clawband patterns                     # list all active patterns (built-in + user + project)
 clawband log                          # view the audit log (--enable, -n N, --clear, --path)
+clawband uninstall                    # remove clawband hooks from settings
 clawband --version
 ```
 
@@ -279,10 +306,11 @@ Patterns are validated as regexes before writing. The install script also adds `
 
 ## PostToolUse hook (optional)
 
-Install with `--post-hook` to enable in-chat allow suggestions:
+Install with `--post` to enable in-chat allow suggestions:
 
 ```sh
-bash install.sh --post-hook
+clawband install --post   # binary
+bash install.sh --post-hook  # install script (flag name differs)
 ```
 
 When you approve a prompted command, the hook tells Claude the command ran and suggests the exact `clawband allow` command to permanently silence that prompt. Uses a breadcrumb file (`~/.clawband/.last-ask`) written at prompt time and consumed on approval — if you deny, PostToolUse never fires and the breadcrumb expires after 60 seconds.
@@ -346,12 +374,12 @@ Each command:
 
 | Agent | Deny | Ask | Allow | Pass (no match) |
 |-------|------|-----|-------|-----------------|
-| Claude | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[CLAWBAND] ..."}}` | same with `"ask"` | same with `"allow"` | no output |
+| Claude | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[CLAWBAND]\n..."}}` | same with `"ask"` | same with `"allow"` | no output |
 | Codex | same JSON shape as Claude | folded via `ask_fallback` | same | no output |
-| Gemini | `{"decision":"block","reason":"[CLAWBAND] ..."}` | folded via `ask_fallback` | `{"decision":"allow"}` | no output |
-| Hermes | `{"decision":"block","reason":"[CLAWBAND] ..."}` | folded via `ask_fallback` | `{}` | no output |
-| Openclaw | `{"decision":"block","reason":"[CLAWBAND] ..."}` | `{"decision":"ask","reason":"..."}` → `requireApproval` | `{"decision":"allow"}` | no output |
-| OpenCode | `{"decision":"block","reason":"[CLAWBAND] ..."}` | folded via `ask_fallback` | `{}` | no output |
+| Gemini | `{"decision":"block","reason":"[CLAWBAND]\n..."}` | folded via `ask_fallback` | `{"decision":"allow"}` | no output |
+| Hermes | `{"decision":"block","reason":"[CLAWBAND]\n..."}` | folded via `ask_fallback` | `{}` | no output |
+| Openclaw | `{"decision":"block","reason":"[CLAWBAND]\n..."}` | `{"decision":"ask","reason":"..."}` → `requireApproval` | `{"decision":"allow"}` | no output |
+| OpenCode | `{"decision":"block","reason":"[CLAWBAND]\n..."}` | folded via `ask_fallback` | `{}` | no output |
 
 All reason strings carry the `[CLAWBAND]` prefix regardless of mode.
 
@@ -361,7 +389,7 @@ Claude's PreToolUse can prompt the user interactively ("ask"). Codex, Gemini, He
 
 - `ask_fallback = allow` (default) — renders as allow (passes the command through). The ask tier is meant to *confirm*, not *forbid*; on agents that can't prompt, hard-blocking it would be surprising. Your hard **deny** patterns still block.
 - `ask_fallback = deny` — renders as a hard deny with the reason:  
-  `[CLAWBAND] manual-approval required (ask tier) — blocked under <mode> (set ask_fallback=allow to permit). Original: …`
+  `[CLAWBAND]\nmanual-approval required (ask tier) — blocked under <mode> (set ask_fallback=allow to permit). Original: …`
 
 Set it in `~/.clawband/config`:
 
@@ -391,15 +419,6 @@ openclaw plugins install <path-to-clawband>/integrations/openclaw/
 openclaw plugins install clawband
 ```
 
-**Ask tier** — OpenClaw is the **only non-Claude agent** where ask-tier
-commands map to OpenClaw's native approval prompt (`requireApproval`) rather
-than being folded to allow/deny via `ask_fallback`. The `ask_fallback` config
-key has no effect in Openclaw mode.
-
-| Agent | Deny | Ask | Allow | Pass (no match) |
-|-------|------|-----|-------|-----------------|
-| Openclaw | `{"decision":"block","reason":"[CLAWBAND] ..."}` | `{"decision":"ask","reason":"..."}` → `requireApproval` | `{"decision":"allow"}` | no output |
-
 See [`integrations/openclaw/README.md`](integrations/openclaw/README.md) for
 full details, prerequisites, and the `CLAWBAND_BIN` override.
 
@@ -426,8 +445,7 @@ cp integrations/opencode/clawband.js .opencode/plugin/
 # { "plugin": ["<path>/integrations/opencode/clawband.js"] }
 ```
 
-**Ask tier** — OpenCode's `tool.execute.before` hook has no native approval
-path. Ask-tier commands fold via `ask_fallback` (default: allow). Set
+Ask-tier commands fold via `ask_fallback` (default: allow). Set
 `ask_fallback = deny` in `~/.clawband/config` to hard-block ask-tier commands.
 
 **Known limitation** — OpenCode plugin hooks do not intercept subagent tool
@@ -469,8 +487,9 @@ Removing the entry from that list lets clawband's ask/deny patterns take over as
 - **Subshells are prompted, not blocked** — `$(...)` and backtick expressions embed commands that can't be safely split. The hook asks for confirmation rather than hard-blocking.
 - **Obfuscated commands** — base64-encoded payloads or variable expansion bypass pattern matching. This is a first line of defence, not a sandbox.
 - **No environment variable inspection** — `MY_CMD=rm; $MY_CMD -rf /` is not caught.
-- **`git push :<branch>` deletion** — the colon-prefix syntax for remote branch deletion is not blocked; use `--delete` instead.
+- **Force-push gaps** — `git push :<branch>` (colon-prefix deletion) and `git push origin +main` (plus-refspec force) are not blocked by the force-push pattern; use `--delete` / `--force-with-lease` instead.
 - **Commit messages containing blocked patterns** — if a commit message itself contains a pattern like `rm -rf /` (e.g. documenting a fix), clawband will block the `git commit` command. Workaround: write the message to a temp file and use `git commit -F /tmp/msg.txt`, or rephrase to avoid the literal pattern.
+- **Fail-closed on parse error** — if clawband cannot read or parse the hook input (stdin read failure, malformed JSON), it emits `deny` and blocks the command. It does **not** fail-open.
 
 ## Contributing
 

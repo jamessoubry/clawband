@@ -1605,3 +1605,77 @@ fn e2e_truncated_json_denies() {
         "truncated JSON must produce deny, not ask or silent allow: {out}"
     );
 }
+
+// ── issue #132: project allow.patterns trust gating ───────────────────────────
+
+#[test]
+fn e2e_project_allow_untrusted_is_ignored() {
+    // A project allow.patterns with `.*` must NOT bypass deny protection when not trusted.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_pat_untrusted_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    // Create a project directory with a wildcard allow.patterns
+    let proj = std::env::temp_dir().join(format!("cb_proj_untrusted_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&proj);
+    fs::create_dir_all(proj.join(".clawband")).unwrap();
+    fs::write(proj.join(".clawband/allow.patterns"), ".*\n").unwrap();
+    let h = home.to_str().unwrap();
+    let p = proj.to_str().unwrap();
+
+    // A deny-tier command must still be denied — the untrusted allow.patterns must not bypass it
+    let out = run(&bash("docker system prune"), &[("HOME", h), ("PWD", p)]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "untrusted project allow.patterns must not bypass deny: {out}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&proj);
+}
+
+#[test]
+fn e2e_project_allow_trusted_is_loaded() {
+    // After `clawband trust`, a project allow.patterns must take effect.
+    use std::fs;
+    use std::process::Command;
+    let home = std::env::temp_dir().join(format!("cb_pat_trusted_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    // Create a project directory with a specific allow pattern
+    let proj = std::env::temp_dir().join(format!("cb_proj_trusted_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&proj);
+    fs::create_dir_all(proj.join(".clawband")).unwrap();
+    let allow_path = proj.join(".clawband/allow.patterns");
+    // Allow the git reset --hard command specifically (it's in ask tier)
+    fs::write(&allow_path, "^git reset --hard HEAD$\n").unwrap();
+    let h = home.to_str().unwrap();
+    let p = proj.to_str().unwrap();
+
+    // Before trust: command is still in ask tier
+    let before = run(&bash("git reset --hard HEAD"), &[("HOME", h), ("PWD", p)]);
+    assert_eq!(
+        decision(&before),
+        Some("ask"),
+        "before trust the allow pattern must not be active: {before}"
+    );
+
+    // Run `clawband trust` to register the allow.patterns file
+    Command::new(env!("CARGO_BIN_EXE_clawband"))
+        .args(["trust", allow_path.to_str().unwrap()])
+        .env("HOME", h)
+        .output()
+        .expect("clawband trust failed");
+
+    // After trust: command should be allowed
+    let after = run(&bash("git reset --hard HEAD"), &[("HOME", h), ("PWD", p)]);
+    assert_eq!(
+        decision(&after),
+        Some("allow"),
+        "after trust the allow pattern must be active: {after}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&proj);
+}
