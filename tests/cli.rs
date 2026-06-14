@@ -1815,6 +1815,34 @@ fn e2e_post_matching_command_suggests_allow() {
     let _ = fs::remove_dir_all(&home);
 }
 
+// ── issue #106: force-push bypass via +refspec prefix and abbreviated flags ───
+
+#[test]
+fn e2e_force_push_plus_refspec() {
+    // `git push origin +main` forces the push via refspec prefix — must deny
+    let out = run(&bash("git push origin +main"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "git push +refspec must deny: {out}"
+    );
+    assert!(
+        out.contains("+<refspec>"),
+        "deny message must mention +<refspec>: {out}"
+    );
+}
+
+#[test]
+fn e2e_force_push_abbreviated() {
+    // `git push --forc` is an abbreviated --force flag — must deny
+    let out = run(&bash("git push --forc"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "git push --forc must deny: {out}"
+    );
+}
+
 // ── issue #104: subshell bypass — pipe/redirect to subshell ──────────────────
 
 #[test]
