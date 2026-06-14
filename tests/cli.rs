@@ -140,10 +140,10 @@ fn e2e_non_bash_tool_without_protect_is_noop() {
 }
 
 #[test]
-fn e2e_malformed_json_is_safe_noop() {
-    // Garbage stdin must not crash or emit a decision.
+fn e2e_malformed_json_fails_closed() {
+    // Malformed JSON must fail closed (ask), not silently allow (issue #130).
     let out = run("not json at all", &[]);
-    assert_eq!(decision(&out), None);
+    assert_eq!(decision(&out), Some("ask"));
 }
 
 #[test]
@@ -1569,5 +1569,39 @@ fn e2e_dangerous_command_with_comment_still_denied() {
         decision(&out),
         Some("deny"),
         "rm -rf / with trailing comment must still be denied: {out}"
+    );
+}
+
+// ── issue #130: fail-closed on stdin/JSON errors ──────────────────────────────
+
+#[test]
+fn e2e_empty_stdin_asks() {
+    // Empty stdin must not silently allow — fail closed with ask
+    let out = run("", &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "empty stdin must produce ask, not silent allow: {out}"
+    );
+}
+
+#[test]
+fn e2e_malformed_json_asks() {
+    // Truncated/invalid JSON must not silently allow — fail closed with ask
+    let out = run("not json at all", &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "malformed JSON must produce ask, not silent allow: {out}"
+    );
+}
+
+#[test]
+fn e2e_truncated_json_asks() {
+    let out = run(r#"{"tool_name":"#, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "truncated JSON must produce ask, not silent allow: {out}"
     );
 }
