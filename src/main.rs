@@ -2,7 +2,7 @@ use regex::Regex;
 use std::{
     env, fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 // ─── Multi-agent mode ─────────────────────────────────────────────────────────
@@ -1005,6 +1005,44 @@ fn project_config_dir() -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+// ─── Project allow.patterns trust ────────────────────────────────────────────
+// Project deny/ask patterns auto-load (a repo tightening its own rules is safe).
+// Project allow.patterns requires explicit `clawband trust` — auto-loading is a
+// supply-chain vector: a `.*` in a committed allow.patterns disables all protection.
+
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for &b in data {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+fn trusted_file() -> PathBuf {
+    config_dir().join("trusted")
+}
+
+fn is_project_allow_trusted(allow_path: &Path) -> bool {
+    let Ok(data) = fs::read(allow_path) else {
+        return false;
+    };
+    let hash = fnv1a_64(&data);
+    let key = allow_path.to_string_lossy();
+    let trusted = fs::read_to_string(trusted_file()).unwrap_or_default();
+    for line in trusted.lines() {
+        let mut parts = line.splitn(2, ' ');
+        if let (Some(path), Some(h)) = (parts.next(), parts.next()) {
+            if path == key {
+                if let Ok(stored) = h.trim().parse::<u64>() {
+                    return stored == hash;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The decision for a command that matches no deny/ask/allow pattern. Read from a
@@ -2533,6 +2571,48 @@ fn cmd_uninstall() {
     }
 }
 
+fn cmd_trust(args: &[&str]) {
+    let path = if args.is_empty() {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(".clawband/allow.patterns")
+    } else {
+        PathBuf::from(args[0])
+    };
+    let canonical = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[clawband] Cannot resolve {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    let data = match fs::read(&canonical) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[clawband] Cannot read {}: {e}", canonical.display());
+            std::process::exit(1);
+        }
+    };
+    let hash = fnv1a_64(&data);
+    let key = canonical.to_string_lossy().into_owned();
+
+    // Read existing trusted file, replace or append
+    let tf = trusted_file();
+    let existing = fs::read_to_string(&tf).unwrap_or_default();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|l| !l.starts_with(&key))
+        .map(String::from)
+        .collect();
+    lines.push(format!("{key} {hash}"));
+    let content = lines.join("\n") + "\n";
+    if let Some(parent) = tf.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&tf, content).expect("write trusted file");
+    println!("[clawband] Trusted: {}", canonical.display());
+}
+
 fn cmd_verify() -> i32 {
     let g = "\x1b[32m";
     let y = "\x1b[33m";
@@ -2661,7 +2741,17 @@ fn cmd_test(command_args: &[String]) {
     if let Some(proj) = project_config_dir() {
         deny_pats.extend(load_patterns(&proj.join("deny.patterns")));
         ask_pats.extend(load_patterns(&proj.join("ask.patterns")));
-        allow_pats.extend(load_patterns(&proj.join("allow.patterns")));
+        let project_allow = proj.join("allow.patterns");
+        if project_allow.exists() {
+            if is_project_allow_trusted(&project_allow) {
+                allow_pats.extend(load_patterns(&project_allow));
+            } else {
+                eprintln!(
+                    "[clawband] Project allow.patterns found but not trusted: {}\n  Run `clawband trust` to enable it.",
+                    project_allow.display()
+                );
+            }
+        }
     }
     if protect_active() {
         deny_pats.extend(self_protect_deny_patterns());
@@ -2728,7 +2818,12 @@ fn cmd_patterns() {
     if let Some(proj) = project_config_dir() {
         let proj_deny = load_patterns(&proj.join("deny.patterns"));
         let proj_ask = load_patterns(&proj.join("ask.patterns"));
-        let proj_allow = load_patterns(&proj.join("allow.patterns"));
+        let proj_allow_path = proj.join("allow.patterns");
+        let proj_allow = if proj_allow_path.exists() && is_project_allow_trusted(&proj_allow_path) {
+            load_patterns(&proj_allow_path)
+        } else {
+            vec![]
+        };
 
         if !proj_deny.is_empty() || !proj_ask.is_empty() || !proj_allow.is_empty() {
             println!("\n{bold}Project patterns{r}  {d}({}){r}", proj.display());
@@ -2746,6 +2841,9 @@ fn cmd_patterns() {
                 "\n{bold}Project patterns{r}  {d}(none loaded from {}){r}",
                 proj.display()
             );
+        }
+        if proj_allow_path.exists() && !is_project_allow_trusted(&proj_allow_path) {
+            println!("  {d}[allow.patterns not trusted — run `clawband trust` to enable]{r}");
         }
     }
 
@@ -3254,6 +3352,9 @@ fn cmd_help() {
         "  {b}post{r}                        PostToolUse companion — reads breadcrumb, suggests allow"
     );
     println!(
+        "  {b}trust{r} {d}[path]{r}                  Trust project allow.patterns at path (default: .clawband/allow.patterns)"
+    );
+    println!(
         "  {b}upgrade{r} {d}[--check]{r}             Self-update: fetch and replace the running binary"
     );
     println!(
@@ -3271,9 +3372,11 @@ fn cmd_help() {
     );
     println!("    protect.paths              Paths Claude cannot Write/Edit (one regex per line)");
     println!("  Project (.clawband/ in CWD)  Loaded in addition to global patterns");
-    println!("    deny.patterns              Project-specific blocks");
-    println!("    ask.patterns               Project-specific prompts");
-    println!("    allow.patterns             Project-specific overrides");
+    println!("    deny.patterns              Project-specific blocks (auto-loaded)");
+    println!("    ask.patterns               Project-specific prompts (auto-loaded)");
+    println!(
+        "    allow.patterns             Project-specific overrides (requires `clawband trust`)"
+    );
     println!("    protect.paths              Project-specific protected paths");
     println!();
 
@@ -3934,6 +4037,15 @@ fn main() {
             cmd_uninstall();
             return;
         }
+        Some("trust") => {
+            cmd_trust(
+                &filtered_args[2..]
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+            );
+            return;
+        }
         Some("verify") => {
             std::process::exit(cmd_verify());
         }
@@ -4101,7 +4213,17 @@ fn main() {
     if let Some(proj) = project_config_dir() {
         deny_pats.extend(load_patterns(&proj.join("deny.patterns")));
         ask_pats.extend(load_patterns(&proj.join("ask.patterns")));
-        allow_pats.extend(load_patterns(&proj.join("allow.patterns")));
+        let project_allow = proj.join("allow.patterns");
+        if project_allow.exists() {
+            if is_project_allow_trusted(&project_allow) {
+                allow_pats.extend(load_patterns(&project_allow));
+            } else {
+                eprintln!(
+                    "[clawband] Project allow.patterns found but not trusted: {}\n  Run `clawband trust` to enable it.",
+                    project_allow.display()
+                );
+            }
+        }
     }
 
     // When self-protect is active, extend deny patterns with tamper-guard patterns.
@@ -7541,5 +7663,91 @@ mod tests {
             Some("deny".into()),
             "rm -rf / with trailing comment must still be denied"
         );
+    }
+
+    // ── issue #132: project allow.patterns trust infrastructure ──────────────
+
+    #[test]
+    fn fnv1a_64_deterministic() {
+        // Same input must always yield the same hash
+        let h1 = fnv1a_64(b"^git reset --hard HEAD$\n");
+        let h2 = fnv1a_64(b"^git reset --hard HEAD$\n");
+        assert_eq!(h1, h2, "fnv1a_64 must be deterministic");
+    }
+
+    #[test]
+    fn fnv1a_64_differs_for_different_input() {
+        let h1 = fnv1a_64(b"abc");
+        let h2 = fnv1a_64(b"abd");
+        assert_ne!(h1, h2, "fnv1a_64 must differ for different inputs");
+    }
+
+    #[test]
+    fn fnv1a_64_empty_input_is_offset_basis() {
+        // FNV-1a of empty input is the offset basis (14695981039346656037)
+        assert_eq!(fnv1a_64(b""), 14695981039346656037u64);
+    }
+
+    #[test]
+    fn is_project_allow_trusted_returns_false_for_missing_file() {
+        // A non-existent path must not be trusted
+        assert!(!is_project_allow_trusted(std::path::Path::new(
+            "/nonexistent/allow.patterns"
+        )));
+    }
+
+    #[test]
+    fn is_project_allow_trusted_roundtrip() {
+        // Write an allow.patterns, register it in a temp trusted file, verify trusted
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("cb_trust_unit_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let allow_path = tmp.join("allow.patterns");
+        let data = b"^ls -la\n";
+        fs::write(&allow_path, data).unwrap();
+        let hash = fnv1a_64(data);
+        let key = allow_path.to_string_lossy().into_owned();
+        // Write a fake trusted file in a temp home
+        let fake_home = tmp.join("home");
+        fs::create_dir_all(fake_home.join(".clawband")).unwrap();
+        let trusted_path = fake_home.join(".clawband/trusted");
+        fs::write(&trusted_path, format!("{key} {hash}\n")).unwrap();
+        // Override HOME for the duration of this assertion
+        let orig_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        let result = is_project_allow_trusted(&allow_path);
+        std::env::set_var("HOME", orig_home);
+        assert!(result, "allow.patterns with correct hash must be trusted");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_project_allow_trusted_wrong_hash_returns_false() {
+        // If the trusted file has a wrong hash, must not be trusted
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("cb_trust_unit_wrong_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let allow_path = tmp.join("allow.patterns");
+        fs::write(&allow_path, b"^ls -la\n").unwrap();
+        let wrong_hash: u64 = 999999999;
+        let key = allow_path.to_string_lossy().into_owned();
+        let fake_home = tmp.join("home");
+        fs::create_dir_all(fake_home.join(".clawband")).unwrap();
+        fs::write(
+            fake_home.join(".clawband/trusted"),
+            format!("{key} {wrong_hash}\n"),
+        )
+        .unwrap();
+        let orig_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        let result = is_project_allow_trusted(&allow_path);
+        std::env::set_var("HOME", orig_home);
+        assert!(
+            !result,
+            "allow.patterns with wrong hash must not be trusted"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
