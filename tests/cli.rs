@@ -1679,3 +1679,119 @@ fn e2e_project_allow_trusted_is_loaded() {
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&proj);
 }
+
+// ── issue #134: breadcrumb misattribution ─────────────────────────────────────
+
+/// Run the binary with the "post" subcommand and a PostToolUse JSON payload on stdin.
+/// `crumb_home` is the HOME directory whose `.clawband/.last-ask` file has been
+/// pre-written by the test to simulate what PreToolUse would have written.
+fn post(post_json: &str, home: &str) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_clawband"));
+    cmd.arg("post");
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    cmd.env_remove("CLAWBAND_SKIP")
+        .env_remove("RTK_ENABLED")
+        .env_remove("SQZ_ENABLED")
+        .env_remove("CLAWBAND_LOG");
+    cmd.env("HOME", home);
+    let mut child = cmd.spawn().expect("spawn clawband post");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(post_json.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait clawband post");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Write a breadcrumb file in the format that the fixed `write_ask_breadcrumb(cmd, reason)`
+/// produces: `<ts>\n<cmd>\n<reason>`.
+fn write_crumb(home_dir: &std::path::Path, cmd: &str, reason: &str) {
+    use std::fs;
+    let cfg = home_dir.join(".clawband");
+    fs::create_dir_all(&cfg).unwrap();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    fs::write(
+        cfg.join(".last-ask"),
+        format!("{}\n{}\n{}", ts, cmd, reason),
+    )
+    .unwrap();
+}
+
+#[test]
+fn e2e_post_no_crumb_is_silent() {
+    // PostToolUse with no breadcrumb file → no output (crumb was never written or
+    // has already been consumed).
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_post_nocrumb_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let h = home.to_str().unwrap();
+
+    let json = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    let out = post(json, h);
+    assert!(
+        out.is_empty(),
+        "PostToolUse with no crumb must produce no output: {out:?}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_post_mismatched_command_is_silent() {
+    // Crumb was written for "git reset --hard HEAD~1" (denied/expired without PostToolUse),
+    // but PostToolUse fires for "ls". The mismatched command must NOT produce output —
+    // this is the exact misattribution bug fixed by issue #134.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_post_mismatch_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+
+    write_crumb(
+        &home,
+        "git reset --hard HEAD~1",
+        "[CLAWBAND] git reset --hard — destructive; run `clawband allow 'git reset --hard'` to stop prompts.",
+    );
+
+    let json = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    let out = post(json, home.to_str().unwrap());
+    assert!(
+        out.is_empty(),
+        "Mismatched PostToolUse command must not trigger allow suggestion: {out:?}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_post_matching_command_suggests_allow() {
+    // Crumb for "git reset --hard HEAD~1" and PostToolUse also for "git reset --hard HEAD~1"
+    // → the user approved the ask, so cmd_post must output the allow suggestion.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_post_match_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+
+    // Use a reason string that contains the " allow '" marker cmd_post looks for.
+    write_crumb(
+        &home,
+        "git reset --hard HEAD~1",
+        "[CLAWBAND] git reset --hard is destructive.\n! clawband allow 'git reset --hard'\n",
+    );
+
+    let json = r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~1"}}"#;
+    let out = post(json, home.to_str().unwrap());
+    assert!(
+        out.contains("clawband allow"),
+        "Matching PostToolUse command must output allow suggestion: {out:?}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}

@@ -1512,7 +1512,7 @@ fn breadcrumb_path() -> PathBuf {
     config_dir().join(".last-ask")
 }
 
-fn write_ask_breadcrumb(reason: &str) {
+fn write_ask_breadcrumb(cmd: &str, reason: &str) {
     let cfg = config_dir();
     let _ = fs::create_dir_all(&cfg);
     let ts = std::time::SystemTime::now()
@@ -1525,7 +1525,7 @@ fn write_ask_breadcrumb(reason: &str) {
         .truncate(true)
         .open(breadcrumb_path())
     {
-        let _ = writeln!(f, "{}\n{}", ts, reason);
+        let _ = writeln!(f, "{}\n{}\n{}", ts, cmd, reason);
     }
 }
 
@@ -1534,16 +1534,33 @@ fn cmd_post() {
     let Ok(content) = fs::read_to_string(&path) else {
         return;
     };
+
+    // Read PostToolUse stdin to extract the command that actually ran.
+    let mut stdin_buf = String::new();
+    let _ = io::stdin().read_to_string(&mut stdin_buf);
+    let post_cmd = serde_json::from_str::<serde_json::Value>(&stdin_buf)
+        .ok()
+        .and_then(|v| v["tool_input"]["command"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
     let _ = fs::remove_file(&path);
 
     let mut lines = content.lines();
     let ts: u64 = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
+    let crumb_cmd = lines.next().unwrap_or("").to_string();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if now.saturating_sub(ts) > 60 {
+        return;
+    }
+
+    // Only proceed if the post-command matches the pre-command that wrote the crumb.
+    // This prevents a denied command's breadcrumb from being misattributed to a
+    // subsequent approved command (issue #134).
+    if post_cmd.is_empty() || crumb_cmd.is_empty() || post_cmd.trim() != crumb_cmd.trim() {
         return;
     }
 
@@ -4242,7 +4259,7 @@ fn main() {
     // Core pattern check (deny/ask/pass)
     if let Some((decision, reason)) = check_command(&command, &deny_pats, &ask_pats, &allow_pats) {
         if decision == "ask" && mode == Mode::Claude {
-            write_ask_breadcrumb(&reason);
+            write_ask_breadcrumb(&command, &reason);
         }
         emit(decision, &reason);
         return;
@@ -4283,7 +4300,7 @@ fn main() {
                 ),
             };
             if decision == "ask" && mode == Mode::Claude {
-                write_ask_breadcrumb(&reason);
+                write_ask_breadcrumb(&command, &reason);
             }
             emit(&decision, &reason);
             return;
@@ -4292,7 +4309,7 @@ fn main() {
             scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
         {
             if decision == "ask" && mode == Mode::Claude {
-                write_ask_breadcrumb(&reason);
+                write_ask_breadcrumb(&command, &reason);
             }
             emit(&decision, &reason);
             return;
