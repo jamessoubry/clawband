@@ -3971,12 +3971,33 @@ fn main() {
     let ask_fallback = config.ask_fallback;
 
     let mut input = String::new();
-    let _ = io::stdin().read_to_string(&mut input);
+    if io::stdin().read_to_string(&mut input).is_err() {
+        // stdin read failure — fail closed: we cannot know what command to check.
+        emit_decision(
+            mode,
+            ask_fallback,
+            "ask",
+            "clawband could not read hook input from stdin — \
+             review this command manually before running.",
+        );
+        return;
+    }
 
     // Parse hook JSON: {"tool_name": "...", "tool_input": {...}}
     let v: serde_json::Value = match serde_json::from_str(&input) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => {
+            // Malformed JSON — fail closed: emit ask so the user can decide.
+            // (We cannot determine the tool or command from unparseable input.)
+            emit_decision(
+                mode,
+                ask_fallback,
+                "ask",
+                "clawband received malformed JSON from the hook runtime — \
+                 review this command manually before running.",
+            );
+            return;
+        }
     };
 
     let log_enabled = logging_enabled();
