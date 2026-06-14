@@ -190,6 +190,40 @@ fn json_escape(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
+// ─── Harness output semantics ────────────────────────────────────────────────
+//
+// Each supported agent harness interprets clawband's stdout differently.
+// Understanding these semantics is critical for fail-closed behaviour — the
+// wrong decision on an error path can silently allow a command.
+//
+// ┌──────────────┬─────────────────────────────┬──────────────────────────────┬────────────────┬──────────────────────────────────┐
+// │ Harness      │ Empty stdout (pass/no-op)    │ "ask" decision               │ "deny" decision│ bypassPermissions / YOLO risk    │
+// ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
+// │ Claude       │ Claude applies own policy    │ prompts user for approval    │ always blocks  │ "ask" = AUTO-APPROVE in YOLO     │
+// │              │ (not a guaranteed allow)     │                              │                │ — functionally identical to allow│
+// ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
+// │ Codex        │ allow (no block signal)      │ ask_fallback: deny or allow  │ always blocks  │ No bypass mode; ask_fallback     │
+// │              │                              │ (deny is the safe default)   │                │ controls ask fate                │
+// ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
+// │ Gemini       │ allow                        │ folded → block               │ always blocks  │ None known                       │
+// ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
+// │ Hermes       │ allow ({} = pass-through)    │ ask_fallback: deny or allow  │ always blocks  │ None known                       │
+// ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
+// │ OpenCode     │ allow ({} = pass-through)    │ ask_fallback: deny or allow  │ always blocks  │ None known                       │
+// ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
+// │ Openclaw     │ allow                        │ approval dialog shown        │ always blocks  │ Likely bypassed in YOLO: Openclaw│
+// │              │                              │                              │                │ is a CC plugin; bypassPermissions│
+// │              │                              │                              │                │ may auto-approve requireApproval  │
+// └──────────────┴─────────────────────────────┴──────────────────────────────┴────────────────┴──────────────────────────────────┘
+//
+// KEY RULE: On any error path where we cannot determine the command being run,
+// ALWAYS emit "deny" — never "ask". For Claude+YOLO and likely Openclaw+YOLO,
+// "ask" is auto-approved (= allow). Only "deny" is universally fail-closed.
+//
+// The ask_fallback mechanism (Codex/Hermes/OpenCode) exists because those
+// harnesses have no native approval path. It converts "ask" to "deny" or
+// "allow" at output time, controlled by the user's config.
+
 /// Claude-mode output (existing format — byte-identical to pre-multi-agent behaviour).
 /// Pass = no output; caller must not call this for pass decisions.
 fn output_claude(decision: &str, reason: &str) {

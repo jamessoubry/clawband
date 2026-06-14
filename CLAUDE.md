@@ -26,6 +26,23 @@ cargo build --release && ~/.cargo/bin/clawband install
 - `emit_decision()` — routes output per mode (Claude, Codex, Gemini, Hermes, Openclaw, Opencode)
 - Version bumps: `Cargo.toml` version field (Cargo.lock updates automatically via `cargo update -p clawband`)
 
+## Harness output semantics
+
+Each harness interprets clawband's stdout differently. This matters for error paths and for choosing the right decision tier.
+
+| Harness | Empty stdout | `ask` decision | `deny` decision | bypassPermissions/YOLO risk |
+|---------|-------------|----------------|-----------------|---------------------------|
+| **Claude** | Claude applies own policy (not guaranteed allow) | prompts user | always blocks | **`ask` = auto-approve in YOLO** |
+| **Codex** | allow | `ask_fallback` → deny (default) or allow | always blocks | None — no bypass mode |
+| **Gemini** | allow | folded → block | always blocks | None known |
+| **Hermes** | allow (`{}` = pass-through) | `ask_fallback` → deny or allow | always blocks | None known |
+| **OpenCode** | allow (`{}` = pass-through) | `ask_fallback` → deny or allow | always blocks | None known |
+| **Openclaw** | allow | approval dialog shown | always blocks | **Likely bypassed in YOLO**: Openclaw is a CC plugin; `bypassPermissions` may auto-approve `requireApproval` |
+
+**Critical rule:** On any error path where the command is unknown, emit `"deny"` — never `"ask"`. For Claude+YOLO and likely Openclaw+YOLO, `ask` is auto-approved (functionally identical to allow). Only `deny` is universally fail-closed across all harnesses.
+
+The `ask_fallback` system (Codex/Hermes/OpenCode) converts `ask` to `deny` or `allow` at output time because those harnesses have no native approval path. Default is `deny`.
+
 ## Testing
 
 All pattern changes must include:
