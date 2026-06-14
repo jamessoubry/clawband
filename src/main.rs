@@ -195,7 +195,7 @@ fn json_escape(s: &str) -> String {
 fn output_claude(decision: &str, reason: &str) {
     // Upper-case so the source stays prominent even where Claude Code renders the
     // permission message without colour (e.g. worktree sessions) — see issue #47.
-    let prefixed = format!("[CLAWBAND] {}", reason);
+    let prefixed = format!("[CLAWBAND]\n{}", reason);
     println!(
         r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"{}","permissionDecisionReason":"{}"}}}}"#,
         decision,
@@ -206,7 +206,7 @@ fn output_claude(decision: &str, reason: &str) {
 /// Codex-mode output.  Same JSON shape as Claude; no native "ask" — ask is
 /// converted to deny or allow via `ask_fallback`.  Pass = no output.
 fn output_codex(decision: &str, reason: &str) {
-    let prefixed = format!("[CLAWBAND] {}", reason);
+    let prefixed = format!("[CLAWBAND]\n{}", reason);
     println!(
         r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"{}","permissionDecisionReason":"{}"}}}}"#,
         decision,
@@ -223,7 +223,7 @@ fn output_gemini(decision: &str, reason: &str) {
         println!(r#"{{"decision":"allow"}}"#);
     } else {
         // deny (or ask-turned-deny)
-        let prefixed = format!("[CLAWBAND] {}", reason);
+        let prefixed = format!("[CLAWBAND]\n{}", reason);
         println!(
             r#"{{"decision":"block","reason":"{}"}}"#,
             json_escape(&prefixed)
@@ -239,7 +239,7 @@ fn output_hermes(decision: &str, reason: &str) {
     if decision == "allow" {
         println!("{{}}");
     } else {
-        let prefixed = format!("[CLAWBAND] {}", reason);
+        let prefixed = format!("[CLAWBAND]\n{}", reason);
         println!(
             r#"{{"decision":"block","reason":"{}"}}"#,
             json_escape(&prefixed)
@@ -248,7 +248,7 @@ fn output_hermes(decision: &str, reason: &str) {
 }
 
 /// OpenCode-mode output.
-/// DENY  → `{"decision":"block","reason":"[CLAWBAND] <reason>"}`
+/// DENY  → `{"decision":"block","reason":"[CLAWBAND]\n<reason>"}`
 /// ALLOW → `{}`
 /// Pass  = no output (caller must not invoke for pass)
 ///
@@ -261,7 +261,7 @@ fn output_opencode(decision: &str, reason: &str) {
         println!("{{}}");
     } else {
         // deny (or ask-turned-deny via ask_fallback)
-        let prefixed = format!("[CLAWBAND] {}", reason);
+        let prefixed = format!("[CLAWBAND]\n{}", reason);
         println!(
             r#"{{"decision":"block","reason":"{}"}}"#,
             json_escape(&prefixed)
@@ -270,8 +270,8 @@ fn output_opencode(decision: &str, reason: &str) {
 }
 
 /// Openclaw-mode output.
-/// DENY  → `{"decision":"block","reason":"[CLAWBAND] <reason>"}`
-/// ASK   → `{"decision":"ask","reason":"[CLAWBAND] <reason>"}`
+/// DENY  → `{"decision":"block","reason":"[CLAWBAND]\n<reason>"}`
+/// ASK   → `{"decision":"ask","reason":"[CLAWBAND]\n<reason>"}`
 /// ALLOW → `{"decision":"allow"}`
 /// Pass  = no output (caller must not invoke for pass)
 ///
@@ -282,7 +282,7 @@ fn output_openclaw(decision: &str, reason: &str) {
     match decision {
         "allow" => println!(r#"{{"decision":"allow"}}"#),
         "ask" => {
-            let prefixed = format!("[CLAWBAND] {}", reason);
+            let prefixed = format!("[CLAWBAND]\n{}", reason);
             println!(
                 r#"{{"decision":"ask","reason":"{}"}}"#,
                 json_escape(&prefixed)
@@ -290,7 +290,7 @@ fn output_openclaw(decision: &str, reason: &str) {
         }
         _ => {
             // deny (or any unrecognised value)
-            let prefixed = format!("[CLAWBAND] {}", reason);
+            let prefixed = format!("[CLAWBAND]\n{}", reason);
             println!(
                 r#"{{"decision":"block","reason":"{}"}}"#,
                 json_escape(&prefixed)
