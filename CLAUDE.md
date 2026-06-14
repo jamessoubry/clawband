@@ -32,16 +32,18 @@ Each harness interprets clawband's stdout differently. This matters for error pa
 
 | Harness | Empty stdout | `ask` decision | `deny` decision | bypassPermissions/YOLO risk |
 |---------|-------------|----------------|-----------------|---------------------------|
-| **Claude** | Claude applies own policy (not guaranteed allow) | prompts user | always blocks | **`ask` = auto-approve in YOLO** |
-| **Codex** | allow | `ask_fallback` → deny (default) or allow | always blocks | None — no bypass mode |
-| **Gemini** | allow | folded → block | always blocks | None known |
-| **Hermes** | allow (`{}` = pass-through) | `ask_fallback` → deny or allow | always blocks | None known |
-| **OpenCode** | allow (`{}` = pass-through) | `ask_fallback` → deny or allow | always blocks | None known |
-| **Openclaw** | allow | approval dialog shown | always blocks | **Likely bypassed in YOLO**: Openclaw is a CC plugin; `bypassPermissions` may auto-approve `requireApproval` |
+| **Claude** | Claude applies own policy (not guaranteed allow) | prompts user | always blocks | **`ask` = auto-approve in YOLO** — bypassPermissions specifically changes how `ask` is handled |
+| **Codex** | allow | `ask_fallback` → deny (default) or allow | always blocks | No bypass mode known |
+| **Gemini** | allow | folded → block (no native ask tier) | always blocks | Gemini has `--yolo`; risk differs from Claude: clawband emits `block` (not `ask`) so YOLO likely only skips interactive prompts, not hook blocks. **Unverified — needs empirical test.** |
+| **Hermes** | allow (`{}` = pass-through) | `ask_fallback` → deny or allow | always blocks | YOLO equivalent unknown — **needs investigation** |
+| **OpenCode** | allow (`{}` = pass-through) | `ask_fallback` → deny or allow | always blocks | YOLO equivalent unknown — **needs investigation** |
+| **Openclaw** | allow | approval dialog shown | always blocks | **Likely bypassed in YOLO**: Openclaw is a CC plugin; `bypassPermissions` may auto-approve `requireApproval` — same host process as Claude |
 
 **Critical rule:** On any error path where the command is unknown, emit `"deny"` — never `"ask"`. For Claude+YOLO and likely Openclaw+YOLO, `ask` is auto-approved (functionally identical to allow). Only `deny` is universally fail-closed across all harnesses.
 
 The `ask_fallback` system (Codex/Hermes/OpenCode) converts `ask` to `deny` or `allow` at output time because those harnesses have no native approval path. Default is `deny`.
+
+**Why Gemini's YOLO risk differs from Claude's:** Claude's bypassPermissions specifically auto-approves `permissionDecision: "ask"` while still respecting `"deny"`. Gemini has no native ask tier — clawband always emits `{"decision":"block"}`. Gemini's `--yolo` most likely skips interactive prompts only, not hook-level blocks. If Gemini YOLO bypasses hooks entirely, the vulnerability is empty-stdout (allow) not ask-tier — a different class of bug.
 
 ## Testing
 

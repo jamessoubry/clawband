@@ -205,16 +205,25 @@ fn json_escape(s: &str) -> String {
 // │ Codex        │ allow (no block signal)      │ ask_fallback: deny or allow  │ always blocks  │ No bypass mode; ask_fallback     │
 // │              │                              │ (deny is the safe default)   │                │ controls ask fate                │
 // ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
-// │ Gemini       │ allow                        │ folded → block               │ always blocks  │ None known                       │
+// │ Gemini       │ allow                        │ folded → block (no ask tier) │ always blocks  │ Has --yolo flag; risk differs:   │
+// │              │                              │                              │                │ clawband emits block not ask, so │
+// │              │                              │                              │                │ YOLO likely skips prompts only.  │
+// │              │                              │                              │                │ UNVERIFIED — needs empirical test│
 // ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
-// │ Hermes       │ allow ({} = pass-through)    │ ask_fallback: deny or allow  │ always blocks  │ None known                       │
+// │ Hermes       │ allow ({} = pass-through)    │ ask_fallback: deny or allow  │ always blocks  │ YOLO equivalent unknown          │
 // ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
-// │ OpenCode     │ allow ({} = pass-through)    │ ask_fallback: deny or allow  │ always blocks  │ None known                       │
+// │ OpenCode     │ allow ({} = pass-through)    │ ask_fallback: deny or allow  │ always blocks  │ YOLO equivalent unknown          │
 // ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
 // │ Openclaw     │ allow                        │ approval dialog shown        │ always blocks  │ Likely bypassed in YOLO: Openclaw│
 // │              │                              │                              │                │ is a CC plugin; bypassPermissions│
 // │              │                              │                              │                │ may auto-approve requireApproval  │
 // └──────────────┴─────────────────────────────┴──────────────────────────────┴────────────────┴──────────────────────────────────┘
+//
+// Why Gemini differs from Claude: Claude's bypassPermissions specifically
+// auto-approves "ask" while respecting "deny". Gemini has no ask tier —
+// clawband always emits {"decision":"block"}. Gemini --yolo likely only skips
+// interactive prompts, not hook-level blocks. If it does bypass hooks, the
+// vulnerability class is empty-stdout (allow), not ask — a separate concern.
 //
 // KEY RULE: On any error path where we cannot determine the command being run,
 // ALWAYS emit "deny" — never "ask". For Claude+YOLO and likely Openclaw+YOLO,
