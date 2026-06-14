@@ -3972,13 +3972,14 @@ fn main() {
 
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
-        // stdin read failure — fail closed: we cannot know what command to check.
+        // stdin read failure — fail closed with deny. We cannot know what command
+        // to check; "ask" would auto-approve in bypassPermissions/YOLO mode.
         emit_decision(
             mode,
             ask_fallback,
-            "ask",
+            "deny",
             "clawband could not read hook input from stdin — \
-             review this command manually before running.",
+             command blocked (fail-closed).",
         );
         return;
     }
@@ -3987,14 +3988,15 @@ fn main() {
     let v: serde_json::Value = match serde_json::from_str(&input) {
         Ok(v) => v,
         Err(_) => {
-            // Malformed JSON — fail closed: emit ask so the user can decide.
-            // (We cannot determine the tool or command from unparseable input.)
+            // Malformed JSON — fail closed with deny. We cannot determine the tool
+            // or command from unparseable input; "ask" auto-approves in
+            // bypassPermissions/YOLO mode so deny is the only safe choice.
             emit_decision(
                 mode,
                 ask_fallback,
-                "ask",
+                "deny",
                 "clawband received malformed JSON from the hook runtime — \
-                 review this command manually before running.",
+                 command blocked (fail-closed).",
             );
             return;
         }

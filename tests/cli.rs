@@ -141,9 +141,10 @@ fn e2e_non_bash_tool_without_protect_is_noop() {
 
 #[test]
 fn e2e_malformed_json_fails_closed() {
-    // Malformed JSON must fail closed (ask), not silently allow (issue #130).
+    // Malformed JSON must fail closed with deny — "ask" auto-approves in
+    // bypassPermissions/YOLO mode, so deny is the only safe fail mode (issue #130).
     let out = run("not json at all", &[]);
-    assert_eq!(decision(&out), Some("ask"));
+    assert_eq!(decision(&out), Some("deny"));
 }
 
 #[test]
@@ -1575,33 +1576,33 @@ fn e2e_dangerous_command_with_comment_still_denied() {
 // ── issue #130: fail-closed on stdin/JSON errors ──────────────────────────────
 
 #[test]
-fn e2e_empty_stdin_asks() {
-    // Empty stdin must not silently allow — fail closed with ask
+fn e2e_empty_stdin_denies() {
+    // Empty stdin must fail closed with deny (not ask — ask auto-approves in YOLO mode)
     let out = run("", &[]);
     assert_eq!(
         decision(&out),
-        Some("ask"),
-        "empty stdin must produce ask, not silent allow: {out}"
+        Some("deny"),
+        "empty stdin must produce deny, not silent allow: {out}"
     );
 }
 
 #[test]
-fn e2e_malformed_json_asks() {
-    // Truncated/invalid JSON must not silently allow — fail closed with ask
+fn e2e_malformed_json_denies() {
+    // Truncated/invalid JSON must fail closed with deny
     let out = run("not json at all", &[]);
     assert_eq!(
         decision(&out),
-        Some("ask"),
-        "malformed JSON must produce ask, not silent allow: {out}"
+        Some("deny"),
+        "malformed JSON must produce deny, not silent allow: {out}"
     );
 }
 
 #[test]
-fn e2e_truncated_json_asks() {
+fn e2e_truncated_json_denies() {
     let out = run(r#"{"tool_name":"#, &[]);
     assert_eq!(
         decision(&out),
-        Some("ask"),
-        "truncated JSON must produce ask, not silent allow: {out}"
+        Some("deny"),
+        "truncated JSON must produce deny, not silent allow: {out}"
     );
 }
