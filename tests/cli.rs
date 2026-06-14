@@ -141,9 +141,10 @@ fn e2e_non_bash_tool_without_protect_is_noop() {
 
 #[test]
 fn e2e_malformed_json_fails_closed() {
-    // Malformed JSON must fail closed (ask), not silently allow (issue #130).
+    // Malformed JSON must fail closed with deny, not ask (issue #130/#131).
+    // ask auto-approves in bypassPermissions mode, so only deny is safe.
     let out = run("not json at all", &[]);
-    assert_eq!(decision(&out), Some("ask"));
+    assert_eq!(decision(&out), Some("deny"));
 }
 
 #[test]
@@ -1572,36 +1573,35 @@ fn e2e_dangerous_command_with_comment_still_denied() {
     );
 }
 
-// ── issue #130: fail-closed on stdin/JSON errors ──────────────────────────────
+// ── issue #131: error paths must emit deny, not ask ───────────────────────────
+// ask auto-approves in bypassPermissions mode; deny is the only safe fail-closed
 
 #[test]
-fn e2e_empty_stdin_asks() {
-    // Empty stdin must not silently allow — fail closed with ask
+fn e2e_empty_stdin_denies() {
     let out = run("", &[]);
     assert_eq!(
         decision(&out),
-        Some("ask"),
-        "empty stdin must produce ask, not silent allow: {out}"
+        Some("deny"),
+        "empty stdin must produce deny, not ask or silent allow: {out}"
     );
 }
 
 #[test]
-fn e2e_malformed_json_asks() {
-    // Truncated/invalid JSON must not silently allow — fail closed with ask
+fn e2e_malformed_json_denies() {
     let out = run("not json at all", &[]);
     assert_eq!(
         decision(&out),
-        Some("ask"),
-        "malformed JSON must produce ask, not silent allow: {out}"
+        Some("deny"),
+        "malformed JSON must produce deny, not ask or silent allow: {out}"
     );
 }
 
 #[test]
-fn e2e_truncated_json_asks() {
+fn e2e_truncated_json_denies() {
     let out = run(r#"{"tool_name":"#, &[]);
     assert_eq!(
         decision(&out),
-        Some("ask"),
-        "truncated JSON must produce ask, not silent allow: {out}"
+        Some("deny"),
+        "truncated JSON must produce deny, not ask or silent allow: {out}"
     );
 }
