@@ -192,9 +192,9 @@ With `default_decision = allow`, only your `deny`/`ask` patterns stop or prompt;
 
 | File | Effect |
 |------|--------|
-| `.clawband/deny.patterns` | Project-specific blocks |
-| `.clawband/ask.patterns` | Project-specific prompts |
-| `.clawband/allow.patterns` | Project-specific overrides |
+| `.clawband/deny.patterns` | Project-specific blocks — auto-loaded |
+| `.clawband/ask.patterns` | Project-specific prompts — auto-loaded |
+| `.clawband/allow.patterns` | Project-specific overrides — **requires `clawband trust`** |
 
 Each file is one **case-insensitive regex** per line. Lines starting with `#` and blank lines are ignored.
 
@@ -204,8 +204,30 @@ See `deny.patterns.example` and `ask.patterns.example` for the format.
 # ~/.clawband/deny.patterns — global blocks for all projects
 my-infra nuke --all
 
-# .clawband/allow.patterns — project-specific override
+# .clawband/allow.patterns — project-specific override (requires clawband trust)
 git reset --hard HEAD$
+```
+
+### Why project allow.patterns requires trust
+
+Project `deny.patterns` and `ask.patterns` auto-load without any prompt — a repo tightening its own rules can only make clawband *stricter*, which is safe. Project `allow.patterns` is different: a single `.*` entry would suppress all deny and ask checks for every command the agent runs in that directory.
+
+This is a supply-chain vector. An attacker commits `.clawband/allow.patterns` containing `.*`, a developer clones the repo and runs an AI agent, and clawband silently stands down for the entire session.
+
+To prevent this, project `allow.patterns` requires explicit opt-in:
+
+```sh
+clawband trust                          # trust .clawband/allow.patterns in the current directory
+clawband trust /path/to/allow.patterns  # trust a specific file
+```
+
+This records the file's path and a content hash in `~/.clawband/trusted`. If the file is later modified (e.g. an upstream commit changes the patterns), the hash no longer matches and clawband warns again — so trust is scoped to the exact content you reviewed, not the file path forever.
+
+Until trusted, clawband loads project deny/ask patterns normally but ignores project allow patterns and prints a warning to stderr:
+
+```
+[CLAWBAND] Project allow.patterns found but not trusted: /path/.clawband/allow.patterns
+  Run `clawband trust` to enable it.
 ```
 
 ## Self-protection
@@ -260,6 +282,8 @@ clawband allow '<pattern>'            # append to ~/.clawband/allow.patterns (gl
 clawband allow --project '<pattern>'  # append to .clawband/allow.patterns (project CWD)
 clawband deny  '<pattern>'            # append to ~/.clawband/deny.patterns (global)
 clawband deny  --project '<pattern>'  # append to .clawband/deny.patterns (project CWD)
+clawband trust                        # trust .clawband/allow.patterns in CWD (records content hash)
+clawband trust <path>                 # trust a specific allow.patterns file
 clawband stats                        # show pattern counts and audit log summary
 clawband test '<command>'             # dry-run: print DENY/ASK/PASS without executing
 clawband patterns                     # list all active patterns (built-in + user + project)
