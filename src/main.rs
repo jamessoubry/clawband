@@ -2529,26 +2529,26 @@ fn cmd_uninstall() {
     let raw = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => {
-            println!("[clawband] No clawband hook found in settings — nothing to remove.");
+            println!("[CLAWBAND] No clawband hook found in settings — nothing to remove.");
             return;
         }
     };
     let mut settings: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            println!("[clawband] No clawband hook found in settings — nothing to remove.");
+            println!("[CLAWBAND] No clawband hook found in settings — nothing to remove.");
             return;
         }
     };
 
     if !clawband_hook_present(&settings) {
-        println!("[clawband] No clawband hook found in settings — nothing to remove.");
+        println!("[CLAWBAND] No clawband hook found in settings — nothing to remove.");
         return;
     }
 
     let changed = remove_clawband_hooks(&mut settings);
     if !changed {
-        println!("[clawband] No clawband hook found in settings — nothing to remove.");
+        println!("[CLAWBAND] No clawband hook found in settings — nothing to remove.");
         return;
     }
 
@@ -2556,16 +2556,16 @@ fn cmd_uninstall() {
         Ok(out) => {
             if fs::write(&path, out + "\n").is_ok() {
                 println!(
-                    "{g}[clawband] Uninstalled:{r} removed clawband PreToolUse hook from {d}{}{r}.",
+                    "{g}[CLAWBAND] Uninstalled:{r} removed clawband PreToolUse hook from {d}{}{r}.",
                     path.display()
                 );
             } else {
-                eprintln!("[clawband] Failed to write {}", path.display());
+                eprintln!("[CLAWBAND] Failed to write {}", path.display());
                 std::process::exit(1);
             }
         }
         Err(e) => {
-            eprintln!("[clawband] Failed to serialize settings: {e}");
+            eprintln!("[CLAWBAND] Failed to serialize settings: {e}");
             std::process::exit(1);
         }
     }
@@ -2582,14 +2582,14 @@ fn cmd_trust(args: &[&str]) {
     let canonical = match path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[clawband] Cannot resolve {}: {e}", path.display());
+            eprintln!("[CLAWBAND] Cannot resolve {}: {e}", path.display());
             std::process::exit(1);
         }
     };
     let data = match fs::read(&canonical) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("[clawband] Cannot read {}: {e}", canonical.display());
+            eprintln!("[CLAWBAND] Cannot read {}: {e}", canonical.display());
             std::process::exit(1);
         }
     };
@@ -2610,7 +2610,7 @@ fn cmd_trust(args: &[&str]) {
         let _ = fs::create_dir_all(parent);
     }
     fs::write(&tf, content).expect("write trusted file");
-    println!("[clawband] Trusted: {}", canonical.display());
+    println!("[CLAWBAND] Trusted: {}", canonical.display());
 }
 
 fn cmd_verify() -> i32 {
@@ -2747,7 +2747,7 @@ fn cmd_test(command_args: &[String]) {
                 allow_pats.extend(load_patterns(&project_allow));
             } else {
                 eprintln!(
-                    "[clawband] Project allow.patterns found but not trusted: {}\n  Run `clawband trust` to enable it.",
+                    "[CLAWBAND] Project allow.patterns found but not trusted: {}\n  Run `clawband trust` to enable it.",
                     project_allow.display()
                 );
             }
@@ -4116,7 +4116,7 @@ fn main() {
     if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
         // Total bypass — emit a prominent warning so the operator knows checks are off,
         // then leave an audit trail in the log file when logging is enabled.
-        eprintln!("[clawband] WARNING: CLAWBAND_SKIP=1 — all security checks are disabled");
+        eprintln!("[CLAWBAND] WARNING: CLAWBAND_SKIP=1 — all security checks are disabled");
         let cmd_preview = v["tool_input"]["command"]
             .as_str()
             .unwrap_or("<non-bash tool>")
@@ -4219,7 +4219,7 @@ fn main() {
                 allow_pats.extend(load_patterns(&project_allow));
             } else {
                 eprintln!(
-                    "[clawband] Project allow.patterns found but not trusted: {}\n  Run `clawband trust` to enable it.",
+                    "[CLAWBAND] Project allow.patterns found but not trusted: {}\n  Run `clawband trust` to enable it.",
                     project_allow.display()
                 );
             }
