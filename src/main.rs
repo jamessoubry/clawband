@@ -197,10 +197,13 @@ fn json_escape(s: &str) -> String {
 // wrong decision on an error path can silently allow a command.
 //
 // ┌──────────────┬─────────────────────────────┬──────────────────────────────┬────────────────┬──────────────────────────────────┐
-// │ Harness      │ Empty stdout (pass/no-op)    │ "ask" decision               │ "deny" decision│ bypassPermissions / YOLO risk    │
+// │ Harness      │ Empty stdout (pass/no-op)    │ "ask" decision               │ "deny" decision│ Error-path concern               │
 // ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
-// │ Claude       │ Claude applies own policy    │ prompts user for approval    │ always blocks  │ "ask" = AUTO-APPROVE in YOLO     │
-// │              │ (not a guaranteed allow)     │                              │                │ — functionally identical to allow│
+// │ Claude       │ Claude applies own policy    │ prompts user; AUTO-APPROVE   │ always blocks  │ On error paths: ask auto-approves│
+// │              │ (not a guaranteed allow)     │ in bypassPermissions (this   │                │ unknown commands in bypass mode. │
+// │              │                              │ is intentional for normal    │                │ Always emit deny on error, not   │
+// │              │                              │ ask-tier — user opted out of │                │ ask. (Normal ask-tier: fine.)    │
+// │              │                              │ double-prompting)            │                │                                  │
 // ├──────────────┼─────────────────────────────┼──────────────────────────────┼────────────────┼──────────────────────────────────┤
 // │ Codex        │ allow (no block signal)      │ ask_fallback: deny or allow  │ always blocks  │ No bypass mode; ask_fallback     │
 // │              │                              │ (deny is the safe default)   │                │ controls ask fate                │
@@ -225,9 +228,11 @@ fn json_escape(s: &str) -> String {
 // interactive prompts, not hook-level blocks. If it does bypass hooks, the
 // vulnerability class is empty-stdout (allow), not ask — a separate concern.
 //
-// KEY RULE: On any error path where we cannot determine the command being run,
-// ALWAYS emit "deny" — never "ask". For Claude+YOLO and likely Openclaw+YOLO,
-// "ask" is auto-approved (= allow). Only "deny" is universally fail-closed.
+// KEY RULE FOR ERROR PATHS: When clawband cannot parse its input, it has zero
+// information about the command being run. Emit "deny" — never "ask".
+// "ask" auto-approving in bypassPermissions is intentional for normal ask-tier
+// matches (user opted out of double-prompting), but wrong for error paths where
+// the command identity is unknown. "deny" is universally fail-closed.
 //
 // The ask_fallback mechanism (Codex/Hermes/OpenCode) exists because those
 // harnesses have no native approval path. It converts "ask" to "deny" or
