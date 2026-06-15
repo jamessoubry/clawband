@@ -499,7 +499,7 @@ fn suggestion_for(label: &str) -> Option<&'static str> {
         | "kubectl delete --all" => {
             "Deletion cascades to every resource in scope — double-check the target."
         }
-        "git reset --hard" => {
+        "git reset --hard/--keep/--merge" => {
             "git stash keeps your changes recoverable; or reset to a ref you have verified."
         }
         "git clean" => "Preview first with git clean -n (dry run) before deleting untracked files.",
@@ -780,12 +780,17 @@ fn builtin_ask() -> Vec<Pattern> {
         // `eval "$(rbenv init -)"` are exempted via builtin_allow().
         ("eval", r"\beval\s"),
         // Destructive git (local) — legitimate but irreversible without reflog
-        ("git reset --hard", r"\bgit\s+reset\s+--hard\b"),
+        // --keep and --merge also discard uncommitted changes
+        (
+            "git reset --hard/--keep/--merge",
+            r"\bgit\s+reset\s+(?:--hard|--keep|--merge)\b",
+        ),
         ("git checkout -- ", r"\bgit\s+checkout\s+--\s"),
         ("git stash drop", r"\bgit\s+stash\s+drop\b"),
         ("git stash clear", r"\bgit\s+stash\s+clear\b"),
         // git clean — wipes untracked files, unrecoverable
-        ("git clean", r"\bgit\s+clean\s+-[fxd]"),
+        // --force is the long form of -f
+        ("git clean", r"\bgit\s+clean\s+(?:-[fxd]+|--force)\b"),
         // Remote branch deletion
         ("git push --delete", r"\bgit\s+push\b.*--delete\b"),
         // git restore without --staged — discards working tree changes
@@ -793,7 +798,11 @@ fn builtin_ask() -> Vec<Pattern> {
         ("git restore", r"\bgit\s+restore\s+[^-]"),
         // git branch -D — force-deletes branch regardless of merge status
         // (?-i:-D) disables the outer (?i) for just -D so lowercase -d isn't caught
-        ("git branch -D", r"\bgit\s+branch\s+(?-i:-D)\b"),
+        // --delete --force and --force --delete are the long-form equivalents
+        (
+            "git branch -D",
+            r"\bgit\s+branch\s+(?:(?-i:-D)\b|--delete\s+--force\b|--force\s+--delete\b)",
+        ),
         // docker rm -f — force-removes a running container
         (
             "docker rm -f",
@@ -4991,8 +5000,60 @@ mod tests {
     }
 
     #[test]
+    fn git_reset_keep_asks() {
+        assert_eq!(decision("git reset --keep HEAD~1"), Some("ask".into()));
+    }
+
+    #[test]
+    fn git_reset_merge_asks() {
+        assert_eq!(decision("git reset --merge HEAD~1"), Some("ask".into()));
+    }
+
+    #[test]
+    fn git_reset_soft_passes() {
+        assert_eq!(decision("git reset --soft HEAD~1"), None);
+    }
+
+    #[test]
+    fn git_reset_mixed_passes() {
+        assert_eq!(decision("git reset --mixed HEAD~1"), None);
+    }
+
+    #[test]
+    fn git_clean_longform_force_asks() {
+        assert_eq!(decision("git clean --force"), Some("ask".into()));
+    }
+
+    #[test]
+    fn git_clean_dry_run_passes() {
+        assert_eq!(decision("git clean -n"), None);
+    }
+
+    #[test]
     fn git_branch_uppercase_d_asks() {
         assert_eq!(decision("git branch -D mybranch"), Some("ask".into()));
+    }
+
+    #[test]
+    fn git_branch_delete_force_asks() {
+        assert_eq!(
+            decision("git branch --delete --force main"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_branch_force_delete_asks() {
+        assert_eq!(
+            decision("git branch --force --delete main"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_branch_delete_only_passes() {
+        // --delete without --force only fails if the branch is unmerged; not forced
+        assert_eq!(decision("git branch --delete main"), None);
     }
 
     #[test]
