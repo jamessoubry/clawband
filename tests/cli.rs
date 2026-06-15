@@ -2248,3 +2248,49 @@ fn e2e_xargs_zero_flag_rm() {
         "xargs -0 rm must be denied: {out}"
     );
 }
+
+// ── issue #122: truncate zero-size forms ──────────────────────────────────────
+
+#[test]
+fn e2e_truncate_s0_nospace_denied() {
+    // truncate -s0 (no space between flag and value) must be denied
+    let out = run(&bash("truncate -s0 file.txt"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "truncate -s0 must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_truncate_size_space_0_denied() {
+    // truncate --size 0 (long flag, space-separated) must be denied
+    let out = run(&bash("truncate --size 0 file.txt"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "truncate --size 0 must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_truncate_size_equals_0_denied() {
+    // truncate --size=0 (long flag, equals-separated) must be denied
+    let out = run(&bash("truncate --size=0 file.txt"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "truncate --size=0 must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_truncate_nonzero_passes() {
+    // truncate with a non-zero size must not be denied
+    let out = run(&bash("truncate -s 100 file.txt"), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("deny"),
+        "truncate -s 100 (non-zero) must not be denied: {out}"
+    );
+}
