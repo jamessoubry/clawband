@@ -2062,7 +2062,9 @@ const PROTECT_PATHS_TEMPLATE: &str =
 ~/.claude/hooks/clawband$\n\
 ~/.clawband/.*\n\
 # Shell startup files — block injecting CLAWBAND_SKIP=1 (or hook removal) here.\n\
-~/\\.(bash_profile|bashrc|profile|zshrc|zprofile|zshenv)$\n\
+~/\\.(bash_profile|bash_login|bash_aliases|bashrc|profile|zshrc|zprofile|zshenv|zlogin|zlogout)$\n\
+~/.config/fish/config\\.fish$\n\
+~/.bashrc\\.d/\n\
 # Auto-executed files — protect git hooks and direnv config from silent injection.\n\
 # Add conftest.py, package.json, Makefile, etc. manually if your project warrants it.\n\
 \\.git/hooks/\n\
@@ -6916,6 +6918,58 @@ mod tests {
         assert!(
             PROTECT_PATHS_TEMPLATE.contains(".envrc"),
             "PROTECT_PATHS_TEMPLATE should include .envrc pattern"
+        );
+    }
+
+    // ── Item #119: PROTECT_PATHS_TEMPLATE covers additional shell init files ──
+
+    #[test]
+    fn protect_paths_template_contains_bash_aliases() {
+        assert!(
+            PROTECT_PATHS_TEMPLATE.contains("bash_aliases"),
+            "PROTECT_PATHS_TEMPLATE should include bash_aliases pattern"
+        );
+    }
+
+    #[test]
+    fn protect_paths_template_contains_bash_login() {
+        assert!(
+            PROTECT_PATHS_TEMPLATE.contains("bash_login"),
+            "PROTECT_PATHS_TEMPLATE should include bash_login pattern"
+        );
+    }
+
+    #[test]
+    fn protect_paths_template_contains_zlogin() {
+        assert!(
+            PROTECT_PATHS_TEMPLATE.contains("zlogin"),
+            "PROTECT_PATHS_TEMPLATE should include zlogin pattern"
+        );
+    }
+
+    #[test]
+    fn protect_paths_template_contains_zlogout() {
+        assert!(
+            PROTECT_PATHS_TEMPLATE.contains("zlogout"),
+            "PROTECT_PATHS_TEMPLATE should include zlogout pattern"
+        );
+    }
+
+    #[test]
+    fn protect_paths_template_contains_fish_config() {
+        assert!(
+            PROTECT_PATHS_TEMPLATE.contains("config/fish/config"),
+            "PROTECT_PATHS_TEMPLATE should include fish config.fish pattern"
+        );
+    }
+
+    #[test]
+    fn protect_paths_template_contains_bashrc_d() {
+        // The template stores the regex pattern with an escaped dot: ~/.bashrc\.d/
+        // so we check for the surrounding fragments rather than the literal path.
+        assert!(
+            PROTECT_PATHS_TEMPLATE.contains("bashrc") && PROTECT_PATHS_TEMPLATE.contains("\\.d/"),
+            "PROTECT_PATHS_TEMPLATE should include .bashrc.d/ directory pattern"
         );
     }
 
