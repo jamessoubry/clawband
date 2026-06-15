@@ -1651,6 +1651,78 @@ fn normalize_segment(segment: &str) -> (String, Vec<String>) {
     (s, stripped_vars)
 }
 
+/// Normalize split short flags for `rm` commands so that `rm -r -v -f /`
+/// is treated identically to `rm -rvf /`.
+///
+/// Only applies when the first word token is `rm` (or `\rm` after backslash
+/// stripping by `normalize_segment`). All separate single-dash short-flag
+/// tokens (e.g. `-r`, `-v`, `-f`) are merged into one combined token placed
+/// immediately after `rm`.  Long flags (`--verbose`, etc.) and path/non-flag
+/// arguments are appended after the merged short flag in their original
+/// relative order.
+///
+/// Reordering long flags to the end ensures that the merged combined flag is
+/// adjacent to the path, which is required for the existing deny patterns to
+/// fire (they only allow `--` end-of-options between the combined flag and the
+/// path anchor).
+///
+/// Example: `rm -r -v -f /`           → `rm -rvf /`
+/// Example: `rm -f --verbose -r /tmp` → `rm -fr /tmp --verbose`
+fn normalize_rm_flags(cmd: &str) -> String {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    if tokens.is_empty() {
+        return cmd.to_string();
+    }
+    // Only apply to rm (or \rm which normalize_segment has already cleaned up).
+    let first = tokens[0].trim_start_matches('\\');
+    if !first.eq_ignore_ascii_case("rm") {
+        return cmd.to_string();
+    }
+
+    let mut merged_flags = String::new(); // accumulates short-flag letters
+    let mut long_flags: Vec<&str> = Vec::new(); // --long-flag tokens
+    let mut paths: Vec<&str> = Vec::new(); // non-flag path/argument tokens
+
+    for tok in tokens.iter().skip(1) {
+        if tok.starts_with("--") {
+            // Long flag (including bare `--` end-of-options)
+            long_flags.push(tok);
+        } else if tok.starts_with('-') && tok.len() > 1 {
+            let letters = &tok[1..];
+            if letters.chars().all(|c| c.is_ascii_alphabetic()) {
+                // Short-flag cluster: merge all its letters into merged_flags
+                merged_flags.push_str(letters);
+            } else {
+                // Mixed token (e.g. -9 for kill) — keep as-is
+                paths.push(tok);
+            }
+        } else {
+            paths.push(tok);
+        }
+    }
+
+    if merged_flags.is_empty() {
+        return cmd.to_string();
+    }
+
+    // Emit: rm -<merged> <paths...> <long-flags...>
+    // Placing paths before long flags ensures the combined flag is adjacent to
+    // the path so the existing deny patterns can match.
+    let mut result = tokens[0].to_string(); // "rm"
+    result.push(' ');
+    result.push('-');
+    result.push_str(&merged_flags);
+    for tok in &paths {
+        result.push(' ');
+        result.push_str(tok);
+    }
+    for tok in &long_flags {
+        result.push(' ');
+        result.push_str(tok);
+    }
+    result
+}
+
 // ─── PostToolUse breadcrumb ───────────────────────────────────────────────────
 // Written by PreToolUse when decision is "ask". Read and deleted by `clawband post`
 // (PostToolUse hook). If the command ran, PostToolUse fires and we know the user
@@ -4026,14 +4098,26 @@ fn check_command<'a>(
         // shell never executes — scanning it produces false-positive blocks.
         let segment: &str = strip_comment(segment.as_str());
         let (norm, stripped_vars) = normalize_segment(segment);
+        // Apply rm flag normalization so `rm -r -v -f /` matches the same deny
+        // patterns as `rm -rvf /` (issue #110).  Run on both the original segment
+        // and the normalize_segment output so modifier-prefixed forms like
+        // `command rm -r -v -f /` are also caught.
+        let rm_norm_seg = normalize_rm_flags(segment);
+        let rm_norm_norm = normalize_rm_flags(&norm);
         // Build list of forms to check: always try original; add normalized if different.
         // Checking both preserves backward compat for allow patterns while ensuring
         // future anchor-based deny patterns fire on normalized form too.
-        let forms: &[&str] = if norm != segment.trim() {
-            &[segment, norm.as_str()]
-        } else {
-            &[segment]
-        };
+        let mut forms_vec: Vec<&str> = vec![segment];
+        if norm != segment.trim() {
+            forms_vec.push(norm.as_str());
+        }
+        if rm_norm_seg != segment {
+            forms_vec.push(rm_norm_seg.as_str());
+        }
+        if rm_norm_norm != norm && rm_norm_norm != segment {
+            forms_vec.push(rm_norm_norm.as_str());
+        }
+        let forms: &[&str] = &forms_vec;
 
         // allow_pats suppress the ASK tier only — DENY tier always fires.
         // A segment is "allowed" when any of its forms matches an allow pattern.
@@ -8261,6 +8345,84 @@ mod tests {
             1,
             "segment count must be 1 after quote-aware split: got {:?}",
             segs
+        );
+    }
+
+    // ── issue #110: normalize_rm_flags ────────────────────────────────────────
+
+    #[test]
+    fn normalize_rm_flags_merges_split_flags() {
+        assert_eq!(normalize_rm_flags("rm -r -v -f /"), "rm -rvf /");
+    }
+
+    #[test]
+    fn normalize_rm_flags_merges_f_verbose_r() {
+        // -f and -r are merged; --verbose (long flag) is moved after the path
+        assert_eq!(
+            normalize_rm_flags("rm -f --verbose -r /tmp"),
+            "rm -fr /tmp --verbose"
+        );
+    }
+
+    #[test]
+    fn normalize_rm_flags_noop_when_already_combined() {
+        // Already-combined flags must pass through unchanged
+        assert_eq!(normalize_rm_flags("rm -rf /"), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_rm_flags_noop_for_non_rm() {
+        // Only rm commands are normalized
+        assert_eq!(normalize_rm_flags("ls -l -a /tmp"), "ls -l -a /tmp");
+    }
+
+    #[test]
+    fn rm_split_flags_r_v_f_is_deny() {
+        // rm -r -v -f / — -v is between -r and -f; must be denied
+        assert_eq!(
+            decision("rm -r -v -f /"),
+            Some("deny".into()),
+            "rm -r -v -f / must be denied"
+        );
+    }
+
+    #[test]
+    fn rm_split_flags_f_verbose_r_is_deny() {
+        // rm -f --verbose -r /tmp — long flag between -f and -r; must be denied
+        assert_eq!(
+            decision("rm -f --verbose -r /tmp"),
+            Some("deny".into()),
+            "rm -f --verbose -r /tmp must be denied"
+        );
+    }
+
+    #[test]
+    fn rm_split_flags_r_f_path_is_deny() {
+        // rm -r -f /important — simple two-token split; must be denied
+        assert_eq!(
+            decision("rm -r -f /important"),
+            Some("deny".into()),
+            "rm -r -f /important must be denied"
+        );
+    }
+
+    #[test]
+    fn rm_combined_still_deny() {
+        // Regression: combined rm -rf / must still be denied
+        assert_eq!(
+            decision("rm -rf /"),
+            Some("deny".into()),
+            "rm -rf / regression must still be denied"
+        );
+    }
+
+    #[test]
+    fn rm_r_only_not_deny() {
+        // rm -r /tmp/safe — no -f flag, so the rm-rf rule must not fire
+        assert_ne!(
+            decision("rm -r /tmp/safe"),
+            Some("deny".into()),
+            "rm -r /tmp/safe must not trigger rm-rf deny rule"
         );
     }
 }

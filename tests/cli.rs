@@ -1928,3 +1928,27 @@ fn e2e_python_c_semicolon() {
         "python3 -c with quoted semicolon must not be denied: {out}"
     );
 }
+
+// ── issue #110: split rm flags bypass ────────────────────────────────────────
+
+#[test]
+fn e2e_rm_split_r_v_f() {
+    // rm -r -v -f / — verbose flag interleaved between -r and -f; must deny
+    let out = run(&bash("rm -r -v -f /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -r -v -f / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_rm_split_f_verbose_r() {
+    // rm -f --verbose -r /tmp — long flag between -f and -r; must deny
+    let out = run(&bash("rm -f --verbose -r /tmp"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -f --verbose -r /tmp must be denied: {out}"
+    );
+}
