@@ -611,16 +611,21 @@ fn builtin_deny() -> Vec<Pattern> {
         // shred — irreversibly overwrites file contents (no recovery possible)
         ("shred", r"\bshred\b"),
         // find / xargs execution escalation
-        ("-exec rm", r"-exec\s+rm\b"),
-        ("-exec sh", r"-exec\s+sh\b"),
-        ("-exec bash", r"-exec\s+bash\b"),
-        ("-exec python", r"-exec\s+python\b"),
-        ("-exec zsh", r"-exec\s+zsh\b"),
-        ("xargs rm", r"\bxargs\s+rm\b"),
-        ("xargs sh", r"\bxargs\s+sh\b"),
-        ("xargs bash", r"\bxargs\s+bash\b"),
-        ("xargs python", r"\bxargs\s+python3?\b"),
-        ("xargs node", r"\bxargs\s+node\b"),
+        // -exec and -execdir: allow optional absolute path prefix before the command name
+        ("-exec rm", r"-exec(?:dir)?\s+(?:\S*/)?rm\b"),
+        ("-exec sh", r"-exec(?:dir)?\s+(?:\S*/)?sh\b"),
+        ("-exec bash", r"-exec(?:dir)?\s+(?:\S*/)?bash\b"),
+        ("-exec python", r"-exec(?:dir)?\s+(?:\S*/)?python\b"),
+        ("-exec zsh", r"-exec(?:dir)?\s+(?:\S*/)?zsh\b"),
+        // xargs: allow optional flags (e.g. -0, -I{}) between xargs and the command name
+        ("xargs rm", r"\bxargs\b(?:\s+-\S+)*\s+(?:\S*/)?rm\b"),
+        ("xargs sh", r"\bxargs\b(?:\s+-\S+)*\s+(?:\S*/)?sh\b"),
+        ("xargs bash", r"\bxargs\b(?:\s+-\S+)*\s+(?:\S*/)?bash\b"),
+        (
+            "xargs python",
+            r"\bxargs\b(?:\s+-\S+)*\s+(?:\S*/)?python3?\b",
+        ),
+        ("xargs node", r"\bxargs\b(?:\s+-\S+)*\s+(?:\S*/)?node\b"),
         // Pipe to interpreter — supply-chain attack vector.
         // Handles three bypass classes (issues #111, #112):
         //   1. Absolute path:      | /bin/bash, | /usr/bin/python3
@@ -8510,6 +8515,82 @@ mod tests {
             decision("kubectl get namespace prod"),
             Some("deny".into()),
             "kubectl get namespace prod must not be denied"
+        );
+    }
+
+    // ── issue #117: find -execdir, absolute-path exec, and xargs flags ────────
+
+    #[test]
+    fn find_execdir_rm_is_deny() {
+        assert_eq!(
+            decision("find . -execdir rm {} \\;"),
+            Some("deny".into()),
+            "find -execdir rm must be denied"
+        );
+    }
+
+    #[test]
+    fn find_exec_absolute_rm_is_deny() {
+        assert_eq!(
+            decision("find . -exec /bin/rm {} \\;"),
+            Some("deny".into()),
+            "find -exec /bin/rm must be denied"
+        );
+    }
+
+    #[test]
+    fn xargs_zero_flag_rm_is_deny() {
+        assert_eq!(
+            decision("ls | xargs -0 rm"),
+            Some("deny".into()),
+            "xargs -0 rm must be denied"
+        );
+    }
+
+    #[test]
+    fn xargs_replace_flag_rm_is_deny() {
+        assert_eq!(
+            decision("ls | xargs -I{} rm {}"),
+            Some("deny".into()),
+            "xargs -I{{}} rm must be denied"
+        );
+    }
+
+    #[test]
+    fn find_exec_rm_still_deny() {
+        // Regression: basic -exec rm must still be caught
+        assert_eq!(
+            decision("find . -exec rm {} \\;"),
+            Some("deny".into()),
+            "find -exec rm must still be denied"
+        );
+    }
+
+    #[test]
+    fn xargs_rm_still_deny() {
+        // Regression: plain xargs rm (no flags) must still be caught
+        assert_eq!(
+            decision("ls | xargs rm"),
+            Some("deny".into()),
+            "xargs rm must still be denied"
+        );
+    }
+
+    #[test]
+    fn find_exec_ls_not_deny() {
+        assert_ne!(
+            decision("find . -name \"*.log\" -exec ls {} \\;"),
+            Some("deny".into()),
+            "find -exec ls must not be denied"
+        );
+    }
+
+    #[test]
+    fn xargs_echo_not_deny() {
+        assert_ne!(
+            decision("ls | xargs echo"),
+            Some("deny".into()),
+            "xargs echo must not be denied"
         );
     }
 }

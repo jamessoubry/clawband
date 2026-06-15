@@ -1996,3 +1996,27 @@ fn e2e_kubectl_delete_namespaces() {
         "kubectl delete namespaces prod must be denied: {out}"
     );
 }
+
+// ── issue #117: find -execdir, absolute-path exec, and xargs flags ────────────
+
+#[test]
+fn e2e_find_execdir_rm() {
+    // find -execdir rm — must be denied (was previously missed)
+    let out = run(&bash("find . -execdir rm {} \\;"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "find -execdir rm must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_xargs_zero_flag_rm() {
+    // xargs -0 rm — -0 flag between xargs and rm must not bypass the pattern
+    let out = run(&bash("ls | xargs -0 rm"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "xargs -0 rm must be denied: {out}"
+    );
+}
