@@ -539,7 +539,7 @@ fn builtin_deny() -> Vec<Pattern> {
         // separator (e.g. rm -rf -- /), and quoted paths (rm -rf '/' or rm -rf "/").
         (
             "rm -rf /",
-            r#"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*(?:--\s+)?["']?/"#,
+            r#"\brm\s+(?:(?:-\S+)\s+)*(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*)\s*(?:--\s+)?["']?/(?:[*\s"']|$|etc\b|usr\b|bin\b|sbin\b|boot\b|lib\b|lib64\b|proc\b|sys\b|dev\b|root\b)"#,
         ),
         (
             "rm -rf ~",
@@ -4894,8 +4894,33 @@ mod tests {
 
     #[test]
     fn rm_literal_path_not_affected() {
-        // literal / path still triggers deny (existing pattern must be unaffected)
-        assert_eq!(decision("rm -rf /tmp/safe"), Some("deny".into()));
+        // absolute root and critical system paths still trigger deny
+        assert_eq!(decision("rm -rf /"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /*"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /etc"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /usr"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /bin"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /boot"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /lib"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /proc"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /sys"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /dev"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /root"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /root/.ssh"), Some("deny".into()));
+        assert_eq!(decision("rm -rf /etc/passwd"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_rf_absolute_noncritical_path_passes() {
+        // non-critical absolute paths should not be blocked (issue #164)
+        assert_eq!(decision("rm -rf /tmp/build"), None);
+        assert_eq!(decision("rm -rf /tmp/mydir"), None);
+        assert_eq!(decision("rm -rf /var/cache/myapp"), None);
+        assert_eq!(decision("rm -rf /home/user/project/dist"), None);
+        assert_eq!(decision("rm -rf /opt/app/node_modules"), None);
+        assert_eq!(decision("rm -rf /srv/data"), None);
+        assert_eq!(decision("rm -rf /run/myapp"), None);
+        assert_eq!(decision("rm -rf /mnt/backup"), None);
     }
 
     #[test]
@@ -5263,7 +5288,7 @@ mod tests {
     #[test]
     fn scan_script_with_deny_pattern_denies() {
         assert_eq!(
-            scan_content("deny", "sh", "#!/bin/bash\nrm -rf /home/user\n"),
+            scan_content("deny", "sh", "#!/bin/bash\nrm -rf /\n"),
             Some("deny".into())
         );
     }
@@ -7587,11 +7612,11 @@ mod tests {
     }
 
     // DENY: ssh + sh -c with rm -rf / payload — deny patterns fire before ask
-    // (rm -rf /tmp matches the "rm -rf /" deny pattern which covers all /-paths)
+    // (rm -rf /etc matches the "rm -rf /" deny pattern for critical system dirs)
     #[test]
     fn ssh_sh_c_rm_rf_denied() {
         assert_eq!(
-            decision("ssh root@192.168.1.1 sh -c 'rm -rf /tmp'"),
+            decision("ssh root@192.168.1.1 sh -c 'rm -rf /etc'"),
             Some("deny".into())
         );
     }
@@ -8048,7 +8073,7 @@ mod tests {
     fn backslash_newline_rm_rf_denied() {
         // Standard multi-line formatting must not bypass deny
         assert_eq!(
-            decision("rm -rf \\\n  /important"),
+            decision("rm -rf \\\n  /etc"),
             Some("deny".into()),
             "multi-line rm -rf must be denied"
         );
@@ -8477,21 +8502,21 @@ mod tests {
 
     #[test]
     fn rm_split_flags_f_verbose_r_is_deny() {
-        // rm -f --verbose -r /tmp — long flag between -f and -r; must be denied
+        // rm -f --verbose -r /etc — long flag between -f and -r; must be denied
         assert_eq!(
-            decision("rm -f --verbose -r /tmp"),
+            decision("rm -f --verbose -r /etc"),
             Some("deny".into()),
-            "rm -f --verbose -r /tmp must be denied"
+            "rm -f --verbose -r /etc must be denied"
         );
     }
 
     #[test]
     fn rm_split_flags_r_f_path_is_deny() {
-        // rm -r -f /important — simple two-token split; must be denied
+        // rm -r -f /usr — simple two-token split; must be denied
         assert_eq!(
-            decision("rm -r -f /important"),
+            decision("rm -r -f /usr"),
             Some("deny".into()),
-            "rm -r -f /important must be denied"
+            "rm -r -f /usr must be denied"
         );
     }
 
