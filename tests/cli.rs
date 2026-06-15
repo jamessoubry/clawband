@@ -1056,6 +1056,26 @@ fn e2e_fork_bomb_denied() {
     );
 }
 
+#[test]
+fn e2e_fork_bomb_named() {
+    let out = run(&bash("bomb(){ bomb|bomb& };bomb"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "named fork bomb (bomb) must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_fork_bomb_f() {
+    let out = run(&bash("f(){ f|f& };f"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "named fork bomb (f) must be denied: {out}"
+    );
+}
+
 // ── base64 false positive fix (issue #83) / deny promotion (issue #84) ───────
 
 #[test]
