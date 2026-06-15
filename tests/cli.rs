@@ -2120,6 +2120,111 @@ fn e2e_ipv6_imds_asks() {
     );
 }
 
+// ── issue #119: protect.paths template covers additional shell init files ─────
+
+/// Seed a temp HOME with shell-init protect patterns (using ~/ so expand_home
+/// substitutes the actual temp HOME at load time — no regex-escaping needed).
+fn home_with_shell_init_protect() -> std::path::PathBuf {
+    use std::fs;
+    // Use only process ID (no thread ID) so the path contains no regex metacharacters.
+    let home = std::env::temp_dir().join(format!("cb_p119_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    // Patterns mirror the PROTECT_PATHS_TEMPLATE shell-init section.
+    // Using ~/  ensures expand_home() substitutes the test HOME at load time.
+    let protect = "~/\\.(bash_profile|bash_login|bash_aliases|bashrc|profile|\
+                   zshrc|zprofile|zshenv|zlogin|zlogout)$\n\
+                   ~/.config/fish/config\\.fish$\n\
+                   ~/.bashrc\\.d/\n";
+    fs::write(home.join(".clawband/protect.paths"), protect).unwrap();
+    home
+}
+
+fn write_to(file_path: &str) -> String {
+    format!(
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":{:?},"content":"export CLAWBAND_SKIP=1\n"}}}}"#,
+        file_path
+    )
+}
+
+#[test]
+fn e2e_protect_bash_aliases_denied() {
+    let home = home_with_shell_init_protect();
+    let h = home.to_str().unwrap();
+    let out = run(&write_to("~/.bash_aliases"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Write to ~/.bash_aliases must be denied when protect.paths active: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_protect_bash_login_denied() {
+    let home = home_with_shell_init_protect();
+    let h = home.to_str().unwrap();
+    let out = run(&write_to("~/.bash_login"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Write to ~/.bash_login must be denied when protect.paths active: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_protect_zlogin_denied() {
+    let home = home_with_shell_init_protect();
+    let h = home.to_str().unwrap();
+    let out = run(&write_to("~/.zlogin"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Write to ~/.zlogin must be denied when protect.paths active: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_protect_zlogout_denied() {
+    let home = home_with_shell_init_protect();
+    let h = home.to_str().unwrap();
+    let out = run(&write_to("~/.zlogout"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Write to ~/.zlogout must be denied when protect.paths active: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_protect_fish_config_denied() {
+    let home = home_with_shell_init_protect();
+    let h = home.to_str().unwrap();
+    let out = run(&write_to("~/.config/fish/config.fish"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Write to ~/.config/fish/config.fish must be denied when protect.paths active: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_protect_bashrc_d_denied() {
+    let home = home_with_shell_init_protect();
+    let h = home.to_str().unwrap();
+    let out = run(&write_to("~/.bashrc.d/skip.sh"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Write to ~/.bashrc.d/skip.sh must be denied when protect.paths active: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ── issue #117: find -execdir, absolute-path exec, and xargs flags ────────────
 
 #[test]
