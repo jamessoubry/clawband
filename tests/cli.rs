@@ -2368,3 +2368,85 @@ fn e2e_truncate_nonzero_passes() {
         "truncate -s 100 (non-zero) must not be denied: {out}"
     );
 }
+
+// ── issue #124: long-form git flag equivalents ────────────────────────────────
+
+#[test]
+fn e2e_git_reset_keep_asks() {
+    let out = run(&bash("git reset --keep HEAD~1"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git reset --keep must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_reset_merge_asks() {
+    let out = run(&bash("git reset --merge HEAD~1"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git reset --merge must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_clean_longform_force_asks() {
+    let out = run(&bash("git clean --force"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git clean --force must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_branch_delete_force_asks() {
+    let out = run(&bash("git branch --delete --force main"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git branch --delete --force must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_branch_force_delete_asks() {
+    let out = run(&bash("git branch --force --delete main"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git branch --force --delete must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_reset_soft_passes() {
+    let out = run(&bash("git reset --soft HEAD~1"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "git reset --soft must not be blocked: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_clean_dry_run_passes() {
+    let out = run(&bash("git clean -n"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "git clean -n (dry-run) must not be blocked: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_branch_delete_only_passes() {
+    let out = run(&bash("git branch --delete main"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "git branch --delete (without --force) must not be blocked: {out}"
+    );
+}
