@@ -739,11 +739,16 @@ fn builtin_deny() -> Vec<Pattern> {
         ),
         // ── killall5 — kills all processes (used in shutdown sequences) ──────
         ("killall5 (kills all processes)", r"\bkillall5\b"),
-        // ── fork bomb — :(){ :|:& };: exhausts all process slots ─────────────
-        // The colon-as-function-name `:(){ ` and the recursive pipe-to-self
-        // `:|:&` are nearly unique to this attack; neither appears in legitimate
-        // shell scripts.
-        ("fork bomb", r":\(\)\s*\{|:\|:&"),
+        // ── fork bomb — structural pattern catches any function name ──────────
+        // Matches the defining characteristic: a shell function whose body
+        // contains a pipe into a backgrounded process (`| word &`).
+        // Uses [\w:]+ so the colon-named canonical form :(){ :|:& } is also caught.
+        // Catches: `:(){ :|:& };:`, `bomb(){ bomb|bomb& };bomb`, `f(){ f|f& };f`
+        // Does NOT match: `foo(){ echo hello | cat; }` (no background `&`)
+        (
+            "fork bomb (recursive function with pipe and background)",
+            r"[\w:]+\(\)\s*\{[^}]*\|[^}]*[\w:]+\s*&",
+        ),
         // base64 decode piped to interpreter — canonical obfuscation/RCE vector
         // independent deny so allow.patterns for plain base64 decode can't bypass it
         (
@@ -7331,11 +7336,11 @@ mod tests {
         assert!(reason("pkill python").contains("Safe alternative:"));
     }
 
-    // ── fork bomb (issue #23) ─────────────────────────────────────────────────
+    // ── fork bomb (issue #23, extended in issue #115) ────────────────────────
 
     // DENY: canonical fork bomb
     #[test]
-    fn fork_bomb_canonical_denied() {
+    fn fork_bomb_canonical_still_deny() {
         assert_eq!(decision(":(){ :|:& };:"), Some("deny".into()));
     }
 
@@ -7345,10 +7350,31 @@ mod tests {
         assert_eq!(decision(":(){ :|:& }"), Some("deny".into()));
     }
 
-    // DENY: recursive body alone
+    // DENY: named fork bomb — bomb
     #[test]
-    fn fork_bomb_body_alone_denied() {
-        assert_eq!(decision(":|:&"), Some("deny".into()));
+    fn fork_bomb_named_bomb_is_deny() {
+        assert_eq!(decision("bomb(){ bomb|bomb& };bomb"), Some("deny".into()));
+    }
+
+    // DENY: named fork bomb — f
+    #[test]
+    fn fork_bomb_named_f_is_deny() {
+        assert_eq!(decision("f(){ f|f& };f"), Some("deny".into()));
+    }
+
+    // DENY: named fork bomb with spaces
+    #[test]
+    fn fork_bomb_spaces_variant_is_deny() {
+        assert_eq!(
+            decision("bomb() { bomb | bomb & }; bomb"),
+            Some("deny".into())
+        );
+    }
+
+    // PASS: legitimate function with pipe but no background
+    #[test]
+    fn legitimate_function_with_pipe_not_deny() {
+        assert_eq!(decision("foo(){ echo hello | cat; }"), None);
     }
 
     // PASS: normal function definition with non-colon name
