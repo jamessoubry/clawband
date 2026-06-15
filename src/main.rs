@@ -572,7 +572,7 @@ fn builtin_deny() -> Vec<Pattern> {
             r">\s*/dev/(sd|hd|nvme|vd|xvd|mmcblk|loop|dm)[a-z0-9]",
         ),
         // Silent file truncation
-        ("truncate -s 0", r"\btruncate\b.*-s\s+0\b"),
+        ("truncate -s 0", r"\btruncate\b.*(?:-s\s*0\b|--size[= ]0\b)"),
         // Infrastructure destruction
         ("terraform destroy", r"\bterraform\s+destroy\b"),
         ("terragrunt destroy", r"\bterragrunt\s+destroy\b"),
@@ -8727,6 +8727,62 @@ mod tests {
             decision("ls | xargs echo"),
             Some("deny".into()),
             "xargs echo must not be denied"
+        );
+    }
+
+    // ── issue #122: truncate zero-size forms ──────────────────────────────────
+
+    #[test]
+    fn truncate_s_space_0_denied() {
+        assert_eq!(
+            decision("truncate -s 0 file.txt"),
+            Some("deny".into()),
+            "truncate -s 0 must be denied"
+        );
+    }
+
+    #[test]
+    fn truncate_s0_nospace_denied() {
+        assert_eq!(
+            decision("truncate -s0 file.txt"),
+            Some("deny".into()),
+            "truncate -s0 (no space) must be denied"
+        );
+    }
+
+    #[test]
+    fn truncate_size_space_0_denied() {
+        assert_eq!(
+            decision("truncate --size 0 file.txt"),
+            Some("deny".into()),
+            "truncate --size 0 must be denied"
+        );
+    }
+
+    #[test]
+    fn truncate_size_equals_0_denied() {
+        assert_eq!(
+            decision("truncate --size=0 file.txt"),
+            Some("deny".into()),
+            "truncate --size=0 must be denied"
+        );
+    }
+
+    #[test]
+    fn truncate_s_100_passes() {
+        assert_ne!(
+            decision("truncate -s 100 file.txt"),
+            Some("deny".into()),
+            "truncate -s 100 (non-zero) must not be denied"
+        );
+    }
+
+    #[test]
+    fn truncate_size_1024_passes() {
+        assert_ne!(
+            decision("truncate --size 1024 file.txt"),
+            Some("deny".into()),
+            "truncate --size 1024 (non-zero) must not be denied"
         );
     }
 }
