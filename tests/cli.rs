@@ -1952,3 +1952,27 @@ fn e2e_rm_split_f_verbose_r() {
         "rm -f --verbose -r /tmp must be denied: {out}"
     );
 }
+
+// ── issue #114: kubectl delete ns/namespaces and flag-prefixed forms ──────────
+
+#[test]
+fn e2e_kubectl_delete_ns() {
+    // kubectl delete ns prod — ns is the official short alias for namespace
+    let out = run(&bash("kubectl delete ns prod"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "kubectl delete ns prod must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_kubectl_delete_namespaces() {
+    // kubectl delete namespaces prod — plural form must be denied
+    let out = run(&bash("kubectl delete namespaces prod"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "kubectl delete namespaces prod must be denied: {out}"
+    );
+}

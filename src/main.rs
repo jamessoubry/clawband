@@ -495,7 +495,8 @@ fn suggestion_for(label: &str) -> Option<&'static str> {
         "terraform destroy" | "terragrunt destroy" => {
             "Target specific resources with -target=resource.name instead of destroying everything."
         }
-        "kubectl delete namespace" | "kubectl delete --all" => {
+        "kubectl delete namespace" | "kubectl delete namespaces" | "kubectl delete ns"
+        | "kubectl delete --all" => {
             "Deletion cascades to every resource in scope — double-check the target."
         }
         "git reset --hard" => {
@@ -577,7 +578,7 @@ fn builtin_deny() -> Vec<Pattern> {
         ("terragrunt destroy", r"\bterragrunt\s+destroy\b"),
         (
             "kubectl delete namespace",
-            r"\bkubectl\s+delete\s+namespace\b",
+            r"\bkubectl\b.*\bdelete\b\s+(?:namespace|namespaces|ns)\b",
         ),
         ("kubectl delete --all", r"\bkubectl\s+delete\s+--all\b"),
         // AWS destructive ops
@@ -8423,6 +8424,66 @@ mod tests {
             decision("rm -r /tmp/safe"),
             Some("deny".into()),
             "rm -r /tmp/safe must not trigger rm-rf deny rule"
+        );
+    }
+
+    #[test]
+    fn kubectl_delete_ns_alias_is_deny() {
+        // kubectl delete ns prod — ns is the official short alias for namespace
+        assert_eq!(
+            decision("kubectl delete ns prod"),
+            Some("deny".into()),
+            "kubectl delete ns prod must be denied"
+        );
+    }
+
+    #[test]
+    fn kubectl_delete_namespaces_plural_is_deny() {
+        // kubectl delete namespaces prod — plural form must be denied
+        assert_eq!(
+            decision("kubectl delete namespaces prod"),
+            Some("deny".into()),
+            "kubectl delete namespaces prod must be denied"
+        );
+    }
+
+    #[test]
+    fn kubectl_flags_before_delete_is_deny() {
+        // kubectl -n x delete namespace prod — flags between kubectl and delete must be caught
+        assert_eq!(
+            decision("kubectl -n x delete namespace prod"),
+            Some("deny".into()),
+            "kubectl -n x delete namespace prod must be denied"
+        );
+    }
+
+    #[test]
+    fn kubectl_delete_namespace_still_deny() {
+        // Regression: original form must still be denied
+        assert_eq!(
+            decision("kubectl delete namespace prod"),
+            Some("deny".into()),
+            "kubectl delete namespace prod regression must still be denied"
+        );
+    }
+
+    #[test]
+    fn kubectl_delete_pod_not_deny() {
+        // kubectl delete pod mypod — deleting a pod is not in scope of this rule
+        assert_ne!(
+            decision("kubectl delete pod mypod"),
+            Some("deny".into()),
+            "kubectl delete pod mypod must not trigger namespace deny rule"
+        );
+    }
+
+    #[test]
+    fn kubectl_get_namespace_not_deny() {
+        // kubectl get namespace prod — read-only, must not be denied
+        assert_ne!(
+            decision("kubectl get namespace prod"),
+            Some("deny".into()),
+            "kubectl get namespace prod must not be denied"
         );
     }
 }
