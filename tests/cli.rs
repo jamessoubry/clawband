@@ -964,6 +964,63 @@ fn e2e_rm_rf_relative_subdir_passes() {
     assert_eq!(decision(&out), None, "rm -rf ./dist must pass: {out}");
 }
 
+// issue #164: rm -rf / pattern was too broad — fired on ANY absolute path
+#[test]
+fn e2e_rm_rf_root_and_system_dirs_still_deny() {
+    // bare root
+    let out = run(&bash("rm -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -rf / must be denied: {out}"
+    );
+    // glob root
+    let out = run(&bash("rm -rf /*"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -rf /* must be denied: {out}"
+    );
+    // critical system directories
+    let out = run(&bash("rm -rf /etc"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -rf /etc must be denied: {out}"
+    );
+    let out = run(&bash("rm -rf /usr"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "rm -rf /usr must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_rm_rf_noncritical_absolute_path_passes() {
+    // non-critical absolute paths must now pass (issue #164)
+    let out = run(&bash("rm -rf /tmp/build"), &[]);
+    assert_eq!(decision(&out), None, "rm -rf /tmp/build must pass: {out}");
+    let out = run(&bash("rm -rf /var/cache/myapp"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "rm -rf /var/cache/myapp must pass: {out}"
+    );
+    let out = run(&bash("rm -rf /home/user/project/dist"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "rm -rf /home/user/project/dist must pass: {out}"
+    );
+    let out = run(&bash("rm -rf /opt/app/node_modules"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "rm -rf /opt/app/node_modules must pass: {out}"
+    );
+}
+
 // eval ask-pattern: subshell-only idioms must not be blocked (#67).
 // They match builtin_allow() so the binary emits an explicit "allow" response.
 #[test]
@@ -1180,12 +1237,16 @@ fn e2e_var_script_dangerous_content_denies() {
 
 #[test]
 fn e2e_backslash_rm_denied() {
-    let out = run(&bash(r"\rm -rf /tmp"), &[]);
+    // \rm with a critical system path must still be denied
+    let out = run(&bash(r"\rm -rf /etc"), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
-        r"\rm must still be denied: {out}"
+        r"\rm -rf /etc must still be denied: {out}"
     );
+    // \rm with a non-critical absolute path now passes (issue #164)
+    let out = run(&bash(r"\rm -rf /tmp"), &[]);
+    assert_eq!(decision(&out), None, r"\rm -rf /tmp must now pass: {out}");
 }
 
 #[test]
@@ -1531,7 +1592,7 @@ fn e2e_bash_no_flags_evil_script_denied() {
 #[test]
 fn e2e_backslash_newline_rm_rf_denied() {
     // Multi-line `rm -rf` (standard shell line-continuation format) must be denied
-    let out = run(&bash("rm -rf \\\n  /important"), &[]);
+    let out = run(&bash("rm -rf \\\n  /etc"), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
@@ -1964,12 +2025,12 @@ fn e2e_rm_split_r_v_f() {
 
 #[test]
 fn e2e_rm_split_f_verbose_r() {
-    // rm -f --verbose -r /tmp — long flag between -f and -r; must deny
-    let out = run(&bash("rm -f --verbose -r /tmp"), &[]);
+    // rm -f --verbose -r /etc — long flag between -f and -r; must deny (critical system dir)
+    let out = run(&bash("rm -f --verbose -r /etc"), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
-        "rm -f --verbose -r /tmp must be denied: {out}"
+        "rm -f --verbose -r /etc must be denied: {out}"
     );
 }
 
