@@ -589,6 +589,10 @@ fn builtin_deny() -> Vec<Pattern> {
         ("aws eks delete-cluster", r"\baws\s+eks\s+delete-cluster\b"),
         ("aws iam delete-role", r"\baws\s+iam\s+delete-role\b"),
         ("aws s3 rb", r"\baws\s+s3\s+rb(\s|$)"),
+        (
+            "aws s3api delete-bucket",
+            r"\baws\s+s3api\s+delete-bucket\b",
+        ),
         ("aws s3 rm --recursive", r"\baws\s+s3\s+rm\b.*--recursive\b"),
         (
             "aws dynamodb delete-table",
@@ -604,6 +608,10 @@ fn builtin_deny() -> Vec<Pattern> {
         ),
         // Database destruction
         ("dropdb", r"\bdropdb\b"),
+        (
+            "psql -c DROP",
+            r#"\bpsql\b.*\s-c\s+['"]?\s*DROP\s+(DATABASE|TABLE|SCHEMA|USER)\b"#,
+        ),
         // Docker destructive ops
         ("docker system prune", r"\bdocker\s+system\s+prune\b"),
         // find -delete (anchored; avoids matching --delete-protection flags)
@@ -6449,6 +6457,76 @@ mod tests {
     #[test]
     fn rsync_src_deploy_passes() {
         assert_eq!(decision("rsync -av ./src user@host:/deploy/"), None);
+    }
+
+    // ── aws s3api delete-bucket and psql -c DROP (issue #123) ────────────────
+
+    #[test]
+    fn aws_s3api_delete_bucket_denied() {
+        assert_eq!(
+            decision("aws s3api delete-bucket --bucket mybucket"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn aws_s3api_delete_bucket_with_region_denied() {
+        assert_eq!(
+            decision("aws s3api delete-bucket --bucket mybucket --region us-east-1"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn aws_s3api_get_object_passes() {
+        assert_eq!(
+            decision("aws s3api get-object --bucket b --key k /tmp/out"),
+            None
+        );
+    }
+
+    #[test]
+    fn aws_s3api_list_objects_passes() {
+        assert_eq!(decision("aws s3api list-objects --bucket mybucket"), None);
+    }
+
+    #[test]
+    fn psql_c_drop_database_denied() {
+        assert_eq!(
+            decision("psql -c 'DROP DATABASE mydb'"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn psql_c_drop_table_denied() {
+        assert_eq!(
+            decision("psql -c \"DROP TABLE users\""),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn psql_c_drop_schema_denied() {
+        assert_eq!(
+            decision("psql -c 'DROP SCHEMA public'"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn psql_c_drop_user_denied() {
+        assert_eq!(decision("psql -c 'DROP USER alice'"), Some("deny".into()));
+    }
+
+    #[test]
+    fn psql_c_select_passes() {
+        assert_eq!(decision("psql -c 'SELECT 1'"), None);
+    }
+
+    #[test]
+    fn psql_c_create_table_passes() {
+        assert_eq!(decision("psql -c 'CREATE TABLE foo(id int)'"), None);
     }
 
     // ── D. source / dot-source scanning (issue #33) ───────────────────────────

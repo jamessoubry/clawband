@@ -1097,6 +1097,80 @@ fn e2e_aws_s3_cp_dist_passes() {
     );
 }
 
+// ── aws s3api delete-bucket and psql -c DROP (issue #123) ────────────────
+
+#[test]
+fn e2e_aws_s3api_delete_bucket_denied() {
+    let out = run(&bash("aws s3api delete-bucket --bucket mybucket"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "aws s3api delete-bucket must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_aws_s3api_delete_bucket_with_region_denied() {
+    let out = run(
+        &bash("aws s3api delete-bucket --bucket mybucket --region us-east-1"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "aws s3api delete-bucket with region must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_aws_s3api_get_object_passes() {
+    let out = run(
+        &bash("aws s3api get-object --bucket b --key k /tmp/out"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        "aws s3api get-object must pass: {out}"
+    );
+}
+
+#[test]
+fn e2e_psql_c_drop_database_denied() {
+    let out = run(&bash("psql -c 'DROP DATABASE mydb'"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "psql -c DROP DATABASE must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_psql_c_drop_table_denied() {
+    let out = run(&bash("psql -c \"DROP TABLE users\""), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "psql -c DROP TABLE must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_psql_c_select_passes() {
+    let out = run(&bash("psql -c 'SELECT 1'"), &[]);
+    assert_eq!(decision(&out), None, "psql -c SELECT must pass: {out}");
+}
+
+#[test]
+fn e2e_psql_c_create_table_passes() {
+    let out = run(&bash("psql -c 'CREATE TABLE foo(id int)'"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "psql -c CREATE TABLE must pass: {out}"
+    );
+}
+
 #[test]
 fn e2e_shred_denies() {
     let out = run(&bash("shred secret.txt"), &[]);
