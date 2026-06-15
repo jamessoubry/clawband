@@ -1431,6 +1431,85 @@ fn strip_safe_pipes(cmd: &str) -> String {
 // Single | is NOT a splitter — keeps pipe-to-interpreter in one segment.
 // \; and \| are escaped before splitting so find -exec and regex patterns survive.
 
+/// Mask separator characters that appear inside quoted regions so that
+/// `split_segments` does not treat them as compound-command delimiters.
+///
+/// Specifically, the characters `;`, `|`, `&`, and `\n` inside `"..."` or
+/// `'...'` are replaced by private-use sentinel bytes (`\x02S`, `\x02P`,
+/// `\x02A`, `\x02N` respectively).  The rest of the string — including the
+/// surrounding quote characters — is left unchanged so that deny/ask patterns
+/// still match content like `rm -rf '/'` or `python3 -c "os.system(...)"`.
+///
+/// The caller (split_segments) only needs to avoid splitting at those positions;
+/// it never needs to restore them because the segments are consumed by the
+/// regex pattern matcher, not executed.
+///
+/// Handles:
+/// - `\"` (escaped double-quote inside `"..."`)
+/// - The other quote type is treated as a literal character inside a quoted region
+///
+/// Known limitations (acceptable per issue #108):
+/// - `$'...'` ANSI-C quoting is not handled (treated as bare `'...'`)
+/// - Heredocs are not masked
+fn mask_quoted_separators(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut in_double = false;
+    let mut in_single = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            match b {
+                b'\'' => {
+                    in_single = false;
+                    out.push('\'');
+                }
+                b';' => out.push('\x02'),  // masked semicolon
+                b'|' => out.push('\x03'),  // masked pipe
+                b'&' => out.push('\x04'),  // masked ampersand
+                b'\n' => out.push('\x05'), // masked newline
+                _ => out.push(b as char),
+            }
+        } else if in_double {
+            match b {
+                b'\\' if i + 1 < bytes.len() => {
+                    // Inside double-quotes, `\"` is an escaped quote — emit both
+                    // chars literally and advance past the escaped char.
+                    out.push(b as char);
+                    out.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                b'"' => {
+                    in_double = false;
+                    out.push('"');
+                }
+                b';' => out.push('\x02'),  // masked semicolon
+                b'|' => out.push('\x03'),  // masked pipe
+                b'&' => out.push('\x04'),  // masked ampersand
+                b'\n' => out.push('\x05'), // masked newline
+                _ => out.push(b as char),
+            }
+        } else {
+            match b {
+                b'"' => {
+                    in_double = true;
+                    out.push('"');
+                }
+                b'\'' => {
+                    in_single = true;
+                    out.push('\'');
+                }
+                _ => out.push(b as char),
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn split_segments(cmd: &str) -> Vec<String> {
     const ESC_SEMI: &str = "\x01S\x01";
     const ESC_PIPE: &str = "\x01P\x01";
@@ -1443,6 +1522,10 @@ fn split_segments(cmd: &str) -> Vec<String> {
     let cmd = cont.replace_all(cmd, " ");
 
     let s = cmd.replace("\\;", ESC_SEMI).replace("\\|", ESC_PIPE);
+
+    // Mask separator characters inside "..." and '...' so they don't split
+    // the command into phantom segments (issue #108).
+    let s = mask_quoted_separators(&s);
 
     let splitter = Regex::new(r"[ \t]*(\|\||&&|;|\n)[ \t]*").unwrap();
     let s = splitter.replace_all(&s, SEP);
@@ -8086,6 +8169,98 @@ mod tests {
         assert_eq!(
             suggestion_for("redirect to subshell path"),
             Some("Expand the subshell first and verify the target path before redirecting.")
+        );
+    }
+
+    // ── issue #108: split_segments quote-awareness ────────────────────────────
+
+    #[test]
+    fn quoted_semicolon_splits_to_one_segment() {
+        // Before the fix, `echo "hello; world"` produced TWO segments:
+        // ["echo \"hello", "world\""] — a phantom split on the `;`.
+        // After the fix it must produce exactly ONE segment.
+        let segs = split_segments(r#"echo "hello; world""#);
+        assert_eq!(
+            segs.len(),
+            1,
+            "semicolon inside double-quotes must not split: got {:?}",
+            segs
+        );
+    }
+
+    #[test]
+    fn quoted_and_and_splits_to_one_segment() {
+        // `&&` inside a commit message must not be treated as a compound separator.
+        let segs = split_segments(r#"git commit -m "fix: handle edge case && update docs""#);
+        assert_eq!(
+            segs.len(),
+            1,
+            "double-amp inside double-quotes must not split: got {:?}",
+            segs
+        );
+    }
+
+    #[test]
+    fn quoted_or_splits_to_one_segment() {
+        // `||` inside a double-quoted string must not split.
+        let segs = split_segments(r#"echo "run: cmd1 || cmd2""#);
+        assert_eq!(
+            segs.len(),
+            1,
+            "double-pipe inside double-quotes must not split: got {:?}",
+            segs
+        );
+    }
+
+    #[test]
+    fn python_c_semicolon_no_false_positive() {
+        // `python3 -c "import sys; sys.exit(1)"` — the semicolon is inside the
+        // inline Python script string and must not produce a phantom segment.
+        let segs = split_segments(r#"python3 -c "import sys; sys.exit(1)""#);
+        assert_eq!(
+            segs.len(),
+            1,
+            "semicolon inside python3 -c string must not split: got {:?}",
+            segs
+        );
+    }
+
+    #[test]
+    fn real_compound_still_blocked() {
+        // A genuine compound command (separator outside quotes) must still be caught.
+        assert_eq!(
+            decision("echo hello; rm -rf /"),
+            Some("deny".into()),
+            "real compound command with deny segment must still be denied"
+        );
+    }
+
+    #[test]
+    fn single_quoted_semicolon_no_false_positive() {
+        // Single-quoted string — the `;` is literal, not a separator.
+        let segs = split_segments("echo 'hello; world'");
+        assert_eq!(
+            segs.len(),
+            1,
+            "semicolon inside single-quotes must not split: got {:?}",
+            segs
+        );
+    }
+
+    #[test]
+    fn quoted_semicolon_no_false_positive() {
+        // `echo "hello; git branch -D foo"` — the git branch -D command is inside
+        // a quoted string argument to echo. Before the fix, split_segments created
+        // a phantom segment `git branch -D foo"` from the `;` split, which triggered
+        // an ask. After the fix, only one segment is produced and the full command
+        // `echo "hello; git branch -D foo"` does not match the `git branch -D` ask
+        // pattern in isolation (it appears in a quoted context within echo).
+        let segs = split_segments(r#"echo "hello; git branch -D foo""#);
+        assert_eq!(
+            segs.len(),
+            1,
+            "segment count must be 1 after quote-aware split: got {:?}",
+            segs
         );
     }
 }
