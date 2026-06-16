@@ -815,6 +815,10 @@ fn builtin_ask() -> Vec<Pattern> {
         // npx/npm exec — downloads and executes arbitrary npm packages
         ("npx", r"\bnpx\s"),
         ("npm exec", r"\bnpm\s+exec\b"),
+        // pnpm dlx / yarn dlx / bunx — equivalent download-and-execute vectors
+        ("pnpm dlx", r"\bpnpm\s+dlx\b"),
+        ("yarn dlx", r"\byarn\s+dlx\b"),
+        ("bunx", r"\bbunx\b"),
         // git push :<branch> — colon-prefix syntax for remote branch deletion
         ("git push :<branch>", r"\bgit\s+push\b.*\s:\S"),
         // Obfuscation / anti-inspection vectors — decoding content before execution
@@ -5102,6 +5106,41 @@ mod tests {
     #[test]
     fn npm_exec_asks() {
         assert_eq!(decision("npm exec -- dangerous-cmd"), Some("ask".into()));
+    }
+
+    #[test]
+    fn pnpm_dlx_asks() {
+        assert_eq!(decision("pnpm dlx create-react-app ."), Some("ask".into()));
+    }
+
+    #[test]
+    fn yarn_dlx_asks() {
+        assert_eq!(decision("yarn dlx serve"), Some("ask".into()));
+    }
+
+    #[test]
+    fn bunx_asks() {
+        assert_eq!(decision("bunx prisma migrate"), Some("ask".into()));
+    }
+
+    #[test]
+    fn pnpm_install_passes() {
+        assert_eq!(decision("pnpm install"), None);
+    }
+
+    #[test]
+    fn yarn_add_passes() {
+        assert_eq!(decision("yarn add react"), None);
+    }
+
+    #[test]
+    fn bun_install_passes() {
+        assert_eq!(decision("bun install"), None);
+    }
+
+    #[test]
+    fn bun_run_passes() {
+        assert_eq!(decision("bun run build"), None);
     }
 
     #[test]
