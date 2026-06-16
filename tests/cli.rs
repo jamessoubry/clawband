@@ -2450,3 +2450,41 @@ fn e2e_git_branch_delete_only_passes() {
         "git branch --delete (without --force) must not be blocked: {out}"
     );
 }
+
+#[test]
+fn e2e_pnpm_dlx_asks() {
+    let out = run(&bash("pnpm dlx create-react-app ."), &[]);
+    assert_eq!(decision(&out), Some("ask"), "pnpm dlx must ask: {out}");
+}
+
+#[test]
+fn e2e_yarn_dlx_asks() {
+    let out = run(&bash("yarn dlx serve"), &[]);
+    assert_eq!(decision(&out), Some("ask"), "yarn dlx must ask: {out}");
+}
+
+#[test]
+fn e2e_bunx_asks() {
+    let out = run(&bash("bunx prisma migrate"), &[]);
+    assert_eq!(decision(&out), Some("ask"), "bunx must ask: {out}");
+}
+
+#[test]
+fn e2e_pnpm_install_passes() {
+    let out = run(&bash("pnpm install"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "pnpm install must not be blocked: {out}"
+    );
+}
+
+#[test]
+fn e2e_bun_install_passes() {
+    let out = run(&bash("bun install"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "bun install must not be blocked: {out}"
+    );
+}
