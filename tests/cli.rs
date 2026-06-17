@@ -1858,10 +1858,11 @@ fn e2e_project_allow_trusted_is_loaded() {
 }
 
 // ── issue #134: breadcrumb misattribution ─────────────────────────────────────
+// ── issue #135: per-call-id breadcrumb keying ─────────────────────────────────
 
 /// Run the binary with the "post" subcommand and a PostToolUse JSON payload on stdin.
-/// `crumb_home` is the HOME directory whose `.clawband/.last-ask` file has been
-/// pre-written by the test to simulate what PreToolUse would have written.
+/// `crumb_home` is the HOME directory whose `.clawband/.ask-{tool_use_id}` file has
+/// been pre-written by the test to simulate what PreToolUse would have written.
 fn post(post_json: &str, home: &str) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_clawband"));
     cmd.arg("post");
@@ -1881,9 +1882,10 @@ fn post(post_json: &str, home: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Write a breadcrumb file in the format that the fixed `write_ask_breadcrumb(cmd, reason)`
-/// produces: `<ts>\n<cmd>\n<reason>`.
-fn write_crumb(home_dir: &std::path::Path, cmd: &str, reason: &str) {
+/// Write a breadcrumb file keyed by `call_id` (the `tool_use_id` value).
+/// Produces `<ts>\n<cmd>\n<reason>` at `.clawband/.ask-{call_id}`.
+/// If `call_id` is empty the file is named `.ask-unknown` (matches binary behaviour).
+fn write_crumb(home_dir: &std::path::Path, call_id: &str, cmd: &str, reason: &str) {
     use std::fs;
     let cfg = home_dir.join(".clawband");
     fs::create_dir_all(&cfg).unwrap();
@@ -1891,8 +1893,13 @@ fn write_crumb(home_dir: &std::path::Path, cmd: &str, reason: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let id = if call_id.is_empty() {
+        "unknown"
+    } else {
+        call_id
+    };
     fs::write(
-        cfg.join(".last-ask"),
+        cfg.join(format!(".ask-{}", id)),
         format!("{}\n{}\n{}", ts, cmd, reason),
     )
     .unwrap();
@@ -1908,7 +1915,8 @@ fn e2e_post_no_crumb_is_silent() {
     fs::create_dir_all(&home).unwrap();
     let h = home.to_str().unwrap();
 
-    let json = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    let json =
+        r#"{"tool_use_id":"toolu_nocrumb","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
     let out = post(json, h);
     assert!(
         out.is_empty(),
@@ -1930,11 +1938,13 @@ fn e2e_post_mismatched_command_is_silent() {
 
     write_crumb(
         &home,
+        "toolu_mismatch01",
         "git reset --hard HEAD~1",
         "[CLAWBAND] git reset --hard — destructive; run `clawband allow 'git reset --hard'` to stop prompts.",
     );
 
-    let json = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    let json =
+        r#"{"tool_use_id":"toolu_mismatch01","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
     let out = post(json, home.to_str().unwrap());
     assert!(
         out.is_empty(),
@@ -1956,15 +1966,45 @@ fn e2e_post_matching_command_suggests_allow() {
     // Use a reason string that contains the " allow '" marker cmd_post looks for.
     write_crumb(
         &home,
+        "toolu_match01",
         "git reset --hard HEAD~1",
         "[CLAWBAND] git reset --hard is destructive.\n! clawband allow 'git reset --hard'\n",
     );
 
-    let json = r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~1"}}"#;
+    let json = r#"{"tool_use_id":"toolu_match01","tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~1"}}"#;
     let out = post(json, home.to_str().unwrap());
     assert!(
         out.contains("clawband allow"),
         "Matching PostToolUse command must output allow suggestion: {out:?}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_post_different_call_ids_dont_clobber() {
+    // Session A and session B each write a crumb with different tool_use_ids.
+    // PostToolUse for session A must only read session A's crumb, not session B's.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_post_isolation_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+
+    // Session B writes its crumb for "rm -rf /tmp/foo".
+    write_crumb(
+        &home,
+        "toolu_session_b",
+        "rm -rf /tmp/foo",
+        "[CLAWBAND] rm -rf is destructive.\n! clawband allow 'rm -rf /tmp/foo'\n",
+    );
+
+    // Session A PostToolUse fires for "git reset --hard HEAD~1" with a *different* call ID.
+    // cmd_post looks for .ask-toolu_session_a which does not exist → silent.
+    let json = r#"{"tool_use_id":"toolu_session_a","tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~1"}}"#;
+    let out = post(json, home.to_str().unwrap());
+    assert!(
+        out.is_empty(),
+        "PostToolUse for a different call_id must not read another session's crumb: {out:?}"
     );
 
     let _ = fs::remove_dir_all(&home);
