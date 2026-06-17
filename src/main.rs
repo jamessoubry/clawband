@@ -1809,12 +1809,20 @@ fn normalize_rm_flags(cmd: &str) -> String {
 // Written by PreToolUse when decision is "ask". Read and deleted by `clawband post`
 // (PostToolUse hook). If the command ran, PostToolUse fires and we know the user
 // approved. If denied, PostToolUse never fires and the breadcrumb expires via TTL.
+//
+// Crumb files are keyed by `tool_use_id` (issue #135) so concurrent Claude Code
+// sessions write to separate files and never clobber each other.
 
-fn breadcrumb_path() -> PathBuf {
-    config_dir().join(".last-ask")
+fn breadcrumb_path(call_id: &str) -> PathBuf {
+    let id = if call_id.is_empty() {
+        "unknown"
+    } else {
+        call_id
+    };
+    config_dir().join(format!(".ask-{}", id))
 }
 
-fn write_ask_breadcrumb(cmd: &str, reason: &str) {
+fn write_ask_breadcrumb(cmd: &str, reason: &str, call_id: &str) {
     let cfg = config_dir();
     let _ = fs::create_dir_all(&cfg);
     let ts = std::time::SystemTime::now()
@@ -1825,27 +1833,63 @@ fn write_ask_breadcrumb(cmd: &str, reason: &str) {
         .write(true)
         .create(true)
         .truncate(true)
-        .open(breadcrumb_path())
+        .open(breadcrumb_path(call_id))
     {
         let _ = writeln!(f, "{}\n{}\n{}", ts, cmd, reason);
     }
 }
 
+/// Delete `.ask-*` breadcrumb files in the config dir that are older than 5 minutes.
+/// Called by `cmd_post` to prevent orphaned crumbs (denied commands whose PostToolUse
+/// never fires) from accumulating indefinitely.
+fn cleanup_stale_breadcrumbs() {
+    let cfg = config_dir();
+    let Ok(entries) = fs::read_dir(&cfg) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with(".ask-") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(age) = modified.elapsed() {
+                    if age.as_secs() > 300 {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn cmd_post() {
-    let path = breadcrumb_path();
+    // Read PostToolUse stdin first to extract both the command that ran and the call ID.
+    let mut stdin_buf = String::new();
+    let _ = io::stdin().read_to_string(&mut stdin_buf);
+    let json_val = serde_json::from_str::<serde_json::Value>(&stdin_buf).ok();
+
+    // Locate the per-call breadcrumb file keyed by tool_use_id (issue #135).
+    let call_id = json_val
+        .as_ref()
+        .and_then(|v| v["tool_use_id"].as_str())
+        .unwrap_or("");
+    let path = breadcrumb_path(call_id);
+
     let Ok(content) = fs::read_to_string(&path) else {
+        cleanup_stale_breadcrumbs();
         return;
     };
 
-    // Read PostToolUse stdin to extract the command that actually ran.
-    let mut stdin_buf = String::new();
-    let _ = io::stdin().read_to_string(&mut stdin_buf);
-    let post_cmd = serde_json::from_str::<serde_json::Value>(&stdin_buf)
-        .ok()
+    let post_cmd = json_val
+        .as_ref()
         .and_then(|v| v["tool_input"]["command"].as_str().map(|s| s.to_string()))
         .unwrap_or_default();
 
     let _ = fs::remove_file(&path);
+    cleanup_stale_breadcrumbs();
 
     let mut lines = content.lines();
     let ts: u64 = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
@@ -4554,6 +4598,11 @@ fn main() {
         _ => return,
     };
 
+    // Extract the per-call identifier for breadcrumb keying (issue #135).
+    // Concurrent sessions each get their own `.ask-{call_id}` file so they
+    // cannot clobber each other's crumbs.
+    let call_id = v["tool_use_id"].as_str().unwrap_or("").to_string();
+
     let rtk_enabled = env::var("RTK_ENABLED").as_deref() == Ok("1");
     let sqz_enabled = env::var("SQZ_ENABLED").as_deref() == Ok("1");
 
@@ -4608,7 +4657,7 @@ fn main() {
     // Core pattern check (deny/ask/pass)
     if let Some((decision, reason)) = check_command(&command, &deny_pats, &ask_pats, &allow_pats) {
         if decision == "ask" && mode == Mode::Claude {
-            write_ask_breadcrumb(&command, &reason);
+            write_ask_breadcrumb(&command, &reason, &call_id);
         }
         emit(decision, &reason);
         return;
@@ -4659,7 +4708,7 @@ fn main() {
                 ),
             };
             if decision == "ask" && mode == Mode::Claude {
-                write_ask_breadcrumb(&command, &reason);
+                write_ask_breadcrumb(&command, &reason, &call_id);
             }
             emit(&decision, &reason);
             return;
@@ -4668,7 +4717,7 @@ fn main() {
             scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
         {
             if decision == "ask" && mode == Mode::Claude {
-                write_ask_breadcrumb(&command, &reason);
+                write_ask_breadcrumb(&command, &reason, &call_id);
             }
             emit(&decision, &reason);
             return;
@@ -9207,5 +9256,58 @@ mod tests {
         writeln!(f, "git push --force").unwrap();
         let errs = check_pattern_file_errors(f.path());
         assert!(errs.is_empty(), "no errors expected for valid patterns");
+    }
+
+    // ── issue #135: per-call-id breadcrumb keying ─────────────────────────────
+
+    #[test]
+    fn breadcrumb_path_keyed_by_call_id() {
+        // Two different tool_use_ids must produce two different paths.
+        let path_a = breadcrumb_path("toolu_01abc");
+        let path_b = breadcrumb_path("toolu_01xyz");
+        assert_ne!(
+            path_a, path_b,
+            "different call IDs must yield different breadcrumb paths"
+        );
+        assert!(
+            path_a
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".ask-toolu_01abc"),
+            "path_a filename must contain the call_id"
+        );
+        assert!(
+            path_b
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".ask-toolu_01xyz"),
+            "path_b filename must contain the call_id"
+        );
+    }
+
+    #[test]
+    fn breadcrumb_path_empty_id_falls_back_to_unknown() {
+        let path = breadcrumb_path("");
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            ".ask-unknown",
+            "empty call_id must produce .ask-unknown"
+        );
+    }
+
+    #[test]
+    fn breadcrumb_path_no_global_last_ask() {
+        // The old global `.last-ask` name must not be produced by any call_id.
+        let path_empty = breadcrumb_path("");
+        let path_some = breadcrumb_path("toolu_01abc");
+        for p in [&path_empty, &path_some] {
+            assert_ne!(
+                p.file_name().unwrap().to_string_lossy(),
+                ".last-ask",
+                "breadcrumb_path must never return the old global .last-ask filename"
+            );
+        }
     }
 }
