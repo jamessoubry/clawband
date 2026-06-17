@@ -1661,6 +1661,48 @@ fn e2e_bash_no_flags_evil_script_denied() {
     );
 }
 
+// ── issue #141: absolute-path interpreter bypasses script-file scanning ───────
+
+#[test]
+fn e2e_abs_interp_bin_bash_evil_script_denied() {
+    // /bin/bash /path/to/evil.sh must scan the file — absolute interpreter path was a bypass
+    let path = format!("/tmp/clawband_e2e_141_bin_{}.sh", std::process::id());
+    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
+    let out = run(&bash(&format!("/bin/bash {}", path)), &[]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "/bin/bash <evil-script> must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_abs_interp_usr_bin_bash_evil_script_denied() {
+    let path = format!("/tmp/clawband_e2e_141_usr_{}.sh", std::process::id());
+    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
+    let out = run(&bash(&format!("/usr/bin/bash {}", path)), &[]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "/usr/bin/bash <evil-script> must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_abs_interp_python3_evil_script_denied() {
+    let path = format!("/tmp/clawband_e2e_141_py_{}.py", std::process::id());
+    std::fs::write(&path, "import os\nos.system('rm -rf /')\n").unwrap();
+    let out = run(&bash(&format!("/usr/bin/python3 {}", path)), &[]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "/usr/bin/python3 <evil-script> must be denied: {out}"
+    );
+}
+
 // ── issue #127: backslash-newline line continuation bypass ────────────────────
 
 #[test]
