@@ -2184,6 +2184,15 @@ fn settings_path() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_default()).join(".claude/settings.json")
 }
 
+/// Write `content` to `path` atomically: write to a `.json.tmp` sibling first,
+/// then rename it into place, so a mid-write interrupt can never corrupt `path`.
+fn write_settings_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 // The command string to register in settings.json. Prefer the bare name when
 // clawband is resolvable on PATH (stable across Homebrew upgrades); otherwise
 // fall back to the absolute path of the running binary.
@@ -2750,7 +2759,7 @@ fn cmd_install(extra_args: &[String]) {
     if register_hook(&mut settings, &command) {
         match serde_json::to_string_pretty(&settings) {
             Ok(out) => {
-                if fs::write(&path, out + "\n").is_ok() {
+                if write_settings_atomic(&path, &(out + "\n")).is_ok() {
                     println!(
                         "  {g}registered{r} PreToolUse Bash hook → {d}{}{r}",
                         command
@@ -2789,7 +2798,7 @@ fn cmd_install(extra_args: &[String]) {
         if register_edit_hook(&mut settings2, &command) {
             match serde_json::to_string_pretty(&settings2) {
                 Ok(out) => {
-                    if fs::write(&path, out + "\n").is_ok() {
+                    if write_settings_atomic(&path, &(out + "\n")).is_ok() {
                         println!(
                             "  {g}registered{r} PreToolUse Write|Edit|MultiEdit|NotebookEdit hook → {d}{}{r}",
                             command
@@ -2827,7 +2836,7 @@ fn cmd_install(extra_args: &[String]) {
         if register_post_hook(&mut settings_p, &post_cmd) {
             match serde_json::to_string_pretty(&settings_p) {
                 Ok(out) => {
-                    if fs::write(&path, out + "\n").is_ok() {
+                    if write_settings_atomic(&path, &(out + "\n")).is_ok() {
                         println!("  {g}registered{r} PostToolUse hook → {d}{}{r}", post_cmd);
                         println!(
                             "  {d}After you approve a prompted command, clawband suggests the exact{r}"
@@ -2939,7 +2948,7 @@ fn cmd_uninstall() {
 
     match serde_json::to_string_pretty(&settings) {
         Ok(out) => {
-            if fs::write(&path, out + "\n").is_ok() {
+            if write_settings_atomic(&path, &(out + "\n")).is_ok() {
                 println!(
                     "{g}[CLAWBAND] Uninstalled:{r} removed clawband hook(s) from {d}{}{r}.",
                     path.display()
@@ -9391,5 +9400,24 @@ mod tests {
                 "breadcrumb_path must never return the old global .last-ask filename"
             );
         }
+    }
+
+    #[test]
+    fn test_write_settings_atomic() {
+        use std::fs;
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("settings.json");
+        let content = r#"{"hooks":{}}"#;
+
+        write_settings_atomic(&target, content).expect("atomic write should succeed");
+
+        // Target must exist with the right content
+        let got = fs::read_to_string(&target).expect("read target");
+        assert_eq!(got, content);
+
+        // Temp file must have been cleaned up by the rename
+        let tmp = target.with_extension("json.tmp");
+        assert!(!tmp.exists(), ".json.tmp must not exist after atomic write");
     }
 }
