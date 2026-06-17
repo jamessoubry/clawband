@@ -1411,7 +1411,7 @@ fn scan_script_file(
                         with_suggestion(
                             format!(
                                 "Review before running — '{}' in {}:{}: {}\nTo always allow:\n  ! {} allow '{}'\n",
-                                pat.label, path, lineno + 1, segment, hook_command_string(), pat.label
+                                pat.label, path, lineno + 1, segment, hook_command_string(), pat.re.as_str()
                             ),
                             &pat.label,
                         ),
@@ -3874,7 +3874,7 @@ fn check_echo_to_script(
                 false,
                 format!(
                     "Review before running — '{}' found in echo content written to script file: {}\nTo always allow:\n  ! {} allow '{}'\n",
-                    pat.label, content, hook_command_string(), pat.label
+                    pat.label, content, hook_command_string(), pat.re.as_str()
                 ),
             ));
         }
@@ -4197,7 +4197,7 @@ fn check_command<'a>(
                             with_suggestion(
                                 format!(
                                     "Review before running — '{}' matched in: {}\nTo always allow:\n  ! {} allow '{}'\n",
-                                    pat.label, segment, hook_command_string(), pat.label
+                                    pat.label, segment, hook_command_string(), pat.re.as_str()
                                 ),
                                 &pat.label,
                             ),
@@ -4745,6 +4745,62 @@ mod tests {
             reason.contains(&format!("! {} allow '", exe)),
             "hint should use hook_command_string(), got: {reason}"
         );
+    }
+
+    #[test]
+    fn allow_hint_uses_regex_not_label() {
+        // The hint arg must be the pattern regex, not the human-readable label.
+        // "credential/metadata access (id_rsa)" is the label; it would never match a real command.
+        let dp = deny_pats();
+        let ap = ask_pats();
+        let al = allow_pats();
+        let (dec, reason) = check_command("cat ~/.ssh/id_rsa", &dp, &ap, &al).unwrap();
+        assert_eq!(dec, "ask");
+        // Extract the argument after "allow '"
+        let allow_arg = reason
+            .split(" allow '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("hint must contain allow '<arg>'");
+        // The label contains spaces and parens — the regex does not look like that
+        assert!(
+            !allow_arg.contains("credential/metadata"),
+            "hint must not use label as allow arg, got: {allow_arg}"
+        );
+        // The allow arg must be a valid regex that matches the triggering command
+        let pat = regex::Regex::new(allow_arg)
+            .unwrap_or_else(|_| panic!("hint arg must be a valid regex"));
+        assert!(
+            pat.is_match("cat ~/.ssh/id_rsa"),
+            "allow hint regex '{allow_arg}' must match the triggering command"
+        );
+    }
+
+    #[test]
+    fn allow_hint_regex_round_trips() {
+        // For multiple ask-tier patterns, verify: extract hint → compile regex → matches original command.
+        let cases = ["cat ~/.ssh/id_rsa", "npx some-pkg", "git checkout -- ."];
+        let dp = deny_pats();
+        let ap = ask_pats();
+        let al = allow_pats();
+        for cmd in &cases {
+            let result = check_command(cmd, &dp, &ap, &al);
+            let (dec, reason) =
+                result.unwrap_or_else(|| panic!("'{cmd}' should trigger a decision"));
+            assert_eq!(dec, "ask", "'{cmd}' should be in ask tier");
+            let allow_arg = reason
+                .split(" allow '")
+                .nth(1)
+                .and_then(|s| s.split('\'').next())
+                .unwrap_or_else(|| panic!("hint for '{cmd}' must contain allow '<arg>'"));
+            let pat = regex::Regex::new(allow_arg).unwrap_or_else(|_| {
+                panic!("hint arg '{allow_arg}' for '{cmd}' must be valid regex")
+            });
+            assert!(
+                pat.is_match(cmd),
+                "allow hint regex '{allow_arg}' must match '{cmd}'"
+            );
+        }
     }
 
     // ── allow-tier semantics (#120) ──────────────────────────────────────────
