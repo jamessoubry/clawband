@@ -2519,3 +2519,42 @@ fn e2e_subprocess_check_call_shell_true_asks() {
         "subprocess.check_call with shell=True must be ask: {out}"
     );
 }
+
+// ── issue #133: malformed user pattern warning ────────────────────────────────
+
+#[test]
+fn e2e_malformed_user_pattern_warns_stderr() {
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_badpat_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    // deny.patterns: one valid pattern and one invalid (unclosed character class)
+    fs::write(
+        home.join(".clawband/deny.patterns"),
+        "docker system prune\nrm -rf [\n",
+    )
+    .unwrap();
+    let h = home.to_str().unwrap();
+
+    // A command that matches the valid pattern must still be denied
+    let (stdout, stderr) = run_with_stderr(&bash("docker system prune"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&stdout),
+        Some("deny"),
+        "valid user deny pattern must still block: {stdout}"
+    );
+
+    // stderr must contain a clawband WARNING for the bad pattern
+    assert!(
+        stderr.contains("[clawband] WARNING"),
+        "stderr must contain [clawband] WARNING for malformed pattern; got: {stderr:?}"
+    );
+
+    // Warning must mention the patterns file name so the user knows where to look
+    assert!(
+        stderr.contains("deny.patterns"),
+        "warning must mention deny.patterns file; got: {stderr:?}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
