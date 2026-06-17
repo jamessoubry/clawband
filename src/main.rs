@@ -1056,15 +1056,53 @@ fn builtin_allow() -> Vec<Pattern> {
 
 // ─── User pattern files ───────────────────────────────────────────────────────
 
+/// Returns `(line_number, pattern_text, error_message)` for every line in `path`
+/// that is non-empty, non-comment, and fails to compile as a regex.
+/// Line numbers are 1-based and reflect the original file position.
+fn check_pattern_file_errors(path: &Path) -> Vec<(usize, String, String)> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return vec![];
+    };
+    let mut errors = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Err(e) = Regex::new(&format!("(?i){}", trimmed)) {
+            errors.push((idx + 1, trimmed.to_string(), e.to_string()));
+        }
+    }
+    errors
+}
+
 fn load_patterns(path: &PathBuf) -> Vec<Pattern> {
     let Ok(text) = fs::read_to_string(path) else {
         return vec![];
     };
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(Pattern::from_user)
-        .collect()
+    let mut patterns = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match Regex::new(&format!("(?i){}", trimmed)) {
+            Ok(re) => patterns.push(Pattern {
+                label: trimmed.to_string(),
+                re,
+            }),
+            Err(e) => {
+                eprintln!(
+                    "[clawband] WARNING: {} line {} failed to compile — skipped: {}\n  Regex error: {}",
+                    path.display(),
+                    idx + 1,
+                    trimmed,
+                    e
+                );
+            }
+        }
+    }
+    patterns
 }
 
 fn config_dir() -> PathBuf {
@@ -2949,7 +2987,31 @@ fn cmd_verify() -> i32 {
         );
     }
 
-    // 4. CLAWBAND_SKIP
+    // 4. User pattern files — check for malformed regexes
+    let pattern_file_names = ["deny.patterns", "ask.patterns", "allow.patterns"];
+    for name in &pattern_file_names {
+        let pf = cfg.join(name);
+        if !pf.exists() {
+            continue;
+        }
+        let errs = check_pattern_file_errors(&pf);
+        if errs.is_empty() {
+            println!("  {ok} {d}{}{r}: all patterns valid", pf.display());
+        } else {
+            println!(
+                "  {bad} {d}{}{r}: {} invalid pattern(s):",
+                pf.display(),
+                errs.len()
+            );
+            for (lineno, pat, err) in &errs {
+                println!("    line {lineno}: {d}{pat}{r}");
+                println!("      {d}{err}{r}");
+            }
+            failures += 1;
+        }
+    }
+
+    // 5. CLAWBAND_SKIP
     if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
         println!("  {bad} {red}{bold}CLAWBAND_SKIP=1 — ALL CHECKS DISABLED{r}");
         failures += 1;
@@ -2957,7 +3019,7 @@ fn cmd_verify() -> i32 {
         println!("  {ok} CLAWBAND_SKIP not set");
     }
 
-    // 5. Self-test: prove the engine blocks and passes correctly
+    // 7. Self-test: prove the engine blocks and passes correctly
     let dp = builtin_deny();
     let ap = builtin_ask();
     let no_allow: Vec<Pattern> = vec![];
@@ -2972,7 +3034,7 @@ fn cmd_verify() -> i32 {
         failures += 1;
     }
 
-    // 6. Self-protect status (informational — no failure if off)
+    // 8. Self-protect status (informational — no failure if off)
     let sp_paths_active = protect_active();
     let sp_hook_active = settings.as_ref().map(edit_hook_present).unwrap_or(false);
     if sp_paths_active && sp_hook_active {
@@ -9073,5 +9135,77 @@ mod tests {
             Some("deny".into()),
             "truncate --size 1024 (non-zero) must not be denied"
         );
+    }
+
+    // ── issue #133: malformed user pattern warnings ───────────────────────────
+
+    #[test]
+    fn from_user_bad_regex_returns_none() {
+        // Unclosed character class — must return None without panicking
+        let result = Pattern::from_user("rm -rf [");
+        assert!(
+            result.is_none(),
+            "malformed pattern must return None, not panic"
+        );
+    }
+
+    #[test]
+    fn from_user_valid_regex_returns_some() {
+        let result = Pattern::from_user("docker system prune");
+        assert!(result.is_some(), "valid pattern must compile successfully");
+    }
+
+    #[test]
+    fn load_patterns_skips_bad_regex_keeps_good() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "docker system prune").unwrap(); // valid
+        writeln!(f, "rm -rf [").unwrap(); // invalid: unclosed char class
+        writeln!(f, "git push --force").unwrap(); // valid
+        let path = f.path().to_path_buf();
+        let pats = load_patterns(&path);
+        assert_eq!(
+            pats.len(),
+            2,
+            "only the two valid patterns should be loaded; bad one must be skipped"
+        );
+    }
+
+    #[test]
+    fn load_patterns_all_bad_returns_empty() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "unclosed [").unwrap();
+        writeln!(f, "another (bad").unwrap();
+        let path = f.path().to_path_buf();
+        let pats = load_patterns(&path);
+        assert!(
+            pats.is_empty(),
+            "no valid patterns — result must be empty vec"
+        );
+    }
+
+    #[test]
+    fn check_pattern_file_errors_detects_bad() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "# this is a comment").unwrap(); // line 1 — skipped
+        writeln!(f, "rm -rf /").unwrap(); // line 2 — valid
+        writeln!(f, "rm -rf [").unwrap(); // line 3 — invalid
+        let errs = check_pattern_file_errors(f.path());
+        assert_eq!(errs.len(), 1, "exactly one error expected");
+        let (lineno, pat, _msg) = &errs[0];
+        assert_eq!(*lineno, 3, "error must be reported on line 3");
+        assert_eq!(pat, "rm -rf [");
+    }
+
+    #[test]
+    fn check_pattern_file_errors_no_errors_on_valid_file() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "docker system prune").unwrap();
+        writeln!(f, "git push --force").unwrap();
+        let errs = check_pattern_file_errors(f.path());
+        assert!(errs.is_empty(), "no errors expected for valid patterns");
     }
 }
