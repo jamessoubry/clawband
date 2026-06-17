@@ -2222,9 +2222,10 @@ fn is_clawband_main_command(cmd: &str) -> bool {
     toks.next() != Some("post")
 }
 
-// Returns true if at least one clawband main hook is registered anywhere in PreToolUse.
+// Returns true if at least one clawband hook (PreToolUse main or PostToolUse companion)
+// is registered.  Used by cmd_uninstall to detect whether there is anything to remove.
 fn clawband_hook_present(settings: &serde_json::Value) -> bool {
-    settings["hooks"]["PreToolUse"]
+    let pre = settings["hooks"]["PreToolUse"]
         .as_array()
         .map(|entries| {
             entries.iter().any(|e| {
@@ -2235,7 +2236,8 @@ fn clawband_hook_present(settings: &serde_json::Value) -> bool {
                 })
             })
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    pre || post_hook_present(settings)
 }
 
 // Register the clawband PreToolUse hook, normalising to exactly one instance.
@@ -2864,25 +2866,43 @@ fn cmd_install(extra_args: &[String]) {
     println!("{d}Verify anytime with: clawband verify{r}");
 }
 
-// Remove every clawband main-hook command from hooks.PreToolUse.  Entries
-// whose hooks array becomes empty after removal are also dropped.  Snapshots
-// the array first so the return value accurately reflects whether anything
+// Remove every clawband hook command from hooks.PreToolUse and hooks.PostToolUse.
+// Entries whose hooks array becomes empty after removal are also dropped.  Snapshots
+// each array first so the return value accurately reflects whether anything
 // changed.  Returns true if at least one command was removed, false if no
 // clawband hook was present.
 fn remove_clawband_hooks(settings: &mut serde_json::Value) -> bool {
-    let Some(pre) = settings["hooks"]["PreToolUse"].as_array_mut() else {
-        return false;
-    };
-    let snapshot = pre.clone();
-    // Strip clawband main commands from every entry's hooks array.
-    for entry in pre.iter_mut() {
-        if let Some(hs) = entry["hooks"].as_array_mut() {
-            hs.retain(|h| !h["command"].as_str().is_some_and(is_clawband_main_command));
+    let mut changed = false;
+
+    // ── PreToolUse: strip clawband main-hook commands ──────────────────────────
+    if let Some(pre) = settings["hooks"]["PreToolUse"].as_array_mut() {
+        let snapshot = pre.clone();
+        for entry in pre.iter_mut() {
+            if let Some(hs) = entry["hooks"].as_array_mut() {
+                hs.retain(|h| !h["command"].as_str().is_some_and(is_clawband_main_command));
+            }
+        }
+        pre.retain(|e| e["hooks"].as_array().map(|h| !h.is_empty()).unwrap_or(true));
+        if *pre != snapshot {
+            changed = true;
         }
     }
-    // Drop entries whose hooks array is now empty.
-    pre.retain(|e| e["hooks"].as_array().map(|h| !h.is_empty()).unwrap_or(true));
-    *pre != snapshot
+
+    // ── PostToolUse: strip clawband post-hook commands ─────────────────────────
+    if let Some(post) = settings["hooks"]["PostToolUse"].as_array_mut() {
+        let snapshot = post.clone();
+        for entry in post.iter_mut() {
+            if let Some(hs) = entry["hooks"].as_array_mut() {
+                hs.retain(|h| !h["command"].as_str().is_some_and(is_clawband_post_command));
+            }
+        }
+        post.retain(|e| e["hooks"].as_array().map(|h| !h.is_empty()).unwrap_or(true));
+        if *post != snapshot {
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 fn cmd_uninstall() {
@@ -2921,7 +2941,7 @@ fn cmd_uninstall() {
         Ok(out) => {
             if fs::write(&path, out + "\n").is_ok() {
                 println!(
-                    "{g}[CLAWBAND] Uninstalled:{r} removed clawband PreToolUse hook from {d}{}{r}.",
+                    "{g}[CLAWBAND] Uninstalled:{r} removed clawband hook(s) from {d}{}{r}.",
                     path.display()
                 );
             } else {
@@ -6117,6 +6137,68 @@ mod tests {
         assert!(remove_clawband_hooks(&mut s));
         // Second call: nothing left to remove.
         assert!(!remove_clawband_hooks(&mut s));
+    }
+
+    // ── uninstall: PostToolUse companion removal (issue #136) ─────────────────
+
+    #[test]
+    fn uninstall_removes_post_hook_when_installed_with_post_flag() {
+        // Simulate `clawband install --post`: both PreToolUse and PostToolUse registered.
+        // uninstall must remove both.
+        let mut s = serde_json::json!({});
+        assert!(register_hook(&mut s, "clawband"));
+        assert!(register_post_hook(&mut s, "clawband post"));
+        assert!(clawband_hook_present(&s));
+        assert!(post_hook_present(&s));
+        // remove_clawband_hooks should clear both tiers and return true.
+        assert!(remove_clawband_hooks(&mut s));
+        assert!(!clawband_hook_present(&s));
+        assert!(!post_hook_present(&s));
+        // PostToolUse array should now be empty.
+        let post_arr = s["hooks"]["PostToolUse"].as_array().unwrap();
+        assert!(post_arr.is_empty(), "PostToolUse entry should be dropped");
+    }
+
+    #[test]
+    fn uninstall_without_post_flag_leaves_post_hooks_untouched() {
+        // If the user has a third-party PostToolUse hook but no clawband post hook,
+        // uninstall must not modify PostToolUse at all.
+        let mut s = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "clawband"}]}
+                ],
+                "PostToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/icm hook post"}]}
+                ]
+            }
+        });
+        assert!(clawband_hook_present(&s));
+        assert!(remove_clawband_hooks(&mut s));
+        assert!(!clawband_hook_present(&s));
+        // Third-party PostToolUse hook must still be intact.
+        let post_arr = s["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post_arr.len(), 1);
+        assert_eq!(
+            post_arr[0]["hooks"][0]["command"].as_str(),
+            Some("/usr/local/bin/icm hook post")
+        );
+    }
+
+    #[test]
+    fn clawband_hook_present_detects_post_only_installation() {
+        // If only the PostToolUse companion is registered (PreToolUse already manually
+        // removed), clawband_hook_present must still return true so that cmd_uninstall
+        // does not exit early with "nothing found".
+        let mut s = serde_json::json!({});
+        assert!(register_post_hook(&mut s, "~/.claude/hooks/clawband post"));
+        assert!(
+            clawband_hook_present(&s),
+            "post-only install must be detected as present"
+        );
+        // And remove_clawband_hooks must clean it up.
+        assert!(remove_clawband_hooks(&mut s));
+        assert!(!clawband_hook_present(&s));
     }
 
     // ── base64 / obfuscation patterns ────────────────────────────────────────
