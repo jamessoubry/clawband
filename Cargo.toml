@@ -1,6 +1,6 @@
 [package]
 name = "clawband"
-version = "2.79.0"
+version = "2.80.0"
 
 edition = "2021"
 description = "Claude Code PreToolUse hook that guards against destructive shell commands"

