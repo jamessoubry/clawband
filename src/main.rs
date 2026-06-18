@@ -1231,7 +1231,8 @@ fn path_basename(path: &str) -> &str {
 }
 
 fn extract_script_path(command: &str) -> Option<String> {
-    let interp = r"(?i)(?:sudo\s+)?(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua[0-9.]*)";
+    let interp =
+        r"(?i)(?:sudo\s+)?(?:\S*/)?(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua[0-9.]*)";
 
     // Input redirection: bash < /path/to/script
     let redir_re = Regex::new(&format!(r"(?i)^\s*{}\s+<\s+(.+)$", interp)).unwrap();
@@ -1306,7 +1307,7 @@ fn extract_script_path(command: &str) -> Option<String> {
     // Standard: interpreter [optional-flags] <path>
     // Capture the interpreter name so we can apply interpreter-specific inline-code flags.
     let interp_capture =
-        r"(?i)(?:sudo\s+)?(bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua[0-9.]*)";
+        r"(?i)(?:sudo\s+)?(?:\S*/)?(bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua[0-9.]*)";
     let re = Regex::new(&format!(
         r"(?i)^\s*{}\s+((?:(?:-[a-zA-Z]+|--[a-zA-Z][-a-zA-Z]*)\s+)*)(.+)$",
         interp_capture
@@ -7066,6 +7067,47 @@ mod tests {
             .map(|(d, _)| d);
         let _ = fs::remove_file(&path);
         assert_eq!(result, Some("deny".into()));
+    }
+
+    // ── H2. absolute-path interpreter (issue #141) ───────────────────────────
+
+    #[test]
+    fn abs_interp_bash_bin_extracts_script() {
+        assert_eq!(
+            extract_script_path("/bin/bash /tmp/evil.sh"),
+            Some("/tmp/evil.sh".into())
+        );
+    }
+
+    #[test]
+    fn abs_interp_usr_bin_bash_extracts_script() {
+        assert_eq!(
+            extract_script_path("/usr/bin/bash /tmp/evil.sh"),
+            Some("/tmp/evil.sh".into())
+        );
+    }
+
+    #[test]
+    fn abs_interp_python3_usr_bin_extracts_script() {
+        assert_eq!(
+            extract_script_path("/usr/bin/python3 /tmp/script.py"),
+            Some("/tmp/script.py".into())
+        );
+    }
+
+    #[test]
+    fn abs_interp_bare_bash_still_works() {
+        // Regression: bare interpreter name must still work after fix
+        assert_eq!(
+            extract_script_path("bash /tmp/evil.sh"),
+            Some("/tmp/evil.sh".into())
+        );
+    }
+
+    #[test]
+    fn abs_interp_usr_bin_ls_not_extracted() {
+        // /usr/bin/ls is not an interpreter — must not match
+        assert_eq!(extract_script_path("/usr/bin/ls -la"), None);
     }
 
     // ── H. interpreter flag cluster scan (issue #116) ────────────────────────
