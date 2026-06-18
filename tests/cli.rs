@@ -2316,8 +2316,12 @@ fn e2e_ipv6_imds_asks() {
 /// substitutes the actual temp HOME at load time — no regex-escaping needed).
 fn home_with_shell_init_protect() -> std::path::PathBuf {
     use std::fs;
-    // Use only process ID (no thread ID) so the path contains no regex metacharacters.
-    let home = std::env::temp_dir().join(format!("cb_p119_{}", std::process::id()));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Unique counter per call so parallel tests don't share the same temp dir
+    // and race on create/delete (pid alone is shared across all test threads).
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let home = std::env::temp_dir().join(format!("cb_p119_{}_{}", std::process::id(), id));
     let _ = fs::remove_dir_all(&home);
     fs::create_dir_all(home.join(".clawband")).unwrap();
     // Patterns mirror the PROTECT_PATHS_TEMPLATE shell-init section.
