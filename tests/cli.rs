@@ -2641,6 +2641,59 @@ fn e2e_write_then_exec_still_asks() {
     );
 }
 
+// ── issue #165: deny-pattern false positives on quoted args to data commands ──
+
+#[test]
+fn e2e_grep_quoted_dangerous_arg_passes() {
+    let out = run(&bash("grep -rn 'rm -rf /' ."), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "grep with dangerous quoted search pattern must pass: {out}"
+    );
+}
+
+#[test]
+fn e2e_echo_quoted_dangerous_string_passes() {
+    let out = run(&bash("echo 'to wipe: rm -rf /'"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "echo with dangerous quoted string must pass: {out}"
+    );
+}
+
+#[test]
+fn e2e_printf_dangerous_format_string_passes() {
+    let out = run(&bash("printf 'cleanup: rm -rf /tmp\\n'"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "printf with dangerous quoted format string must pass: {out}"
+    );
+}
+
+#[test]
+fn e2e_var_assignment_dangerous_quoted_value_passes() {
+    let out = run(&bash("MSG='warning: rm -rf / is dangerous'"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "variable assignment with dangerous quoted value must pass: {out}"
+    );
+}
+
+#[test]
+fn e2e_echo_command_substitution_still_denies() {
+    // $(rm -rf /) inside double-quotes actually executes — must still deny
+    let out = run(&bash(r#"echo "$(rm -rf /)""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "echo with command substitution must still deny: {out}"
+    );
+}
+
 // ── issue #126: subprocess.check_call and bare import patterns ────────────────
 
 #[test]
