@@ -2609,6 +2609,38 @@ fn e2e_bun_install_passes() {
     );
 }
 
+// ── issue #162: write-then-exec false positive on `cat file.sh 2>/dev/null` ──
+
+#[test]
+fn e2e_cat_sh_with_stderr_redirect_passes() {
+    // `cat file.sh 2>/dev/null` must not trigger write-then-exec.
+    // write_re was matching `>` in `2>/dev/null` → "null"; exec_re was matching
+    // `\bsh` in the `.sh` extension → also "null". Both fixed.
+    let out = run(
+        &bash("ls /tmp/ && cat /tmp/import-monitors.sh 2>/dev/null || echo done"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        "cat file.sh 2>/dev/null must not trigger write-then-exec: {out}"
+    );
+}
+
+#[test]
+fn e2e_write_then_exec_still_asks() {
+    // True positive must survive the fix
+    let out = run(
+        &bash(r#"echo "evil" > /tmp/run162.sh && bash /tmp/run162.sh"#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "write-then-exec must still be ask after fix: {out}"
+    );
+}
+
 // ── issue #126: subprocess.check_call and bare import patterns ────────────────
 
 #[test]

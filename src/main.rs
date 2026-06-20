@@ -4045,18 +4045,32 @@ fn check_write_then_execute(segments: &[String]) -> bool {
     if segments.len() < 2 {
         return false;
     }
-    // Capture the filename after any output redirection operator
-    let write_re = Regex::new(r">>?\s*(\S+)").unwrap();
-    // Capture the filename passed to an interpreter or run directly
+    // Capture filename after output redirection. The alternation skips fd-redirects
+    // like `2>/dev/null` and `&>/dev/null` (first branch consumes the digit/& prefix
+    // with no capture group); plain redirects are captured in group 1.
+    let write_re = Regex::new(r"(?:[0-9&]>>?\s*\S+|>>?\s*(\S+))").unwrap();
+    // Capture filename passed to an interpreter or run directly.
+    // Use (?:^|\s) instead of \b so that a `.sh` file extension is not mistaken
+    // for the `sh` interpreter (\b fires after `.` because `.` is non-word).
     let exec_re = Regex::new(
-        r"(?i)(?:\b(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua)\s+<?|^\s*(?:sudo\s+)?\./)(\S+)",
+        r"(?i)(?:(?:^|\s)(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua)\s+<?|^\s*(?:sudo\s+)?\./)(\S+)",
     )
     .unwrap();
 
     let written: Vec<&str> = segments
         .iter()
         .flat_map(|s| write_re.captures_iter(s))
-        .filter_map(|c| c.get(1).map(|m| path_basename(m.as_str())))
+        .filter_map(|c| {
+            c.get(1).and_then(|m| {
+                let path = m.as_str();
+                // Device paths (e.g. /dev/null) are never script targets
+                if path.starts_with("/dev/") {
+                    None
+                } else {
+                    Some(path_basename(path))
+                }
+            })
+        })
         .collect();
 
     if written.is_empty() {
@@ -5550,6 +5564,35 @@ mod tests {
         assert_eq!(
             decision(r#"echo "log entry" > progress.log && bash build.sh"#),
             None
+        );
+    }
+
+    #[test]
+    fn cat_sh_file_with_stderr_redirect_passes() {
+        // Issue #162: `cat file.sh 2>/dev/null` was a false positive.
+        // write_re was matching `>` in `2>/dev/null`, capturing `/dev/null` → "null".
+        // exec_re was matching `\bsh` in the `.sh` extension, also capturing "null".
+        // Fix: fd-redirects excluded from write_re; (?:^|\s) anchor in exec_re.
+        assert_eq!(
+            decision("ls /tmp/ && cat /tmp/import-monitors.sh 2>/dev/null || echo done"),
+            None
+        );
+    }
+
+    #[test]
+    fn cat_sh_file_compound_passes() {
+        assert_eq!(decision("cat /tmp/script.sh 2>/dev/null"), None);
+    }
+
+    #[test]
+    fn fd_redirect_does_not_trigger_write_then_exec() {
+        // fd-redirects like 2>/dev/null and 1>/dev/null should not be treated as
+        // writes to script files — they never produce an executable output file
+        assert_eq!(decision("make build 1>/dev/null 2>&1 && echo done"), None);
+        // True positive still fires: explicit file write + execute
+        assert_eq!(
+            decision("echo evil > run.sh && bash run.sh 1>/dev/null 2>&1"),
+            Some("ask".into())
         );
     }
 
