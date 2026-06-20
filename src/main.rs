@@ -4041,6 +4041,142 @@ fn check_echo_to_script(
 // the content can't be scanned before execution. Matches by basename so
 // extension doesn't matter — `echo bad > run.txt; bash run.txt` is caught too.
 
+// ─── Data-command quoted-arg stripping (issue #165) ──────────────────────────
+// Deny patterns fire on the full segment text including quoted string arguments.
+// When the command is a read-only / data-output builtin (echo, grep, printf …),
+// dangerous-looking text inside a quoted arg is *never executed* — it's just
+// data.  Stripping static quoted content before deny-matching eliminates these
+// false positives while preserving detection of real threats (e.g. command
+// substitutions inside double-quotes still contain `$`/`` ` `` and are kept).
+
+/// Strip single-quoted content and static double-quoted content (no `$` /
+/// backtick) from a segment.  Quoted regions that contain expansions are
+/// preserved so that `echo "$(rm -rf /)"` is still inspected.
+fn strip_static_quoted_args(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                // Single-quoted: no shell expansions possible — discard and replace
+                for c2 in chars.by_ref() {
+                    if c2 == '\'' {
+                        break;
+                    }
+                }
+                result.push(' ');
+            }
+            '"' => {
+                let mut inner = String::new();
+                let mut has_expansion = false;
+                let mut closed = false;
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\\') => {
+                            // `\"` keeps the quote from closing; `\$` isn't an expansion.
+                            if let Some(c2) = chars.next() {
+                                inner.push('\\');
+                                inner.push(c2);
+                            }
+                        }
+                        Some('"') => {
+                            closed = true;
+                            break;
+                        }
+                        Some(c2) => {
+                            if c2 == '$' || c2 == '`' {
+                                has_expansion = true;
+                            }
+                            inner.push(c2);
+                        }
+                    }
+                }
+                if has_expansion {
+                    // Keep — the expansion could run a dangerous sub-command
+                    result.push('"');
+                    result.push_str(&inner);
+                    if closed {
+                        result.push('"');
+                    }
+                } else {
+                    result.push(' ');
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+/// True when the first command word is a read-only / data-output builtin that
+/// cannot execute its string arguments.
+fn is_data_command(segment: &str) -> bool {
+    let s = segment.trim();
+    let s = s
+        .strip_prefix("sudo")
+        .and_then(|r| r.strip_prefix(char::is_whitespace))
+        .map(str::trim_start)
+        .unwrap_or(s);
+    let first = s.split_whitespace().next().unwrap_or("");
+    let first = first.rsplit('/').next().unwrap_or(first);
+    matches!(
+        first,
+        "echo"
+            | "printf"
+            | "grep"
+            | "egrep"
+            | "fgrep"
+            | "rg"
+            | "awk"
+            | "gawk"
+            | "sed"
+            | "cat"
+            | "less"
+            | "more"
+            | "head"
+            | "tail"
+            | "wc"
+            | ":"
+    )
+}
+
+/// True when the segment is a bare shell variable assignment with no trailing
+/// command and a non-expanding value.  The value is pure data — deny matches
+/// inside it are false positives.
+///
+/// Matches `VAR=<value>` (or with a leading `export`/`declare`) where the
+/// value is a single-quoted string, a simple double-quoted string (no `$` or
+/// backtick), or a plain unquoted word — followed immediately by end of
+/// segment.  Assignments that contain expansions or are followed by a command
+/// word are intentionally excluded.
+fn is_pure_var_assignment(segment: &str) -> bool {
+    let s = segment.trim();
+    let s = s
+        .strip_prefix("export")
+        .and_then(|r| r.strip_prefix(char::is_whitespace))
+        .map(str::trim_start)
+        .or_else(|| {
+            s.strip_prefix("declare")
+                .and_then(|r| r.strip_prefix(char::is_whitespace))
+                .map(str::trim_start)
+        })
+        .unwrap_or(s);
+    Regex::new(
+        r#"(?x)
+        ^[A-Za-z_][A-Za-z0-9_]*=   # VAR=
+        (?:
+          '[^']*'                   # single-quoted value (no expansions)
+          | "[^"$`]*"               # simple double-quoted (no $ or backtick)
+          | [^\s]*                  # unquoted word
+        )?
+        \s*$                        # end of segment
+        "#,
+    )
+    .unwrap()
+    .is_match(s)
+}
+
 fn check_write_then_execute(segments: &[String]) -> bool {
     if segments.len() < 2 {
         return false;
@@ -4338,8 +4474,40 @@ fn check_command<'a>(
             return Some(("deny", reason));
         }
 
-        // Check deny patterns against all forms; reason shows original segment
-        for &form in forms {
+        // For read-only / data-output commands (echo, grep, printf …) and pure
+        // variable assignments, strip static quoted content before deny-matching.
+        // Deny patterns that match only inside a quoted argument to such commands
+        // are false positives — the dangerous text is never executed (issue #165).
+        // Double-quoted content containing `$` or backtick is preserved so that
+        // command substitutions like `echo "$(rm -rf /)"` are still caught.
+        //
+        // For pure variable assignments, normalize_segment splits the assignment
+        // mid-value (VAR='a b c' → norm="b c'"), so we must NOT include the
+        // corrupted norm in the deny forms — only the stripped segment is safe.
+        let deny_stripped: Option<Vec<String>> =
+            if is_data_command(segment) || is_data_command(&norm) {
+                // Data command: strip both segment and norm (norm handles `command echo …`)
+                let sa = strip_static_quoted_args(segment);
+                let sb = strip_static_quoted_args(&norm);
+                Some(if sa != sb { vec![sa, sb] } else { vec![sa] })
+            } else if is_pure_var_assignment(segment) {
+                // Pure variable assignment: only use the stripped segment;
+                // norm is split mid-value by normalize_segment and must not be used.
+                Some(vec![strip_static_quoted_args(segment)])
+            } else {
+                None
+            };
+        // Build the slice to check; fall back to all forms when no stripping applies.
+        let deny_refs_owned: Vec<&str>;
+        let forms_for_deny: &[&str] = if let Some(ref strings) = deny_stripped {
+            deny_refs_owned = strings.iter().map(|s| s.as_str()).collect();
+            &deny_refs_owned
+        } else {
+            forms
+        };
+
+        // Check deny patterns against applicable forms; reason shows original segment
+        for &form in forms_for_deny {
             for pat in deny_pats {
                 if pat.matches(form) {
                     return Some((
@@ -5499,6 +5667,65 @@ mod tests {
             Some(path.as_str()),
             "extract_script_path must find script path after normalizing `command python3 ...`"
         );
+    }
+
+    // ── issue #165: deny-pattern false positives on quoted args to data cmds ────
+
+    #[test]
+    fn grep_single_quoted_dangerous_arg_passes() {
+        assert_eq!(decision("grep -rn 'rm -rf /' ."), None);
+    }
+
+    #[test]
+    fn grep_double_quoted_dangerous_arg_passes() {
+        assert_eq!(decision("grep -rn \"rm -rf /\" ."), None);
+    }
+
+    #[test]
+    fn echo_single_quoted_dangerous_string_passes() {
+        assert_eq!(decision("echo 'to wipe: rm -rf /'"), None);
+    }
+
+    #[test]
+    fn echo_double_quoted_dangerous_string_passes() {
+        assert_eq!(decision("echo \"do not run rm -rf / ever\""), None);
+    }
+
+    #[test]
+    fn printf_dangerous_format_string_passes() {
+        assert_eq!(decision("printf 'cleanup: rm -rf /tmp\\n'"), None);
+    }
+
+    #[test]
+    fn var_assignment_quoted_dangerous_value_passes() {
+        // Variable assignment with a dangerous string as data — not a command
+        assert!(
+            is_pure_var_assignment("MSG='warning: rm -rf / is dangerous'"),
+            "is_pure_var_assignment must return true for MSG='...'"
+        );
+        assert_eq!(decision("MSG='warning: rm -rf / is dangerous'"), None);
+    }
+
+    #[test]
+    fn echo_with_command_substitution_still_denies() {
+        // `echo "$(rm -rf /)"` actually executes rm -rf / via `$()` — must still deny
+        // (check_subshells catches the inner command; full_decision covers both paths)
+        assert_eq!(full_decision("echo \"$(rm -rf /)\""), Some("deny".into()));
+    }
+
+    #[test]
+    fn real_rm_rf_not_in_quotes_still_denies() {
+        assert_eq!(decision("rm -rf /"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rg_dangerous_pattern_passes() {
+        assert_eq!(decision("rg 'rm -rf' /tmp"), None);
+    }
+
+    #[test]
+    fn awk_dangerous_pattern_passes() {
+        assert_eq!(decision("awk '/rm -rf/ { print }' /tmp/log"), None);
     }
 
     // ── write-then-execute ─────────────────────────────────────────────────────
