@@ -2899,3 +2899,49 @@ fn e2e_malformed_user_pattern_warns_stderr() {
 
     let _ = fs::remove_dir_all(&home);
 }
+
+// ── issue #129: first-token empty-quote / backslash normalization ─────────────
+
+#[test]
+fn e2e_inline_empty_double_quote_denied() {
+    // r""m -rf / normalizes first token to rm → matches deny pattern
+    let out = run(&bash(r#"r""m -rf /"#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "r\"\"m -rf / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_inline_empty_single_quote_denied() {
+    // r''m -rf / normalizes first token to rm → matches deny pattern
+    let out = run(&bash("r''m -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "r''m -rf / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_inline_backslash_denied() {
+    // r\m -rf / normalizes first token to rm → matches deny pattern
+    let out = run(&bash(r"r\m -rf /"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        r"r\m -rf / must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_brace_expansion_passes() {
+    // {rm,-rf,/} — brace expansion requires a shell to resolve; out of scope, must pass through
+    let out = run(&bash("{rm,-rf,/}"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "{{rm,-rf,/}} must pass through (brace expansion is out of scope): {out}"
+    );
+}
