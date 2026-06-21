@@ -612,6 +612,18 @@ fn builtin_deny() -> Vec<Pattern> {
             "psql -c DROP",
             r#"\bpsql\b.*\s-c\s+['"]?\s*DROP\s+(DATABASE|TABLE|SCHEMA|USER)\b"#,
         ),
+        // Elasticsearch: DELETE /_all or DELETE /* deletes ALL indices — catastrophic
+        // Match both orderings: flag-before-URL and URL-before-flag
+        (
+            "curl DELETE /_all or /* (Elasticsearch — deletes all indices)",
+            concat!(
+                r"\bcurl\b.*(?:",
+                r"(?:(?:-X|--request)(?:=|\s+)DELETE\b).*(?:/_all\b|/\*(?:\s|$))",
+                r"|",
+                r"(?:/_all\b|/\*(?:\s|$)).*(?:(?:-X|--request)(?:=|\s+)DELETE\b)",
+                r")"
+            ),
+        ),
         // Docker destructive ops
         ("docker system prune", r"\bdocker\s+system\s+prune\b"),
         // find -delete (anchored; avoids matching --delete-protection flags)
@@ -1018,6 +1030,13 @@ fn builtin_ask() -> Vec<Pattern> {
                 r".*(?:(?:-X|--request)(?:=|\s+)DELETE\b)",
                 r")"
             ),
+        ),
+        // ── Elasticsearch: _delete_by_query (issue #172) ─────────────────────────
+        // Mass document deletion via POST; body is not visible to clawband so the
+        // URL token alone is the signal.  `_delete_by_query` only ever destroys.
+        (
+            "curl _delete_by_query (Elasticsearch mass deletion)",
+            r"\bcurl\b.*\b_delete_by_query\b",
         ),
         // ── ssh remote interpreter / script execution (issue #74) ─────────────
         // clawband cannot inspect remote files, so running an interpreter over
@@ -7357,6 +7376,68 @@ mod tests {
         // GET to a cloud API is fine — only DELETE is flagged
         assert_eq!(
             decision("curl https://compute.googleapis.com/compute/v1/projects/p/zones"),
+            None
+        );
+    }
+
+    // ── Elasticsearch DELETE /_all, /*, _delete_by_query (issue #172) ──────────
+
+    #[test]
+    fn curl_delete_all_indices_denied() {
+        assert_eq!(
+            decision("curl -X DELETE http://localhost:9200/_all"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_all_indices_wildcard_denied() {
+        assert_eq!(
+            decision("curl -X DELETE http://localhost:9200/*"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_all_request_flag_denied() {
+        assert_eq!(
+            decision("curl --request DELETE http://es:9200/_all"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_all_url_before_flag_denied() {
+        // URL before -X DELETE must still be caught
+        assert_eq!(
+            decision("curl http://localhost:9200/_all -X DELETE"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_by_query_asks() {
+        assert_eq!(
+            decision("curl -X POST http://localhost:9200/logs/_delete_by_query -d '{}'"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_by_query_no_method_asks() {
+        assert_eq!(
+            decision(
+                "curl http://es:9200/idx/_delete_by_query -H 'Content-Type: application/json'"
+            ),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_get_elasticsearch_passes() {
+        // Read-only operations against Elasticsearch must not trigger
+        assert_eq!(
+            decision("curl http://localhost:9200/my-index/_search"),
             None
         );
     }
