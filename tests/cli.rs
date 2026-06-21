@@ -1095,6 +1095,67 @@ fn e2e_eval_subshell_wget_asks() {
     );
 }
 
+// ── curl -X DELETE cloud management APIs (issue #170) ────────────────────
+
+#[test]
+fn e2e_curl_delete_azure_asks() {
+    let out = run(
+        &bash("curl -X DELETE https://management.azure.com/subscriptions/xxx/resourceGroups/prod"),
+        &[],
+    );
+    assert_eq!(decision(&out), Some("ask"), "curl -X DELETE azure must ask");
+}
+
+#[test]
+fn e2e_curl_delete_gcp_asks() {
+    let out = run(
+        &bash("curl -X DELETE https://compute.googleapis.com/compute/v1/projects/p/zones/z/instances/vm"),
+        &[],
+    );
+    assert_eq!(decision(&out), Some("ask"), "curl -X DELETE gcp must ask");
+}
+
+#[test]
+fn e2e_curl_delete_digitalocean_asks() {
+    let out = run(
+        &bash("curl -X DELETE https://api.digitalocean.com/v2/droplets/12345"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "curl -X DELETE digitalocean must ask"
+    );
+}
+
+#[test]
+fn e2e_curl_request_delete_hetzner_asks() {
+    let out = run(
+        &bash("curl --request DELETE https://api.hetzner.cloud/v1/servers/42"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "curl --request DELETE hetzner must ask"
+    );
+}
+
+#[test]
+fn e2e_curl_delete_localhost_passes() {
+    let out = run(&bash("curl -X DELETE http://localhost:3000/items/42"), &[]);
+    assert_eq!(decision(&out), None, "curl -X DELETE localhost must pass");
+}
+
+#[test]
+fn e2e_curl_delete_custom_api_passes() {
+    let out = run(
+        &bash("curl -X DELETE https://myapi.example.com/users/1"),
+        &[],
+    );
+    assert_eq!(decision(&out), None, "curl -X DELETE custom api must pass");
+}
+
 // ── ssh remote interpreter / script execution (issue #74) ────────────────
 
 #[test]
