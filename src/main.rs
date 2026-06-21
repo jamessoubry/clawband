@@ -997,6 +997,28 @@ fn builtin_ask() -> Vec<Pattern> {
             "curl upload exfiltration (sensitive file)",
             r"\bcurl\b.*(?:-T\b|--upload-file\b).*\.(?:env|pem|netrc|npmrc)\b",
         ),
+        // ── curl -X DELETE / --request DELETE against cloud management APIs ─────
+        // An agent could delete cloud resources via REST APIs (instances, databases,
+        // load balancers, IAM roles …) without triggering any CLI-specific pattern.
+        // We ask when BOTH the DELETE method flag AND a known cloud-management
+        // hostname appear in the same curl segment, in either order.
+        // Normal REST development (localhost, custom domains) passes silently.
+        (
+            "curl DELETE (cloud management API)",
+            concat!(
+                r"\bcurl\b.*(?:",
+                // flag before URL
+                r"(?:(?:-X|--request)(?:=|\s+)DELETE\b).*",
+                r"(?:management\.azure\.com|googleapis\.com|api\.digitalocean\.com",
+                r"|api\.vultr\.com|api\.linode\.com|api\.hetzner\.cloud|\.amazonaws\.com)",
+                r"|",
+                // URL before flag
+                r"(?:management\.azure\.com|googleapis\.com|api\.digitalocean\.com",
+                r"|api\.vultr\.com|api\.linode\.com|api\.hetzner\.cloud|\.amazonaws\.com)",
+                r".*(?:(?:-X|--request)(?:=|\s+)DELETE\b)",
+                r")"
+            ),
+        ),
         // ── ssh remote interpreter / script execution (issue #74) ─────────────
         // clawband cannot inspect remote files, so running an interpreter over
         // ssh is a strong "prompt the user" signal.
@@ -7247,6 +7269,96 @@ mod tests {
     #[test]
     fn psql_c_create_table_passes() {
         assert_eq!(decision("psql -c 'CREATE TABLE foo(id int)'"), None);
+    }
+
+    // ── curl -X DELETE cloud management API (issue #170) ────────────────────────
+
+    #[test]
+    fn curl_delete_azure_asks() {
+        assert_eq!(
+            decision(
+                "curl -X DELETE https://management.azure.com/subscriptions/xxx/resourceGroups/prod"
+            ),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_gcp_asks() {
+        assert_eq!(
+            decision("curl -X DELETE https://compute.googleapis.com/compute/v1/projects/p/zones/z/instances/vm"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_digitalocean_asks() {
+        assert_eq!(
+            decision("curl -X DELETE https://api.digitalocean.com/v2/droplets/12345"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_vultr_asks() {
+        assert_eq!(
+            decision("curl -X DELETE https://api.vultr.com/v2/instances/xxx"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_amazonaws_asks() {
+        assert_eq!(
+            decision("curl -X DELETE https://ec2.amazonaws.com/"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_request_delete_hetzner_asks() {
+        assert_eq!(
+            decision("curl --request DELETE https://api.hetzner.cloud/v1/servers/42"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_url_before_flag_asks() {
+        // URL before -X DELETE — both orderings must be caught
+        assert_eq!(
+            decision(
+                "curl https://management.azure.com/subscriptions/xxx -X DELETE -H 'Auth: tok'"
+            ),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn curl_delete_localhost_passes() {
+        // Normal REST development against local server must not trigger ask
+        assert_eq!(
+            decision("curl -X DELETE http://localhost:3000/items/42"),
+            None
+        );
+    }
+
+    #[test]
+    fn curl_delete_custom_api_passes() {
+        // Generic custom API — should pass silently
+        assert_eq!(
+            decision("curl -X DELETE https://myapi.example.com/users/1"),
+            None
+        );
+    }
+
+    #[test]
+    fn curl_get_cloud_passes() {
+        // GET to a cloud API is fine — only DELETE is flagged
+        assert_eq!(
+            decision("curl https://compute.googleapis.com/compute/v1/projects/p/zones"),
+            None
+        );
     }
 
     // ── D. source / dot-source scanning (issue #33) ───────────────────────────
