@@ -1156,6 +1156,39 @@ fn e2e_curl_delete_custom_api_passes() {
     assert_eq!(decision(&out), None, "curl -X DELETE custom api must pass");
 }
 
+// ── Elasticsearch: DELETE /_all, /*, _delete_by_query (issue #172) ──────────
+
+#[test]
+fn e2e_curl_delete_es_all_denied() {
+    let out = run(&bash("curl -X DELETE http://localhost:9200/_all"), &[]);
+    assert_eq!(decision(&out), Some("deny"), "curl DELETE /_all must deny");
+}
+
+#[test]
+fn e2e_curl_delete_es_wildcard_denied() {
+    let out = run(&bash("curl -X DELETE http://localhost:9200/*"), &[]);
+    assert_eq!(decision(&out), Some("deny"), "curl DELETE /* must deny");
+}
+
+#[test]
+fn e2e_curl_delete_by_query_asks() {
+    let out = run(
+        &bash("curl -X POST http://localhost:9200/logs/_delete_by_query -d '{}'"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "curl _delete_by_query must ask"
+    );
+}
+
+#[test]
+fn e2e_curl_get_es_passes() {
+    let out = run(&bash("curl http://localhost:9200/my-index/_search"), &[]);
+    assert_eq!(decision(&out), None, "curl GET elasticsearch must pass");
+}
+
 // ── ssh remote interpreter / script execution (issue #74) ────────────────
 
 #[test]
