@@ -146,40 +146,6 @@ enum AskFallback {
     Allow,
 }
 
-#[allow(dead_code)]
-fn resolve_ask_fallback() -> AskFallback {
-    let read = |dir: std::path::PathBuf| -> Option<AskFallback> {
-        let text = fs::read_to_string(dir.join("config")).ok()?;
-        for line in text.lines() {
-            let l = line.trim();
-            if l.is_empty() || l.starts_with('#') {
-                continue;
-            }
-            if let Some((k, v)) = l.split_once('=') {
-                if k.trim() == "ask_fallback" {
-                    return match v
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_ascii_lowercase()
-                        .as_str()
-                    {
-                        "allow" => Some(AskFallback::Allow),
-                        "deny" => Some(AskFallback::Deny),
-                        _ => None,
-                    };
-                }
-            }
-        }
-        None
-    };
-    // Project config takes precedence over global
-    project_config_dir()
-        .and_then(read)
-        .or_else(|| read(config_dir()))
-        .unwrap_or(AskFallback::Allow)
-}
-
 // ─── Decision output ──────────────────────────────────────────────────────────
 
 /// Escape a JSON string value (inner content, no surrounding quotes).
@@ -1208,41 +1174,6 @@ fn is_project_allow_trusted(allow_path: &Path) -> bool {
         }
     }
     false
-}
-
-/// The decision for a command that matches no deny/ask/allow pattern. Read from a
-/// `config` file (`default_decision = passthrough | allow | ask`); project config
-/// overrides global. Defaults to "passthrough" (stay silent, let Claude Code's
-/// native permission check handle it).
-fn default_decision() -> &'static str {
-    let read = |dir: PathBuf| -> Option<String> {
-        let text = fs::read_to_string(dir.join("config")).ok()?;
-        for line in text.lines() {
-            let l = line.trim();
-            if l.is_empty() || l.starts_with('#') {
-                continue;
-            }
-            if let Some((k, v)) = l.split_once('=') {
-                if k.trim() == "default_decision" {
-                    return Some(
-                        v.trim()
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                            .to_ascii_lowercase(),
-                    );
-                }
-            }
-        }
-        None
-    };
-    let val = project_config_dir()
-        .and_then(read)
-        .or_else(|| read(config_dir()));
-    match val.as_deref() {
-        Some("allow") => "allow",
-        Some("ask") => "ask",
-        _ => "passthrough",
-    }
 }
 
 // ─── RTK prefix stripping ─────────────────────────────────────────────────────
@@ -3981,7 +3912,7 @@ fn cmd_stats() {
         "  subshell scanning        {g}on{r}  {d}($() and backtick inner-command evaluation){r}"
     );
 
-    let dd = default_decision();
+    let dd = load_config().default_decision;
     let dd_note = match dd {
         "allow" => "clawband is the sole gatekeeper — native prompts suppressed",
         "ask" => "unmatched commands reviewed (only prompts outside bypass mode)",
