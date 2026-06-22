@@ -7633,11 +7633,15 @@ mod tests {
     #[test]
     fn source_dangerous_file_scanned() {
         // Write an evil script and check that `source /path` triggers the scanner
-        let path = format!("/tmp/clawband_test_{}_source_evil.sh", std::process::id());
-        fs::write(&path, "#!/bin/bash\ndocker system prune\n").unwrap();
-        let result =
-            scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow()).map(|(d, _)| d);
-        let _ = fs::remove_file(&path);
+        let f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        fs::write(f.path(), "#!/bin/bash\ndocker system prune\n").unwrap();
+        let result = scan_script_file(
+            f.path().to_str().unwrap(),
+            &deny_pats(),
+            &ask_pats(),
+            &no_allow(),
+        )
+        .map(|(d, _)| d);
         assert_eq!(result, Some("deny".into()));
     }
 
@@ -7706,7 +7710,8 @@ mod tests {
     #[test]
     fn abs_path_dangerous_script_scanned() {
         // An absolute-path script with deny content should be caught
-        let path = format!("/tmp/clawband_test_{}_abs_evil.sh", std::process::id());
+        let f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        let path = f.path().to_str().unwrap().to_string();
         fs::write(&path, "#!/bin/bash\ndocker system prune\n").unwrap();
         // The full extract + scan pipeline
         let extracted = extract_script_path(&path);
@@ -7714,7 +7719,6 @@ mod tests {
         let result = extracted
             .and_then(|p| scan_script_file(&p, &deny_pats(), &ask_pats(), &no_allow()))
             .map(|(d, _)| d);
-        let _ = fs::remove_file(&path);
         assert_eq!(result, Some("deny".into()));
     }
 
@@ -7791,23 +7795,23 @@ mod tests {
     #[test]
     fn bash_ex_evil_script_denied() {
         // Full pipeline: -ex flag should not skip scanning, evil file should deny
-        let path = format!("/tmp/clawband_test_{}_116_ex.sh", std::process::id());
+        let f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        let path = f.path().to_str().unwrap().to_string();
         fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
-        let result = extract_script_path(&format!("bash -ex {}", path))
+        let result = extract_script_path(&format!("bash -ex {path}"))
             .and_then(|p| scan_script_file(&p, &deny_pats(), &ask_pats(), &no_allow()))
             .map(|(d, _)| d);
-        let _ = fs::remove_file(&path);
         assert_eq!(result, Some("deny".into()));
     }
 
     #[test]
     fn bash_eu_evil_script_denied() {
-        let path = format!("/tmp/clawband_test_{}_116_eu.sh", std::process::id());
+        let f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        let path = f.path().to_str().unwrap().to_string();
         fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
-        let result = extract_script_path(&format!("bash -eu {}", path))
+        let result = extract_script_path(&format!("bash -eu {path}"))
             .and_then(|p| scan_script_file(&p, &deny_pats(), &ask_pats(), &no_allow()))
             .map(|(d, _)| d);
-        let _ = fs::remove_file(&path);
         assert_eq!(result, Some("deny".into()));
     }
 
@@ -8027,7 +8031,8 @@ mod tests {
     #[test]
     fn scan_script_oversized_file_skipped() {
         use std::io::Write;
-        let path = format!("/tmp/clawband_test_{}_oversized.sh", std::process::id());
+        let tmp = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
         // Write a file larger than SCRIPT_SCAN_MAX_BYTES (1 MiB).
         // Fill with benign content so the only reason to skip is size.
         let mut f = fs::File::create(&path).unwrap();
@@ -8038,7 +8043,6 @@ mod tests {
         }
         drop(f);
         let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
-        let _ = fs::remove_file(&path);
         assert_eq!(
             result, None,
             "oversized file should be skipped (no decision)"
@@ -9614,14 +9618,14 @@ mod tests {
     #[test]
     fn which_interp_with_script_file_is_scanned() {
         // Full pipeline: $(which bash) evil.sh → script is extracted and scanned
-        let path = format!("/tmp/clawband_test_{}_which_evil.sh", std::process::id());
+        let f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        let path = f.path().to_str().unwrap().to_string();
         fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
-        let extracted = extract_script_path(&format!("$(which bash) {}", path));
+        let extracted = extract_script_path(&format!("$(which bash) {path}"));
         assert_eq!(extracted, Some(path.clone()));
         let result = extracted
             .and_then(|p| scan_script_file(&p, &deny_pats(), &ask_pats(), &no_allow()))
             .map(|(d, _)| d);
-        let _ = fs::remove_file(&path);
         assert_eq!(
             result,
             Some("deny".into()),
