@@ -1793,10 +1793,10 @@ fn e2e_pipe_to_bash_space_regression() {
 #[test]
 fn e2e_bash_ex_evil_script_denied() {
     // bash -ex /path should still scan the file — -e means errexit, not inline code
-    let path = format!("/tmp/clawband_e2e_116_{}.sh", std::process::id());
-    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
-    let out = run(&bash(&format!("bash -ex {}", path)), &[]);
-    let _ = std::fs::remove_file(&path);
+    let mut f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    writeln!(f, "#!/bin/bash\nrm -rf /").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash -ex {path}")), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
@@ -1806,10 +1806,10 @@ fn e2e_bash_ex_evil_script_denied() {
 
 #[test]
 fn e2e_bash_eu_evil_script_denied() {
-    let path = format!("/tmp/clawband_e2e_116_eu_{}.sh", std::process::id());
-    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
-    let out = run(&bash(&format!("bash -eu {}", path)), &[]);
-    let _ = std::fs::remove_file(&path);
+    let mut f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    writeln!(f, "#!/bin/bash\nrm -rf /").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash -eu {path}")), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
@@ -1820,10 +1820,10 @@ fn e2e_bash_eu_evil_script_denied() {
 #[test]
 fn e2e_bash_no_flags_evil_script_denied() {
     // Baseline regression: unflagged invocation must still be caught
-    let path = format!("/tmp/clawband_e2e_116_base_{}.sh", std::process::id());
-    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
-    let out = run(&bash(&format!("bash {}", path)), &[]);
-    let _ = std::fs::remove_file(&path);
+    let mut f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    writeln!(f, "#!/bin/bash\nrm -rf /").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
@@ -1836,10 +1836,10 @@ fn e2e_bash_no_flags_evil_script_denied() {
 #[test]
 fn e2e_abs_interp_bin_bash_evil_script_denied() {
     // /bin/bash /path/to/evil.sh must scan the file — absolute interpreter path was a bypass
-    let path = format!("/tmp/clawband_e2e_141_bin_{}.sh", std::process::id());
-    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
-    let out = run(&bash(&format!("/bin/bash {}", path)), &[]);
-    let _ = std::fs::remove_file(&path);
+    let mut f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    writeln!(f, "#!/bin/bash\nrm -rf /").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("/bin/bash {path}")), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
@@ -1849,10 +1849,10 @@ fn e2e_abs_interp_bin_bash_evil_script_denied() {
 
 #[test]
 fn e2e_abs_interp_usr_bin_bash_evil_script_denied() {
-    let path = format!("/tmp/clawband_e2e_141_usr_{}.sh", std::process::id());
-    std::fs::write(&path, "#!/bin/bash\nrm -rf /\n").unwrap();
-    let out = run(&bash(&format!("/usr/bin/bash {}", path)), &[]);
-    let _ = std::fs::remove_file(&path);
+    let mut f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    writeln!(f, "#!/bin/bash\nrm -rf /").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("/usr/bin/bash {path}")), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
@@ -1862,10 +1862,10 @@ fn e2e_abs_interp_usr_bin_bash_evil_script_denied() {
 
 #[test]
 fn e2e_abs_interp_python3_evil_script_denied() {
-    let path = format!("/tmp/clawband_e2e_141_py_{}.py", std::process::id());
-    std::fs::write(&path, "import os\nos.system('rm -rf /')\n").unwrap();
-    let out = run(&bash(&format!("/usr/bin/python3 {}", path)), &[]);
-    let _ = std::fs::remove_file(&path);
+    let mut f = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+    writeln!(f, "import os\nos.system('rm -rf /')").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("/usr/bin/python3 {path}")), &[]);
     assert_eq!(
         decision(&out),
         Some("deny"),
