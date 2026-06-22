@@ -1409,6 +1409,7 @@ fn scan_script_file(
 
         // Reuse compound-command splitting so `foo && rm -rf /` is caught
         let clean = strip_safe_pipes(line);
+        let mut chained_match: Option<&str> = None;
         for segment in &split_segments(&clean) {
             if allow_pats.iter().any(|p| p.matches(segment)) {
                 continue;
@@ -1444,9 +1445,47 @@ fn scan_script_file(
                     ));
                 }
             }
+            // Chained-script detection: flag lines that invoke another script
+            // whose contents are not scanned.
+            if chained_match.is_none() && is_chained_script_invocation(segment) {
+                chained_match = Some(raw_line);
+            }
+        }
+        if let Some(matched_line) = chained_match {
+            return Some((
+                "ask".into(),
+                format!(
+                    "script chains to another script: '{}' — contents not scanned",
+                    matched_line.trim()
+                ),
+            ));
         }
     }
     None
+}
+
+/// Returns true if `segment` looks like an invocation of another script file
+/// whose contents clawband has not scanned (e.g. `bash scripts/setup.sh`,
+/// `source ./env.sh`, `./deploy.sh`).
+fn is_chained_script_invocation(segment: &str) -> bool {
+    // interpreter + path: bash/sh/zsh/python3/python/ruby/perl/node followed
+    // by a non-flag, non-empty argument that looks like a file path.
+    let interp_re =
+        Regex::new(r"(?i)^\s*(?:bash|sh|zsh|python3?|ruby|perl|node)\s+([^-\s]\S*)").unwrap();
+    if interp_re.is_match(segment) {
+        return true;
+    }
+    // source or . (dot) followed by a file argument
+    let source_re = Regex::new(r"(?i)^\s*(?:source|\.)\s+(\S+)").unwrap();
+    if source_re.is_match(segment) {
+        return true;
+    }
+    // direct execution: ./path
+    let direct_re = Regex::new(r"(?i)^\s*\./\S+").unwrap();
+    if direct_re.is_match(segment) {
+        return true;
+    }
+    false
 }
 
 // ─── Git force push check ─────────────────────────────────────────────────────
@@ -6010,6 +6049,78 @@ mod tests {
                 "#!/bin/bash\necho hi && docker system prune\n"
             ),
             Some("deny".into())
+        );
+    }
+
+    // ── chained-script detection ───────────────────────────────────────────────
+
+    fn scan_content_decision(name: &str, ext: &str, content: &str) -> Option<(String, String)> {
+        let path = format!("/tmp/clawband_test_{}_{}.{}", std::process::id(), name, ext);
+        fs::write(&path, content).unwrap();
+        let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
+        let _ = fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn scan_chained_bash_script_asks() {
+        let r = scan_content_decision("ch_bash", "sh", "#!/bin/bash\nbash scripts/setup.sh\n");
+        assert_eq!(r.as_ref().map(|(d, _)| d.as_str()), Some("ask"));
+        assert!(
+            r.unwrap().1.contains("chains to another script"),
+            "reason must mention chained script"
+        );
+    }
+
+    #[test]
+    fn scan_chained_python3_asks() {
+        let r = scan_content_decision("ch_py3", "sh", "#!/bin/bash\npython3 helper.py\n");
+        assert_eq!(r.as_ref().map(|(d, _)| d.as_str()), Some("ask"));
+        assert!(r.unwrap().1.contains("chains to another script"));
+    }
+
+    #[test]
+    fn scan_chained_source_asks() {
+        let r = scan_content_decision("ch_src", "sh", "#!/bin/bash\nsource ./env.sh\n");
+        assert_eq!(r.as_ref().map(|(d, _)| d.as_str()), Some("ask"));
+        assert!(r.unwrap().1.contains("chains to another script"));
+    }
+
+    #[test]
+    fn scan_chained_dot_source_asks() {
+        let r = scan_content_decision("ch_dot", "sh", "#!/bin/bash\n. config.sh\n");
+        assert_eq!(r.as_ref().map(|(d, _)| d.as_str()), Some("ask"));
+        assert!(r.unwrap().1.contains("chains to another script"));
+    }
+
+    #[test]
+    fn scan_chained_direct_exec_asks() {
+        let r = scan_content_decision("ch_direct", "sh", "#!/bin/bash\n./deploy.sh\n");
+        assert_eq!(r.as_ref().map(|(d, _)| d.as_str()), Some("ask"));
+        assert!(r.unwrap().1.contains("chains to another script"));
+    }
+
+    #[test]
+    fn scan_echo_hello_does_not_trigger_chained() {
+        assert_eq!(
+            scan_content("ch_echo", "sh", "#!/bin/bash\necho hello\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_deny_pattern_not_chained_script() {
+        // Existing deny patterns take priority over the chained-script ask.
+        let r = scan_content_decision(
+            "ch_deny",
+            "sh",
+            "#!/bin/bash\ncd /tmp && docker system prune\n",
+        );
+        // Must be deny (from docker system prune pattern), not a chained-script ask
+        assert_eq!(r.as_ref().map(|(d, _)| d.as_str()), Some("deny"));
+        assert!(
+            !r.unwrap().1.contains("chains to another script"),
+            "deny pattern must fire, not chained-script"
         );
     }
 
