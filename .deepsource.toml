@@ -1,0 +1,25 @@
+version = 1
+
+[[analyzers]]
+name = "rust"
+enabled = true
+
+  [analyzers.meta]
+  # Mark test functions so DeepSource applies test-file thresholds.
+  # Inline /tmp/ strings in test assertions are not creating real files.
+  test_patterns = [
+    "tests/**",
+    "**/*_test.rs",
+  ]
+
+[[analyzers]]
+name = "shell"
+enabled = true
+
+[[analyzers]]
+name = "secrets"
+enabled = true
+
+[[analyzers]]
+name = "javascript"
+enabled = true
