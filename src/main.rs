@@ -6850,15 +6850,17 @@ mod tests {
 
     #[test]
     fn edit_candidates_nonexistent_path_parent_resolved() {
-        // Parent dir exists (/var/tmp), file does not
-        let path = "/var/tmp/clawband_test_nonexistent_unique.txt";
-        let candidates = edit_candidates(path);
+        // Create a real tempfile, capture its path, then drop it so the file
+        // is gone but the parent directory still exists.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let fname = f.path().file_name().unwrap().to_str().unwrap().to_string();
+        drop(f);
+        let candidates = edit_candidates(&path);
         // Must contain the original path
-        assert!(candidates.iter().any(|c| c == path));
+        assert!(candidates.iter().any(|c| c == &path));
         // Must include a candidate ending with the filename
-        assert!(candidates
-            .iter()
-            .any(|c| c.ends_with("clawband_test_nonexistent_unique.txt")));
+        assert!(candidates.iter().any(|c| c.ends_with(&fname)));
     }
 
     #[test]
