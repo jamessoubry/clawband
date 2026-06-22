@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod experiment_scanner;
+
 // ─── Multi-agent mode ─────────────────────────────────────────────────────────
 
 /// Which agent the hook is serving.  Affects only output rendering and install
