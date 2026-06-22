@@ -2945,3 +2945,91 @@ fn e2e_brace_expansion_passes() {
         "{{rm,-rf,/}} must pass through (brace expansion is out of scope): {out}"
     );
 }
+
+// ── Chained-script detection e2e (issue #178) ────────────────────────────────
+
+#[test]
+fn e2e_chained_bash_script_asks() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\nbash scripts/setup.sh").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "script containing 'bash scripts/setup.sh' must ask: {out}"
+    );
+    assert!(
+        out.contains("chains to another script"),
+        "reason must mention chained script: {out}"
+    );
+}
+
+#[test]
+fn e2e_chained_python3_script_asks() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\npython3 helper.py").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "script containing 'python3 helper.py' must ask: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}
+
+#[test]
+fn e2e_chained_source_script_asks() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\nsource ./env.sh").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "script containing 'source ./env.sh' must ask: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}
+
+#[test]
+fn e2e_chained_dot_source_asks() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\n. config.sh").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "script containing '. config.sh' must ask: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}
+
+#[test]
+fn e2e_chained_direct_exec_asks() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\n./deploy.sh").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "script containing './deploy.sh' must ask: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}
+
+#[test]
+fn e2e_chained_clean_script_passes() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\necho hello\ncd /tmp\nexport FOO=bar").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "clean script with no chained invocations must pass: {out}"
+    );
+}

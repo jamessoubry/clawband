@@ -1468,20 +1468,25 @@ fn scan_script_file(
 /// whose contents clawband has not scanned (e.g. `bash scripts/setup.sh`,
 /// `source ./env.sh`, `./deploy.sh`).
 fn is_chained_script_invocation(segment: &str) -> bool {
+    use std::sync::OnceLock;
+    static INTERP_RE: OnceLock<Regex> = OnceLock::new();
+    static SOURCE_RE: OnceLock<Regex> = OnceLock::new();
+    static DIRECT_RE: OnceLock<Regex> = OnceLock::new();
     // interpreter + path: bash/sh/zsh/python3/python/ruby/perl/node followed
     // by a non-flag, non-empty argument that looks like a file path.
-    let interp_re =
-        Regex::new(r"(?i)^\s*(?:bash|sh|zsh|python3?|ruby|perl|node)\s+([^-\s]\S*)").unwrap();
+    let interp_re = INTERP_RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(?:bash|sh|zsh|python3?|ruby|perl|node)\s+([^-\s]\S*)").unwrap()
+    });
     if interp_re.is_match(segment) {
         return true;
     }
     // source or . (dot) followed by a file argument
-    let source_re = Regex::new(r"(?i)^\s*(?:source|\.)\s+(\S+)").unwrap();
+    let source_re = SOURCE_RE.get_or_init(|| Regex::new(r"(?i)^\s*(?:source|\.)\s+(\S+)").unwrap());
     if source_re.is_match(segment) {
         return true;
     }
     // direct execution: ./path
-    let direct_re = Regex::new(r"(?i)^\s*\./\S+").unwrap();
+    let direct_re = DIRECT_RE.get_or_init(|| Regex::new(r"(?i)^\s*\./\S+").unwrap());
     if direct_re.is_match(segment) {
         return true;
     }
