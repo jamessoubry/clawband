@@ -491,6 +491,24 @@ Removing the entry from that list lets clawband's ask/deny patterns take over as
 - **Commit messages containing blocked patterns** — if a commit message itself contains a pattern like `rm -rf /` (e.g. documenting a fix), clawband will block the `git commit` command. Workaround: write the message to a temp file and use `git commit -F /tmp/msg.txt`, or rephrase to avoid the literal pattern.
 - **Fail-closed on parse error** — if clawband cannot read or parse the hook input (stdin read failure, malformed JSON), it emits `deny` and blocks the command. It does **not** fail-open.
 
+### Known shell obfuscation bypasses (issue #129)
+
+clawband performs static string matching without running a shell interpreter, so techniques that require shell evaluation to resolve are out of scope. The following bypass classes are documented here for transparency:
+
+| Technique | Example | Status |
+|-----------|---------|--------|
+| Brace expansion | `{rm,-rf,/}` | Out of scope — requires shell to resolve |
+| ANSI-C hex quoting | `$'\x72\x6d' -rf /` | Out of scope — requires shell to resolve |
+| ANSI-C octal quoting | `$'\162\155' -rf /` | Out of scope — requires shell to resolve |
+| Glob in binary path | `/bin/r? -rf /` | Out of scope — requires shell to resolve |
+| Bracket glob | `/bin/r[m] -rf /` | Out of scope — requires shell to resolve |
+| Empty-quote splitting | `r""m -rf /`, `r''m -rf /` | **Normalized and caught** |
+| Backslash in command word | `r\m -rf /` | **Normalized and caught** |
+
+The inline-quote and backslash forms (`r""m`, `r''m`, `r\m`) are handled by a first-token normalization pass that strips empty quote pairs and unescaped backslashes before pattern matching, reducing these to their effective command name (e.g. `rm`).
+
+Brace expansion, ANSI-C quoting, and glob expansion require actual shell execution to resolve and cannot be detected reliably without running the command. These are treated as out-of-scope for a static hook.
+
 ## Contributing
 
 Found a destructive command clawband misses? Open a [New pattern issue](https://github.com/jamessoubry/clawband/issues/new?template=new-pattern.md) (no Rust needed) or add it yourself — patterns live in `src/main.rs` in `builtin_deny()` and `builtin_ask()`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the pattern recipe, guidelines, and dev setup.

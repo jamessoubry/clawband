@@ -1660,6 +1660,69 @@ fn strip_comment(s: &str) -> &str {
     s
 }
 
+// ─── First-token normalization (issue #129) ──────────────────────────────────
+// Strips empty-quote insertions and lone backslashes from the first word of a
+// segment so that obfuscated forms like `r""m`, `r''m`, and `r\m` are reduced
+// to their effective command name before pattern matching.
+
+/// Normalize the first whitespace-delimited token of a segment by removing:
+///   - empty double-quotes (`""`) embedded in the token
+///   - empty single-quotes (`''`) embedded in the token
+///   - unescaped backslash characters (`\`) that split a command name
+///
+/// Non-empty quoted strings are left untouched (e.g. `"foo"bar` stays as-is).
+/// Returns the segment with the normalized first token substituted in place.
+fn normalize_first_token(segment: &str) -> String {
+    let Some(space_pos) = segment.find(|c: char| c.is_ascii_whitespace()) else {
+        // Whole segment is one token
+        let normalized = strip_empty_quotes_and_backslashes(segment);
+        return normalized;
+    };
+    let first = &segment[..space_pos];
+    let rest = &segment[space_pos..];
+    let normalized = strip_empty_quotes_and_backslashes(first);
+    format!("{}{}", normalized, rest)
+}
+
+/// Remove `""`, `''`, and lone backslashes from a command-name token.
+/// Non-empty quoted content is preserved so we don't accidentally collapse
+/// `"foo"bar` into `foobar` (which might be a different command).
+fn strip_empty_quotes_and_backslashes(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let bytes = token.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'"' if i + 1 < bytes.len() && bytes[i + 1] == b'"' => {
+                // empty double-quote pair — skip both
+                i += 2;
+            }
+            b'\'' if i + 1 < bytes.len() && bytes[i + 1] == b'\'' => {
+                // empty single-quote pair — skip both
+                i += 2;
+            }
+            b'\\' if i + 1 < bytes.len() => {
+                let next = bytes[i + 1];
+                if next != b'"' && next != b'\'' && next != b'\\' {
+                    // bare backslash splitting the command name — skip just the backslash
+                    i += 1;
+                } else {
+                    // escape sequence with semantic meaning — keep both chars
+                    out.push(b as char);
+                    out.push(next as char);
+                    i += 2;
+                }
+            }
+            _ => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 // ─── Segment normalization (issue #70) ───────────────────────────────────────
 // Strips leading shell noise so pattern matching fires reliably regardless of
 // how a command is prefixed. Applied in check_command before deny/ask checks.
@@ -4418,6 +4481,9 @@ fn check_command<'a>(
         // A `#` outside quotes preceded by whitespace begins a comment that the
         // shell never executes — scanning it produces false-positive blocks.
         let segment: &str = strip_comment(segment.as_str());
+        // Normalize empty-quote and backslash command-word splitting (issue #129):
+        // `r""m -rf /` → `rm -rf /`, `r''m -rf /` → `rm -rf /`, `r\m -rf /` → `rm -rf /`.
+        let tok_norm = normalize_first_token(segment);
         let (norm, stripped_vars) = normalize_segment(segment);
         // Apply rm flag normalization so `rm -r -v -f /` matches the same deny
         // patterns as `rm -rvf /` (issue #110).  Run on both the original segment
@@ -4429,6 +4495,9 @@ fn check_command<'a>(
         // Checking both preserves backward compat for allow patterns while ensuring
         // future anchor-based deny patterns fire on normalized form too.
         let mut forms_vec: Vec<&str> = vec![segment];
+        if tok_norm != segment {
+            forms_vec.push(tok_norm.as_str());
+        }
         if norm != segment.trim() {
             forms_vec.push(norm.as_str());
         }
@@ -9931,5 +10000,60 @@ mod tests {
         // Temp file must have been cleaned up by the rename
         let tmp = target.with_extension("json.tmp");
         assert!(!tmp.exists(), ".json.tmp must not exist after atomic write");
+    }
+
+    // ── First-token normalization (issue #129) ─────────────────────────────────
+
+    #[test]
+    fn empty_double_quote_split_denied() {
+        // r""m -rf / normalizes to rm -rf / → deny
+        assert_eq!(decision(r#"r""m -rf /"#), Some("deny".into()));
+    }
+
+    #[test]
+    fn empty_single_quote_split_denied() {
+        // r''m -rf / normalizes to rm -rf / → deny
+        assert_eq!(decision("r''m -rf /"), Some("deny".into()));
+    }
+
+    #[test]
+    fn backslash_split_denied() {
+        // r\m -rf / normalizes to rm -rf / → deny
+        assert_eq!(decision(r"r\m -rf /"), Some("deny".into()));
+    }
+
+    #[test]
+    fn brace_expansion_passes() {
+        // {rm,-rf,/} — brace expansion requires shell to resolve; out of scope, must pass through
+        assert_eq!(decision("{rm,-rf,/}"), None);
+    }
+
+    #[test]
+    fn non_empty_quote_passes() {
+        // r"foo"m -rf / — non-empty quoted string, out of scope for normalization
+        assert_eq!(decision(r#"r"foo"m -rf /"#), None);
+    }
+
+    #[test]
+    fn normalize_first_token_empty_double_quotes() {
+        assert_eq!(normalize_first_token(r#"r""m -rf /"#), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_first_token_empty_single_quotes() {
+        assert_eq!(normalize_first_token("r''m -rf /"), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_first_token_backslash() {
+        assert_eq!(normalize_first_token(r"r\m -rf /"), "rm -rf /");
+    }
+
+    #[test]
+    fn normalize_first_token_no_change_for_non_empty_quotes() {
+        assert_eq!(
+            normalize_first_token(r#"r"foo"m -rf /"#),
+            r#"r"foo"m -rf /"#
+        );
     }
 }
