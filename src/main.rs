@@ -1361,6 +1361,9 @@ fn scan_script_file(
         || path.ends_with(".tsx");
     let is_lua = path.ends_with(".lua");
     let mut in_block_comment = false;
+    // Chained-script match is tracked across all lines so that deny/ask
+    // patterns on later lines still take priority (see issue #178).
+    let mut chained_match: Option<String> = None;
 
     for (lineno, raw_line) in content.lines().enumerate() {
         let line = raw_line.trim();
@@ -1409,7 +1412,6 @@ fn scan_script_file(
 
         // Reuse compound-command splitting so `foo && rm -rf /` is caught
         let clean = strip_safe_pipes(line);
-        let mut chained_match: Option<&str> = None;
         for segment in &split_segments(&clean) {
             if allow_pats.iter().any(|p| p.matches(segment)) {
                 continue;
@@ -1445,21 +1447,21 @@ fn scan_script_file(
                     ));
                 }
             }
-            // Chained-script detection: flag lines that invoke another script
-            // whose contents are not scanned.
+            // Chained-script detection: record first match but keep scanning
+            // so deny/ask patterns on later lines still take priority.
             if chained_match.is_none() && is_chained_script_invocation(segment) {
-                chained_match = Some(raw_line);
+                chained_match = Some(raw_line.trim().to_string());
             }
         }
-        if let Some(matched_line) = chained_match {
-            return Some((
-                "ask".into(),
-                format!(
-                    "script chains to another script: '{}' — contents not scanned",
-                    matched_line.trim()
-                ),
-            ));
-        }
+    }
+    if let Some(matched_line) = chained_match {
+        return Some((
+            "ask".into(),
+            format!(
+                "script chains to another script: '{}' — contents not scanned",
+                matched_line
+            ),
+        ));
     }
     None
 }
@@ -5979,13 +5981,19 @@ mod tests {
     // Write real temp files and verify the scanner catches dangerous content.
 
     // Use unique per-test paths to avoid parallel-test race conditions
-    fn scan_content(name: &str, ext: &str, content: &str) -> Option<String> {
-        let path = format!("/tmp/clawband_test_{}_{}.{}", std::process::id(), name, ext);
-        fs::write(&path, content).unwrap();
-        let result =
-            scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow()).map(|(d, _)| d);
-        let _ = fs::remove_file(&path);
-        result
+    fn scan_content(_name: &str, ext: &str, content: &str) -> Option<String> {
+        let f = tempfile::Builder::new()
+            .suffix(&format!(".{ext}"))
+            .tempfile()
+            .unwrap();
+        fs::write(f.path(), content).unwrap();
+        scan_script_file(
+            f.path().to_str().unwrap(),
+            &deny_pats(),
+            &ask_pats(),
+            &no_allow(),
+        )
+        .map(|(d, _)| d)
     }
 
     #[test]
@@ -6059,12 +6067,18 @@ mod tests {
 
     // ── chained-script detection ───────────────────────────────────────────────
 
-    fn scan_content_decision(name: &str, ext: &str, content: &str) -> Option<(String, String)> {
-        let path = format!("/tmp/clawband_test_{}_{}.{}", std::process::id(), name, ext);
-        fs::write(&path, content).unwrap();
-        let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
-        let _ = fs::remove_file(&path);
-        result
+    fn scan_content_decision(_name: &str, ext: &str, content: &str) -> Option<(String, String)> {
+        let f = tempfile::Builder::new()
+            .suffix(&format!(".{ext}"))
+            .tempfile()
+            .unwrap();
+        fs::write(f.path(), content).unwrap();
+        scan_script_file(
+            f.path().to_str().unwrap(),
+            &deny_pats(),
+            &ask_pats(),
+            &no_allow(),
+        )
     }
 
     #[test]
@@ -6123,6 +6137,26 @@ mod tests {
         );
         // Must be deny (from docker system prune pattern), not a chained-script ask
         assert_eq!(r.as_ref().map(|(d, _)| d.as_str()), Some("deny"));
+        assert!(
+            !r.unwrap().1.contains("chains to another script"),
+            "deny pattern must fire, not chained-script"
+        );
+    }
+
+    #[test]
+    fn scan_deny_after_chained_beats_chained() {
+        // Deny pattern on a LATER line must still fire even though an earlier
+        // line triggered chained-script detection (priority inversion fix).
+        let r = scan_content_decision(
+            "ch_deny_later",
+            "sh",
+            "#!/bin/bash\nsource ./env.sh\ndocker system prune\n",
+        );
+        assert_eq!(
+            r.as_ref().map(|(d, _)| d.as_str()),
+            Some("deny"),
+            "deny on later line must win over chained ask on earlier line"
+        );
         assert!(
             !r.unwrap().1.contains("chains to another script"),
             "deny pattern must fire, not chained-script"
