@@ -30,6 +30,16 @@ Single `|` is intentionally **not** a splitter — this keeps pipe-to-interprete
 
 When a command runs a script file (`bash foo.sh`, `python3 script.py`, `ruby app.rb`, `./run.sh`, `bash < input.sh`), clawband reads the file and checks each line against deny/ask patterns before execution. Supported interpreters: `bash`, `sh`, `zsh`, `dash`, `python3`, `node`, `deno`, `perl`, `ruby`, `lua`.
 
+> **Tip — the safe way to install scripts from the internet:** clawband unconditionally blocks `curl | bash` and similar pipe-to-interpreter patterns. The recommended alternative is to download the script first, read it, then run it:
+>
+> ```sh
+> curl -O https://example.com/install.sh   # download
+> cat install.sh                           # inspect before running
+> bash install.sh                          # clawband scans the file line-by-line before execution
+> ```
+>
+> This is safer in two ways: you see what the script does before it runs, and clawband's file scanner checks every line against deny/ask patterns at execution time. A one-liner like `curl url | bash` bypasses both.
+
 ### Write-then-execute detection
 
 If a compound command **writes** to a file and **executes that same file** in one invocation, the content can't be scanned before it runs. clawband catches this regardless of file extension:
