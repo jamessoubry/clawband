@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 /// Experimental two-tier line scanner — used to test static analysis tooling.
 ///
 /// Scans `lines` for two classes of pattern:
