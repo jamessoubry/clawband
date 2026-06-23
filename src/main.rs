@@ -1355,11 +1355,54 @@ fn scan_script_file(
         return None;
     }
     let content = fs::read_to_string(path).ok()?;
-    let is_js = path.ends_with(".js")
-        || path.ends_with(".mjs")
-        || path.ends_with(".ts")
-        || path.ends_with(".tsx");
-    let is_lua = path.ends_with(".lua");
+
+    // Detect interpreter from shebang; shebang takes precedence over extension.
+    // Returns None for unrecognised interpreters so the extension fallback still fires.
+    let shebang_interp: Option<&'static str> = content
+        .lines()
+        .next()
+        .and_then(|first| first.strip_prefix("#!"))
+        .and_then(|interp_line| {
+            // Strip leading whitespace and take the interpreter name after optional /usr/bin/env
+            let tokens: Vec<&str> = interp_line.split_whitespace().collect();
+            let interp = if tokens.first().map(|t| t.ends_with("/env")).unwrap_or(false) {
+                tokens.get(1).copied().unwrap_or("")
+            } else {
+                tokens.first().copied().unwrap_or("")
+            };
+            // Extract basename of interpreter path
+            let name = interp.rsplit('/').next().unwrap_or(interp);
+            if name.starts_with("python") {
+                Some("python")
+            } else if matches!(name, "bash" | "sh" | "zsh" | "dash" | "ksh") {
+                Some("shell")
+            } else if name.starts_with("node") || matches!(name, "deno" | "bun") {
+                Some("node")
+            } else if name.starts_with("ruby") {
+                Some("ruby")
+            } else if name.starts_with("perl") {
+                Some("perl")
+            } else if name.starts_with("lua") {
+                Some("lua")
+            } else {
+                // Unrecognised shebang — return None so extension fallback fires
+                None
+            }
+        });
+
+    let is_js = if let Some(interp) = shebang_interp {
+        interp == "node"
+    } else {
+        path.ends_with(".js")
+            || path.ends_with(".mjs")
+            || path.ends_with(".ts")
+            || path.ends_with(".tsx")
+    };
+    let is_lua = if let Some(interp) = shebang_interp {
+        interp == "lua"
+    } else {
+        path.ends_with(".lua")
+    };
     let mut in_block_comment = false;
     // Chained-script match is tracked across all lines so that deny/ask
     // patterns on later lines still take priority (see issue #178).
@@ -6161,6 +6204,60 @@ mod tests {
             !r.unwrap().1.contains("chains to another script"),
             "deny pattern must fire, not chained-script"
         );
+    }
+
+    // ── shebang-based interpreter detection ───────────────────────────────────
+
+    fn scan_no_ext(content: &str) -> Option<String> {
+        // Create a tempfile with no extension to verify shebang-only detection.
+        let f = tempfile::Builder::new().tempfile().unwrap();
+        fs::write(f.path(), content).unwrap();
+        scan_script_file(
+            f.path().to_str().unwrap(),
+            &deny_pats(),
+            &ask_pats(),
+            &no_allow(),
+        )
+        .map(|(d, _)| d)
+    }
+
+    #[test]
+    fn scan_shebang_python_no_ext_deny() {
+        // File has no extension but shebang declares python3; os.system must be caught.
+        assert_eq!(
+            scan_no_ext("#!/usr/bin/env python3\nimport os\nos.system('rm -rf /')\n"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn scan_shebang_bash_no_ext_deny() {
+        assert_eq!(scan_no_ext("#!/bin/bash\nrm -rf /\n"), Some("deny".into()));
+    }
+
+    #[test]
+    fn scan_shebang_node_no_ext_js_block_comment_respected() {
+        // Shebang declares node; JS block-comment stripping should be active
+        // so a deny pattern inside /* ... */ is NOT caught.
+        assert_eq!(
+            scan_no_ext("#!/usr/bin/env node\n/* rm -rf / */\nconsole.log('hi');\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_shebang_lua_no_ext_lua_block_comment_respected() {
+        // Shebang declares lua; Lua block-comment stripping should be active.
+        assert_eq!(
+            scan_no_ext("#!/usr/bin/lua\n--[[ rm -rf / ]]\nprint('hi')\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_no_shebang_no_ext_deny_still_caught() {
+        // No shebang, no extension — safe fallback applies all pattern sets.
+        assert_eq!(scan_no_ext("rm -rf /\n"), Some("deny".into()));
     }
 
     // ── install: register_hook ─────────────────────────────────────────────────
