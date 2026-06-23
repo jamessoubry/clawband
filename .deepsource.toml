@@ -1,0 +1,28 @@
+version = 1
+
+[[analyzers]]
+name = "rust"
+enabled = true
+
+  [analyzers.meta]
+  test_patterns = [
+    "tests/**",
+    "**/*_test.rs",
+  ]
+
+[[exclude_patterns]]
+# Temp-file usage in test helpers is intentional and safe — tempfile crate
+# is used everywhere; remaining /tmp/ strings are test input literals only.
+pattern = "tests/**"
+
+[[analyzers]]
+name = "shell"
+enabled = true
+
+[[analyzers]]
+name = "secrets"
+enabled = true
+
+[[analyzers]]
+name = "javascript"
+enabled = true
