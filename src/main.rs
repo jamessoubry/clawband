@@ -1357,11 +1357,12 @@ fn scan_script_file(
     let content = fs::read_to_string(path).ok()?;
 
     // Detect interpreter from shebang; shebang takes precedence over extension.
+    // Returns None for unrecognised interpreters so the extension fallback still fires.
     let shebang_interp: Option<&'static str> = content
         .lines()
         .next()
         .and_then(|first| first.strip_prefix("#!"))
-        .map(|interp_line| {
+        .and_then(|interp_line| {
             // Strip leading whitespace and take the interpreter name after optional /usr/bin/env
             let tokens: Vec<&str> = interp_line.split_whitespace().collect();
             let interp = if tokens.first().map(|t| t.ends_with("/env")).unwrap_or(false) {
@@ -1372,19 +1373,20 @@ fn scan_script_file(
             // Extract basename of interpreter path
             let name = interp.rsplit('/').next().unwrap_or(interp);
             if name.starts_with("python") {
-                "python"
+                Some("python")
             } else if matches!(name, "bash" | "sh" | "zsh" | "dash" | "ksh") {
-                "shell"
-            } else if name.starts_with("node") {
-                "node"
+                Some("shell")
+            } else if name.starts_with("node") || matches!(name, "deno" | "bun") {
+                Some("node")
             } else if name.starts_with("ruby") {
-                "ruby"
+                Some("ruby")
             } else if name.starts_with("perl") {
-                "perl"
+                Some("perl")
             } else if name.starts_with("lua") {
-                "lua"
+                Some("lua")
             } else {
-                "unknown"
+                // Unrecognised shebang — return None so extension fallback fires
+                None
             }
         });
 

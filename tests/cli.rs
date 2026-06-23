@@ -3046,13 +3046,7 @@ fn e2e_shebang_python_script_without_extension_denied() {
         "#!/usr/bin/env python3\nimport os\nos.system('rm -rf /')"
     )
     .unwrap();
-    let filename = f
-        .path()
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    let filename = f.path().file_name().unwrap().to_str().unwrap().to_string();
     let out = run(&bash(&format!("./{filename}")), &[]);
     assert_eq!(
         decision(&out),
@@ -3066,13 +3060,7 @@ fn e2e_shebang_bash_script_without_extension_passes_clean() {
     // Clean bash script with shebang but no extension — must pass.
     let mut f = tempfile::Builder::new().tempfile_in(".").unwrap();
     writeln!(f, "#!/bin/bash\necho hello\nls -la").unwrap();
-    let filename = f
-        .path()
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    let filename = f.path().file_name().unwrap().to_str().unwrap().to_string();
     let out = run(&bash(&format!("./{filename}")), &[]);
     assert_eq!(
         decision(&out),
