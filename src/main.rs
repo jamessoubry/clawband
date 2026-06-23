@@ -1338,6 +1338,75 @@ fn variable_name_from_path(path: &str) -> Option<String> {
     }
 }
 
+/// Reads the shebang from the first line of `content` and returns the
+/// interpreter class, or `None` for an unrecognised/absent shebang so that
+/// the extension fallback in `scan_script_file` still fires.
+fn detect_interpreter(content: &str) -> Option<&'static str> {
+    let interp_line = content.lines().next()?.strip_prefix("#!")?;
+    let tokens: Vec<&str> = interp_line.split_whitespace().collect();
+    let interp = if tokens.first().map(|t| t.ends_with("/env")).unwrap_or(false) {
+        tokens.get(1).copied().unwrap_or("")
+    } else {
+        tokens.first().copied().unwrap_or("")
+    };
+    let name = interp.rsplit('/').next().unwrap_or(interp);
+    if name.starts_with("python") {
+        Some("python")
+    } else if matches!(name, "bash" | "sh" | "zsh" | "dash" | "ksh") {
+        Some("shell")
+    } else if name.starts_with("node") || matches!(name, "deno" | "bun") {
+        Some("node")
+    } else if name.starts_with("ruby") {
+        Some("ruby")
+    } else if name.starts_with("perl") {
+        Some("perl")
+    } else if name.starts_with("lua") {
+        Some("lua")
+    } else {
+        None
+    }
+}
+
+/// Returns `true` if `line` (already trimmed) is a comment and should be
+/// skipped during pattern scanning.  Updates `in_block_comment` in place for
+/// multi-line block comment tracking.
+fn is_comment_line(line: &str, is_js: bool, is_lua: bool, in_block_comment: &mut bool) -> bool {
+    if is_js {
+        if *in_block_comment {
+            if line.contains("*/") {
+                *in_block_comment = false;
+            }
+            return true;
+        }
+        if line.starts_with("/*") {
+            *in_block_comment = !line.contains("*/");
+            return true;
+        }
+        if line.starts_with("//") || line.starts_with('*') {
+            return true;
+        }
+    }
+
+    if is_lua {
+        if *in_block_comment {
+            if line.contains("]]") {
+                *in_block_comment = false;
+            }
+            return true;
+        }
+        if line.starts_with("--[[") {
+            *in_block_comment = !line.contains("]]");
+            return true;
+        }
+        if line.starts_with("--") {
+            return true;
+        }
+    }
+
+    // Shell / Python / Perl line comments
+    line.starts_with('#')
+}
+
 fn scan_script_file(
     path: &str,
     deny_pats: &[Pattern],
@@ -1356,53 +1425,19 @@ fn scan_script_file(
     }
     let content = fs::read_to_string(path).ok()?;
 
-    // Detect interpreter from shebang; shebang takes precedence over extension.
-    // Returns None for unrecognised interpreters so the extension fallback still fires.
-    let shebang_interp: Option<&'static str> = content
-        .lines()
-        .next()
-        .and_then(|first| first.strip_prefix("#!"))
-        .and_then(|interp_line| {
-            // Strip leading whitespace and take the interpreter name after optional /usr/bin/env
-            let tokens: Vec<&str> = interp_line.split_whitespace().collect();
-            let interp = if tokens.first().map(|t| t.ends_with("/env")).unwrap_or(false) {
-                tokens.get(1).copied().unwrap_or("")
-            } else {
-                tokens.first().copied().unwrap_or("")
-            };
-            // Extract basename of interpreter path
-            let name = interp.rsplit('/').next().unwrap_or(interp);
-            if name.starts_with("python") {
-                Some("python")
-            } else if matches!(name, "bash" | "sh" | "zsh" | "dash" | "ksh") {
-                Some("shell")
-            } else if name.starts_with("node") || matches!(name, "deno" | "bun") {
-                Some("node")
-            } else if name.starts_with("ruby") {
-                Some("ruby")
-            } else if name.starts_with("perl") {
-                Some("perl")
-            } else if name.starts_with("lua") {
-                Some("lua")
-            } else {
-                // Unrecognised shebang — return None so extension fallback fires
-                None
-            }
-        });
+    let shebang_interp = detect_interpreter(&content);
 
-    let is_js = if let Some(interp) = shebang_interp {
-        interp == "node"
-    } else {
-        path.ends_with(".js")
-            || path.ends_with(".mjs")
-            || path.ends_with(".ts")
-            || path.ends_with(".tsx")
-    };
-    let is_lua = if let Some(interp) = shebang_interp {
-        interp == "lua"
-    } else {
-        path.ends_with(".lua")
-    };
+    let is_js = shebang_interp.map_or_else(
+        || {
+            path.ends_with(".js")
+                || path.ends_with(".mjs")
+                || path.ends_with(".ts")
+                || path.ends_with(".tsx")
+        },
+        |interp| interp == "node",
+    );
+    let is_lua = shebang_interp.map_or_else(|| path.ends_with(".lua"), |interp| interp == "lua");
+
     let mut in_block_comment = false;
     // Chained-script match is tracked across all lines so that deny/ask
     // patterns on later lines still take priority (see issue #178).
@@ -1413,43 +1448,7 @@ fn scan_script_file(
         if line.is_empty() {
             continue;
         }
-
-        // JS/TS block comment state: /* ... */
-        if is_js {
-            if in_block_comment {
-                if line.contains("*/") {
-                    in_block_comment = false;
-                }
-                continue;
-            }
-            if line.starts_with("/*") {
-                in_block_comment = !line.contains("*/");
-                continue;
-            }
-            if line.starts_with("//") || line.starts_with('*') {
-                continue;
-            }
-        }
-
-        // Lua comment state: --[[ ... ]] block comments and -- line comments
-        if is_lua {
-            if in_block_comment {
-                if line.contains("]]") {
-                    in_block_comment = false;
-                }
-                continue;
-            }
-            if line.starts_with("--[[") {
-                in_block_comment = !line.contains("]]");
-                continue;
-            }
-            if line.starts_with("--") {
-                continue;
-            }
-        }
-
-        // Shell (#) and Python (#) and Perl (#) line comments
-        if line.starts_with('#') {
+        if is_comment_line(line, is_js, is_lua, &mut in_block_comment) {
             continue;
         }
 
