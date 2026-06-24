@@ -217,7 +217,8 @@ jobs:
           SHA_LINUX_X86="$(sha clawband-linux-x86_64)"
           SHA_LINUX_ARM="$(sha clawband-linux-arm64)"
 
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/jamessoubry/homebrew-clawband.git" tap
+          GH_TOKEN="${TAP_TOKEN}" gh auth setup-git
+          git clone https://github.com/jamessoubry/homebrew-clawband.git tap
           bash scripts/gen-formula.sh "$VERSION" "$SHA_MAC_ARM" "$SHA_MAC_X86" "$SHA_LINUX_X86" "$SHA_LINUX_ARM" \
             > tap/Formula/clawband.rb
 
