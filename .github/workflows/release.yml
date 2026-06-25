@@ -65,13 +65,17 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Stage binary
-        run: cp target/${{ matrix.target }}/release/clawband ${{ matrix.artifact }}
+        run: |
+          cp target/${{ matrix.target }}/release/clawband ${{ matrix.artifact }}
+          sha256sum ${{ matrix.artifact }} | cut -d' ' -f1 > ${{ matrix.artifact }}.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
 
   smoke-test:
     name: Smoke test (linux-x86_64)
@@ -173,9 +177,13 @@ jobs:
           generate_release_notes: true
           files: |
             clawband-linux-x86_64
+            clawband-linux-x86_64.sha256
             clawband-linux-arm64
+            clawband-linux-arm64.sha256
             clawband-macos-x86_64
+            clawband-macos-x86_64.sha256
             clawband-macos-arm64
+            clawband-macos-arm64.sha256
 
   bump-formula:
     name: Bump Homebrew tap
