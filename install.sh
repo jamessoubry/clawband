@@ -49,11 +49,27 @@ if [[ -n "$ASSET" ]]; then
     | jq -r '.tag_name // empty' 2>/dev/null || true)
   if [[ -n "$LATEST" ]]; then
     URL="https://github.com/$REPO/releases/download/$LATEST/$ASSET"
-    if curl -fsSL "$URL" -o "$HOOK_DIR/clawband" 2>/dev/null; then
+    TMP_BIN="$(mktemp)"
+    TMP_SHA="$(mktemp)"
+    if curl -fsSL "$URL" -o "$TMP_BIN" 2>/dev/null \
+        && curl -fsSL "${URL}.sha256" -o "$TMP_SHA" 2>/dev/null; then
+      # Verify SHA256 checksum before installing
+      EXPECTED="$(cat "$TMP_SHA")"
+      ACTUAL="$(sha256sum "$TMP_BIN" | cut -d' ' -f1)"
+      if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+        rm -f "$TMP_BIN" "$TMP_SHA"
+        red "Error: SHA256 checksum mismatch — aborting installation."
+        echo "  Expected: $EXPECTED"
+        echo "  Got:      $ACTUAL"
+        exit 1
+      fi
+      cp "$TMP_BIN" "$HOOK_DIR/clawband"
+      rm -f "$TMP_BIN" "$TMP_SHA"
       chmod +x "$HOOK_DIR/clawband"
       green "Installed pre-built binary ($LATEST)"
       BINARY_INSTALLED=1
     else
+      rm -f "$TMP_BIN" "$TMP_SHA"
       yellow "Pre-built binary not available for this platform — building from source"
     fi
   else

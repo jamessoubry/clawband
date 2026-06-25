@@ -3660,6 +3660,62 @@ fn download_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// Download the `.sha256` sidecar for `binary_url` and verify that the local
+/// file at `path` matches. Returns Err with a message if the download fails or
+/// the hash does not match.
+fn verify_sha256(path: &std::path::Path, binary_url: &str) -> Result<(), String> {
+    let sha_url = format!("{}.sha256", binary_url);
+    let expected = fetch_url(&sha_url)
+        .map_err(|e| format!("could not download SHA256 sidecar from {sha_url}: {e}"))?;
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return Err(format!("SHA256 sidecar at {sha_url} is empty"));
+    }
+
+    // Shell out to sha256sum (Linux) or shasum -a 256 (macOS)
+    let actual = if cfg!(target_os = "macos") {
+        let out = std::process::Command::new("shasum")
+            .args(["-a", "256", path.to_string_lossy().as_ref()])
+            .output()
+            .map_err(|e| format!("could not run shasum: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "shasum exited with non-zero status: {}",
+                out.status
+            ));
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    } else {
+        let out = std::process::Command::new("sha256sum")
+            .arg(path.to_string_lossy().as_ref())
+            .output()
+            .map_err(|e| format!("could not run sha256sum: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "sha256sum exited with non-zero status: {}",
+                out.status
+            ));
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+
+    if actual != expected {
+        return Err(format!(
+            "SHA256 mismatch\n  expected: {expected}\n  got:      {actual}"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Verify a downloaded binary by running `<path> --version` and checking that
 /// stdout starts with "clawband v" and contains the expected version string.
 fn verify_binary(path: &std::path::Path, expected_version: &str) -> Result<(), String> {
@@ -3799,7 +3855,16 @@ fn cmd_upgrade(args: &[String]) {
         std::process::exit(1);
     }
 
-    // 7. chmod +x the temp file
+    // 7. Verify SHA256 checksum before installing
+    println!("  {d}Verifying SHA256 checksum …{r}");
+    if let Err(e) = verify_sha256(&tmp_path, &download_url) {
+        eprintln!("clawband upgrade: checksum verification failed — {e}");
+        eprintln!("clawband upgrade: aborting; the running binary is unchanged.");
+        let _ = fs::remove_file(&tmp_path);
+        std::process::exit(1);
+    }
+
+    // 8. chmod +x the temp file
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
@@ -3809,7 +3874,7 @@ fn cmd_upgrade(args: &[String]) {
         }
     }
 
-    // 8. Verify the downloaded binary
+    // 9. Verify the downloaded binary
     println!("  {d}Verifying downloaded binary …{r}");
     if let Err(e) = verify_binary(&tmp_path, latest) {
         eprintln!("clawband upgrade: verification failed — {e}");
@@ -3818,7 +3883,7 @@ fn cmd_upgrade(args: &[String]) {
         std::process::exit(1);
     }
 
-    // 9. Atomic-ish replace: copy temp → <target>.new (same dir), then rename
+    // 10. Atomic-ish replace: copy temp → <target>.new (same dir), then rename
     //    Rename is atomic within a filesystem; temp_dir may be on a different fs.
     let target_dir = install_target.parent().unwrap_or(std::path::Path::new("/"));
     let staging = target_dir.join(format!(".clawband_new_{}", std::process::id()));
