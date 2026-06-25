@@ -119,7 +119,8 @@ fi
 HOOK_ENTRY='{"matcher":"Bash","hooks":[{"type":"command","command":"~/.claude/hooks/clawband"}]}'
 
 if [ ! -f "$SETTINGS" ]; then
-  echo '{"hooks":{"PreToolUse":[]}}' > "$SETTINGS"
+  _tmp=$(mktemp "${SETTINGS}.XXXXXX")
+  echo '{"hooks":{"PreToolUse":[]}}' > "$_tmp" && mv "$_tmp" "$SETTINGS"
 fi
 
 if jq -e '.hooks.PreToolUse[]?.hooks[]? | select(.command and (.command | contains("clawband")) and (.command | contains("icm") | not) and (.command | contains("sqz") | not))' "$SETTINGS" &>/dev/null; then
@@ -128,7 +129,8 @@ else
   UPDATED=$(jq --argjson entry "$HOOK_ENTRY" '
     .hooks.PreToolUse = ([$entry] + (.hooks.PreToolUse // []))
   ' "$SETTINGS")
-  echo "$UPDATED" > "$SETTINGS"
+  _tmp=$(mktemp "${SETTINGS}.XXXXXX")
+  echo "$UPDATED" > "$_tmp" && mv "$_tmp" "$SETTINGS"
   green "Registered hook in $SETTINGS"
 fi
 
@@ -141,7 +143,8 @@ if [[ "$POST_HOOK" == "1" ]]; then
     UPDATED=$(jq --argjson entry "$POST_ENTRY" '
       .hooks.PostToolUse = ([$entry] + (.hooks.PostToolUse // []))
     ' "$SETTINGS")
-    echo "$UPDATED" > "$SETTINGS"
+    _tmp=$(mktemp "${SETTINGS}.XXXXXX")
+    echo "$UPDATED" > "$_tmp" && mv "$_tmp" "$SETTINGS"
     green "PostToolUse hook registered — will suggest 'clawband allow' after approvals"
   fi
 fi
