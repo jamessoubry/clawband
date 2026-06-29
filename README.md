@@ -500,6 +500,7 @@ Removing the entry from that list lets clawband's ask/deny patterns take over as
 - **Force-push gaps** — `git push :<branch>` (colon-prefix deletion) and `git push origin +main` (plus-refspec force) are not blocked by the force-push pattern; use `--delete` / `--force-with-lease` instead.
 - **Commit messages containing blocked patterns** — if a commit message itself contains a pattern like `rm -rf /` (e.g. documenting a fix), clawband will block the `git commit` command. Workaround: write the message to a temp file and use `git commit -F /tmp/msg.txt`, or rephrase to avoid the literal pattern.
 - **Fail-closed on parse error** — if clawband cannot read or parse the hook input (stdin read failure, malformed JSON), it emits `deny` and blocks the command. It does **not** fail-open.
+- **Claude Code's `~/.claude/` hard-coded protection ignores hook responses** — Claude Code has a built-in protection layer for `~/.claude/` paths that fires independently of the hook system. Even if clawband returns `allow`, Claude Code will still show its own native permission prompt for commands referencing `~/.claude/`. Workaround: add the operation to `permissions.allow` in `~/.claude/settings.json` (e.g. `"Bash(cp ~/.claude/*:*)"`).
 
 ### Known shell obfuscation bypasses (issue #129)
 
