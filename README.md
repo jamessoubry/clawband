@@ -198,7 +198,7 @@ default_decision = passthrough   # (default) let Claude Code's native check hand
 
 With `default_decision = allow`, only your `deny`/`ask` patterns stop or prompt; everything else runs with no native prompt. This is what makes clawband useful **without** `bypassPermissions` mode: instead of Claude Code asking about every command, clawband silently allows the safe ones, **prompts** on `ask`-tier commands (e.g. `git reset --hard`, so you approve it only when it's a safe moment), and **hard-blocks** the dangerous ones.
 
-> Mode note: a hook `ask` decision only produces a prompt when you are **not** in `bypassPermissions`/YOLO mode. In YOLO mode an `ask` runs without prompting, so `default_decision = ask` and the `ask` tier only gate when bypass mode is off. A project-level `.clawband/config` overrides the global one.
+> Hook-generated `ask` decisions prompt you for confirmation in all modes — including `bypassPermissions`/YOLO mode. Bypass mode skips Claude Code's own internal permission prompts, not hook-generated ones. A project-level `.clawband/config` overrides the global one.
 
 **Project** (`.clawband/` in the current working directory) — loaded in addition to global patterns when the directory exists. Useful for per-repo restrictions or allowances without affecting other projects:
 

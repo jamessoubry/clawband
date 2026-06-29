@@ -596,6 +596,7 @@
         <h3>Reduce the noise, not the safety</h3>
         <p>Keep Claude Code's permission prompts active. Use clawband to guarantee that no compound-command trick or bypass can sneak a destructive command through — even when Claude hallucinates or gets prompt-injected.</p>
         <p>Add patterns you trust to your <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">allow.patterns</code> file to stop being asked about them. clawband still hard-blocks anything catastrophic — you just stop approving the same safe commands over and over.</p>
+        <p>To eliminate Claude Code's native prompts entirely and let clawband own all decisions, set <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">default_decision = allow</code> in <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">~/.clawband/config</code>. Safe commands pass silently, ambiguous ones prompt you, and catastrophic ones are hard-blocked — clawband becomes the sole gatekeeper.</p>
       </div>
       <div class="mode-card mode-b">
         <div class="mode-label">Mode B — full YOLO</div>
@@ -848,7 +849,7 @@
 
     <div class="faq-item">
       <div class="faq-q">Claude Code keeps asking me to approve every command — how do I reduce the prompts without losing safety?</div>
-      <div class="faq-a">That's "approval fatigue." Two options: keep approvals on and add commands you trust to clawband's <code>allow.patterns</code> so you stop being asked about them; or turn approvals off entirely (bypassPermissions) and let clawband hard-block only the genuinely dangerous commands. Either way you stop rubber-stamping safe commands while staying protected from catastrophic ones.</div>
+      <div class="faq-a">That's "approval fatigue." Two options: keep approvals on and add commands you trust to clawband's <code>allow.patterns</code> so you stop being asked about them; or turn approvals off entirely (bypassPermissions) and let clawband hard-block only the genuinely dangerous commands. Either way you stop rubber-stamping safe commands while staying protected from catastrophic ones. If you keep approvals on but still find Claude Code's native prompts noisy, set <code>default_decision = allow</code> in <code>~/.clawband/config</code> — this makes clawband the sole gatekeeper so unmatched commands pass silently without hitting Claude Code's own prompt.</div>
     </div>
 
     <div class="faq-item">
