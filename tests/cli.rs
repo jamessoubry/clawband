@@ -3068,3 +3068,56 @@ fn e2e_shebang_bash_script_without_extension_passes_clean() {
         "clean shebang bash script (no extension) must pass: {out}"
     );
 }
+
+// ── issue #208: ~/.claude/ read advisory ─────────────────────────────────────
+
+#[test]
+fn e2e_claude_dir_read_emits_advisory_on_stderr() {
+    // cat ~/.claude/settings.json → no block, but advisory on stderr (Claude mode)
+    let (out, err) = run_with_stderr(&bash("cat ~/.claude/settings.json"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "cat ~/.claude/ must pass (no block): {out}"
+    );
+    assert!(
+        err.contains("[CLAWBAND]") && err.contains("~/.claude/"),
+        "advisory must appear on stderr: {err}"
+    );
+}
+
+#[test]
+fn e2e_claude_dir_read_advisory_not_emitted_for_non_claude_mode() {
+    // In Gemini mode the advisory is skipped (Claude-specific protection only)
+    let (out, err) = run_with_stderr(
+        &bash("cat ~/.claude/settings.json"),
+        &[("CLAWBAND_MODE", "gemini")],
+    );
+    // Gemini allow emits {"decision":"allow"} — but decision may be None if passthrough
+    assert!(
+        !err.contains("~/.claude/"),
+        "advisory must not appear for non-Claude mode: {err}"
+    );
+    let _ = out; // decision not asserted (mode-specific output format)
+}
+
+#[test]
+fn e2e_claude_dir_write_redirect_no_advisory() {
+    // Output redirect writes to ~/.claude/ — should NOT emit the read advisory
+    // (the write is a different concern; clawband's redirect patterns may or may not block it)
+    let (_, err) = run_with_stderr(&bash("echo hello > ~/.claude/settings.json"), &[]);
+    assert!(
+        !err.contains("Command reads from ~/.claude/"),
+        "write redirect must not trigger read advisory: {err}"
+    );
+}
+
+#[test]
+fn e2e_claude_dir_read_unrelated_command_no_advisory() {
+    // Commands that don't touch ~/.claude/ must not emit the advisory
+    let (_, err) = run_with_stderr(&bash("ls /tmp && echo hello"), &[]);
+    assert!(
+        !err.contains("~/.claude/"),
+        "unrelated command must not emit advisory: {err}"
+    );
+}

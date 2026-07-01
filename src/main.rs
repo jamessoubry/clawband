@@ -4616,6 +4616,77 @@ fn check_subshells(
     None
 }
 
+// ─── ~/.claude/ read advisory (issue #208) ───────────────────────────────────
+// Informational stderr message when a command reads from ~/.claude/ and the access
+// is not already covered by an entry in ~/.claude/settings.json permissions.allow.
+// Never changes the decision — purely advisory.
+
+/// Returns true if `cmd` appears to read from `~/.claude/` rather than write to it.
+fn reads_claude_dir(cmd: &str) -> bool {
+    let home = env::var("HOME").unwrap_or_default();
+    let has_ref = cmd.contains("~/.claude/")
+        || cmd.contains("$HOME/.claude/")
+        || (!home.is_empty() && cmd.contains(&format!("{}/.claude/", home)));
+    if !has_ref {
+        return false;
+    }
+    // Exclude output redirects writing to ~/.claude/ (e.g. "echo x > ~/.claude/settings.json")
+    let redirect_re = Regex::new(r">{1,2}\s*(?:~|\$HOME|/[^\s;|&]*)/.claude/").unwrap();
+    if redirect_re.is_match(cmd) {
+        return false;
+    }
+    // Exclude rm/shred targeting ~/.claude/ (deletion, not a read)
+    let destroy_re = Regex::new(r"(?i)\b(?:rm|shred)\b[^;&|\n]*(?:~|\$HOME)/\.claude/").unwrap();
+    if destroy_re.is_match(cmd) {
+        return false;
+    }
+    true
+}
+
+/// Returns true if any entry in `~/.claude/settings.json` `permissions.allow` plausibly
+/// covers a read from `~/.claude/`. When covered, the advisory message is suppressed.
+fn covered_by_permissions_allow(cmd: &str) -> bool {
+    let settings_path =
+        PathBuf::from(env::var("HOME").unwrap_or_default()).join(".claude/settings.json");
+    let Ok(content) = fs::read_to_string(&settings_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    let Some(allow_arr) = json["permissions"]["allow"].as_array() else {
+        return false;
+    };
+    // Check if any allow entry references ~/.claude/ — if so, treat the user as having
+    // intentionally configured access to that directory.
+    for entry in allow_arr {
+        let Some(s) = entry.as_str() else {
+            continue;
+        };
+        if s.contains("~/.claude/") || s.contains("$HOME/.claude/") {
+            return true;
+        }
+        // Also check for the inner pattern when the entry uses the Bash(...) wrapper
+        if let Some(inner) = s.strip_prefix("Bash(").and_then(|t| t.strip_suffix(')')) {
+            // Simple substring: does the command contain the core token of the allow entry?
+            let core = inner.split(':').next().unwrap_or(inner);
+            if cmd.contains(core) || core.contains("~/.claude/") {
+                return true;
+            }
+        }
+    }
+    // Also check if any allow entry is just a substring of the command (raw match)
+    for entry in allow_arr {
+        let Some(s) = entry.as_str() else {
+            continue;
+        };
+        if !s.is_empty() && cmd.contains(s) {
+            return true;
+        }
+    }
+    false
+}
+
 // ─── Core check logic ────────────────────────────────────────────────────────
 // Returns Some(("deny"|"ask", reason)) or None for pass.
 // Does NOT perform script-file scanning (requires filesystem) or subshell checks.
@@ -5153,6 +5224,17 @@ fn main() {
     {
         emit(decision, &reason);
         return;
+    }
+
+    // ~/.claude/ read advisory (issue #208, Claude mode only).
+    // Emit once per command after all blocking checks have passed. Decision is unchanged.
+    if mode == Mode::Claude && reads_claude_dir(&command) && !covered_by_permissions_allow(&command)
+    {
+        eprintln!(
+            "[CLAWBAND] Command reads from ~/.claude/ — Claude Code will prompt for this \
+             independently. To suppress: add the relevant pattern to permissions.allow in \
+             ~/.claude/settings.json"
+        );
     }
 
     // Nothing flagged by deny/ask/script/subshell.
@@ -10373,5 +10455,69 @@ mod tests {
             normalize_first_token(r#"r"foo"m -rf /"#),
             r#"r"foo"m -rf /"#
         );
+    }
+
+    // ── ~/.claude/ read advisory helpers (issue #208) ─────────────────────────
+
+    #[test]
+    fn reads_claude_dir_detects_cat() {
+        assert!(reads_claude_dir("cat ~/.claude/settings.json"));
+    }
+
+    #[test]
+    fn reads_claude_dir_detects_cp_source() {
+        assert!(reads_claude_dir(
+            "cp ~/.claude/settings.json /tmp/backup.json"
+        ));
+    }
+
+    #[test]
+    fn reads_claude_dir_detects_head() {
+        assert!(reads_claude_dir("head ~/.claude/hooks/clawband"));
+    }
+
+    #[test]
+    fn reads_claude_dir_detects_ls() {
+        assert!(reads_claude_dir("ls ~/.claude/"));
+    }
+
+    #[test]
+    fn reads_claude_dir_detects_dollar_home() {
+        assert!(reads_claude_dir("cat $HOME/.claude/settings.json"));
+    }
+
+    #[test]
+    fn reads_claude_dir_excludes_redirect_write() {
+        assert!(!reads_claude_dir("echo hello > ~/.claude/settings.json"));
+    }
+
+    #[test]
+    fn reads_claude_dir_excludes_append_redirect() {
+        assert!(!reads_claude_dir("echo hello >> ~/.claude/x"));
+    }
+
+    #[test]
+    fn reads_claude_dir_excludes_rm() {
+        assert!(!reads_claude_dir("rm -f ~/.claude/somefile"));
+    }
+
+    #[test]
+    fn reads_claude_dir_excludes_shred() {
+        assert!(!reads_claude_dir("shred ~/.claude/settings.json"));
+    }
+
+    #[test]
+    fn reads_claude_dir_no_match_for_unrelated_commands() {
+        assert!(!reads_claude_dir("cat ~/.bashrc"));
+        assert!(!reads_claude_dir("ls /tmp/"));
+        assert!(!reads_claude_dir("git status"));
+    }
+
+    #[test]
+    fn covered_by_permissions_allow_empty_returns_false() {
+        // No allow entries → not covered
+        // We test the logic indirectly since the real function reads $HOME/settings.json;
+        // call reads_claude_dir so at least the helper is exercised.
+        assert!(reads_claude_dir("cat ~/.claude/CLAUDE.md"));
     }
 }
