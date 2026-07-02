@@ -4621,9 +4621,11 @@ fn check_subshells(
 // is not already covered by an entry in ~/.claude/settings.json permissions.allow.
 // Never changes the decision — purely advisory.
 
+const ENV_HOME: &str = "HOME";
+
 /// Returns true if `cmd` appears to read from `~/.claude/` rather than write to it.
 fn reads_claude_dir(cmd: &str) -> bool {
-    let home = env::var("HOME").unwrap_or_default();
+    let home = env::var(ENV_HOME).unwrap_or_default();
     let has_ref = cmd.contains("~/.claude/")
         || cmd.contains("$HOME/.claude/")
         || (!home.is_empty() && cmd.contains(&format!("{}/.claude/", home)));
@@ -4644,10 +4646,10 @@ fn reads_claude_dir(cmd: &str) -> bool {
 }
 
 /// Returns true if any entry in `~/.claude/settings.json` `permissions.allow` plausibly
-/// covers a read from `~/.claude/`. When covered, the advisory message is suppressed.
+/// covers the specific command. When covered, the advisory message is suppressed.
 fn covered_by_permissions_allow(cmd: &str) -> bool {
-    let settings_path =
-        PathBuf::from(env::var("HOME").unwrap_or_default()).join(".claude/settings.json");
+    let home = env::var(ENV_HOME).unwrap_or_default();
+    let settings_path = PathBuf::from(&home).join(".claude/settings.json");
     let Ok(content) = fs::read_to_string(&settings_path) else {
         return false;
     };
@@ -4657,30 +4659,32 @@ fn covered_by_permissions_allow(cmd: &str) -> bool {
     let Some(allow_arr) = json["permissions"]["allow"].as_array() else {
         return false;
     };
-    // Check if any allow entry references ~/.claude/ — if so, treat the user as having
-    // intentionally configured access to that directory.
+    // Expand ~ and $HOME in the command for consistent comparison.
+    let expanded_cmd = cmd.replace('~', &home).replace("$HOME", &home);
+    let cur_bin = expanded_cmd.split_whitespace().next().unwrap_or("");
     for entry in allow_arr {
         let Some(s) = entry.as_str() else {
             continue;
         };
-        if s.contains("~/.claude/") || s.contains("$HOME/.claude/") {
-            return true;
-        }
-        // Also check for the inner pattern when the entry uses the Bash(...) wrapper
-        if let Some(inner) = s.strip_prefix("Bash(").and_then(|t| t.strip_suffix(')')) {
-            // Simple substring: does the command contain the core token of the allow entry?
-            let core = inner.split(':').next().unwrap_or(inner);
-            if cmd.contains(core) || core.contains("~/.claude/") {
-                return true;
-            }
-        }
-    }
-    // Also check if any allow entry is just a substring of the command (raw match)
-    for entry in allow_arr {
-        let Some(s) = entry.as_str() else {
+        // Extract inner pattern from Bash(...) wrapper if present, otherwise use as-is.
+        let pattern = s
+            .strip_prefix("Bash(")
+            .and_then(|t| t.strip_suffix(')'))
+            .unwrap_or(s);
+        let expanded_pat = pattern.replace('~', &home).replace("$HOME", &home);
+        // Match on the binary name first — avoids suppressing `cp` advisory when only
+        // `cat ~/.claude/settings.json` is allowed.
+        let pat_bin = expanded_pat.split_whitespace().next().unwrap_or("");
+        if !pat_bin.is_empty() && pat_bin != cur_bin {
             continue;
-        };
-        if !s.is_empty() && cmd.contains(s) {
+        }
+        // Extract the path prefix (before any glob `*`, `?`, or `:` separator).
+        let path_prefix = expanded_pat
+            .split_whitespace()
+            .nth(1)
+            .and_then(|p| p.split(['*', '?', ':']).next())
+            .unwrap_or("");
+        if path_prefix.is_empty() || expanded_cmd.contains(path_prefix) {
             return true;
         }
     }
