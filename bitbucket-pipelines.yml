@@ -11,6 +11,8 @@ pipelines:
     clawband-base:
       - step:
           name: SonarQube Cloud — main branch scan
+          clone:
+            depth: full
           caches:
             - cargo
             - sonar
@@ -24,6 +26,8 @@ pipelines:
     '**':
       - step:
           name: SonarQube Cloud — PR scan
+          clone:
+            depth: full
           caches:
             - cargo
             - sonar
