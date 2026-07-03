@@ -1,0 +1,33 @@
+image: rust:latest
+
+definitions:
+  caches:
+    cargo: ~/.cargo
+    sonar: ~/.sonar
+
+pipelines:
+  # Scan the main branch on push
+  branches:
+    clawband-base:
+      - step:
+          name: SonarQube Cloud — main branch scan
+          caches:
+            - cargo
+            - sonar
+          script:
+            - pipe: sonarsource/sonarcloud-scan:2.0.0
+              variables:
+                SONAR_TOKEN: $SONAR_TOKEN
+
+  # Scan every pull request
+  pull-requests:
+    '**':
+      - step:
+          name: SonarQube Cloud — PR scan
+          caches:
+            - cargo
+            - sonar
+          script:
+            - pipe: sonarsource/sonarcloud-scan:2.0.0
+              variables:
+                SONAR_TOKEN: $SONAR_TOKEN
