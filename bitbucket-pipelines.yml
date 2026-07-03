@@ -17,6 +17,8 @@ pipelines:
             - cargo
             - sonar
           script:
+            - apt-get update -qq && apt-get install -y -qq default-jdk 2>/dev/null
+            - find samples -name "*.java" -exec javac {} + 2>/dev/null || true
             - pipe: sonarsource/sonarcloud-scan:2.0.0
               variables:
                 SONAR_TOKEN: $SONAR_TOKEN
@@ -32,6 +34,8 @@ pipelines:
             - cargo
             - sonar
           script:
+            - apt-get update -qq && apt-get install -y -qq default-jdk 2>/dev/null
+            - find samples -name "*.java" -exec javac {} + 2>/dev/null || true
             - pipe: sonarsource/sonarcloud-scan:2.0.0
               variables:
                 SONAR_TOKEN: $SONAR_TOKEN
