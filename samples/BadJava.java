@@ -6,7 +6,8 @@ public class BadJava {
 
     // Hardcoded credentials
     private static final String DB_PASSWORD = "supersecret123";
-    private static final String API_KEY = "sk-1234567890abcdef";
+    private static final String API_KEY = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMNOP";
+    private static final String AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
     // SQL injection — user input concatenated directly into query
     public ResultSet getUser(Connection conn, String username) throws SQLException {

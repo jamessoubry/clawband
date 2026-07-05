@@ -4,7 +4,8 @@ use std::process::Command;
 use std::collections::HashMap;
 
 // Hardcoded secret
-const API_KEY: &str = "sk-1234567890abcdef1234567890abcdef";
+const API_KEY: &str = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMNOP";
+const AWS_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 const DB_PASSWORD: &str = "hunter2";
 
 // Panic on None — unwrap without check
