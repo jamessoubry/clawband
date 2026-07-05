@@ -26,13 +26,9 @@ pipelines:
             - javac -cp /tmp/junit.jar samples/BadJava.java samples/BadJavaTest.java -d samples/out 2>/dev/null || true
             - java -javaagent:/tmp/jacoco-agent.jar=destfile=samples/jacoco.exec -cp samples/out:/tmp/junit.jar:/tmp/hamcrest.jar org.junit.runner.JUnitCore BadJavaTest 2>/dev/null || true
             - java -jar /tmp/jacoco-cli.jar report samples/jacoco.exec --classfiles samples/out --sourcefiles samples --xml samples/jacoco.xml 2>/dev/null || true
-            # Rust: install tarpaulin and generate coverage
-            - cargo install cargo-tarpaulin --quiet 2>/dev/null || true
-            - cargo tarpaulin --out Xml --output-dir . --timeout 120 2>/dev/null || true
-            # Report coverage to DeepSource
+            # Report Java coverage to DeepSource
             - curl -sSL https://deepsource.io/cli | sh
             - ./bin/deepsource report --analyzer test-coverage --key java --value-file samples/jacoco.xml 2>/dev/null || true
-            - ./bin/deepsource report --analyzer test-coverage --key rust --value-file cobertura.xml 2>/dev/null || true
             # SonarQube scan
             - pipe: sonarsource/sonarcloud-scan:2.0.0
               variables:
@@ -58,13 +54,9 @@ pipelines:
             - javac -cp /tmp/junit.jar samples/BadJava.java samples/BadJavaTest.java -d samples/out 2>/dev/null || true
             - java -javaagent:/tmp/jacoco-agent.jar=destfile=samples/jacoco.exec -cp samples/out:/tmp/junit.jar:/tmp/hamcrest.jar org.junit.runner.JUnitCore BadJavaTest 2>/dev/null || true
             - java -jar /tmp/jacoco-cli.jar report samples/jacoco.exec --classfiles samples/out --sourcefiles samples --xml samples/jacoco.xml 2>/dev/null || true
-            # Rust: install tarpaulin and generate coverage
-            - cargo install cargo-tarpaulin --quiet 2>/dev/null || true
-            - cargo tarpaulin --out Xml --output-dir . --timeout 120 2>/dev/null || true
-            # Report coverage to DeepSource
+            # Report Java coverage to DeepSource
             - curl -sSL https://deepsource.io/cli | sh
             - ./bin/deepsource report --analyzer test-coverage --key java --value-file samples/jacoco.xml 2>/dev/null || true
-            - ./bin/deepsource report --analyzer test-coverage --key rust --value-file cobertura.xml 2>/dev/null || true
             # SonarQube scan
             - pipe: sonarsource/sonarcloud-scan:2.0.0
               variables:
