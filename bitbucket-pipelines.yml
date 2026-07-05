@@ -10,26 +10,15 @@ pipelines:
   branches:
     clawband-base:
       - step:
-          name: Coverage + SonarQube Cloud — main branch scan
+          name: SonarQube Cloud — main branch scan
           clone:
             depth: full
           caches:
             - cargo
             - sonar
           script:
-            # Java: install JDK + JUnit + JaCoCo, compile, run tests, generate coverage
-            - apt-get update -qq && apt-get install -y -qq default-jdk wget 2>/dev/null
-            - wget -q https://repo1.maven.org/maven2/junit/junit/4.13.2/junit-4.13.2.jar -O /tmp/junit.jar
-            - wget -q https://repo1.maven.org/maven2/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar -O /tmp/hamcrest.jar
-            - wget -q https://repo1.maven.org/maven2/org/jacoco/org.jacoco.agent/0.8.11/org.jacoco.agent-0.8.11-runtime.jar -O /tmp/jacoco-agent.jar
-            - wget -q https://repo1.maven.org/maven2/org/jacoco/org.jacoco.cli/0.8.11/org.jacoco.cli-0.8.11-nodeps.jar -O /tmp/jacoco-cli.jar
-            - javac -cp /tmp/junit.jar samples/BadJava.java samples/BadJavaTest.java -d samples/out 2>/dev/null || true
-            - java -javaagent:/tmp/jacoco-agent.jar=destfile=samples/jacoco.exec -cp samples/out:/tmp/junit.jar:/tmp/hamcrest.jar org.junit.runner.JUnitCore BadJavaTest 2>/dev/null || true
-            - java -jar /tmp/jacoco-cli.jar report samples/jacoco.exec --classfiles samples/out --sourcefiles samples --xml samples/jacoco.xml 2>/dev/null || true
-            # Report Java coverage to DeepSource
-            - curl -sSL https://deepsource.io/cli | sh
-            - ./bin/deepsource report --analyzer test-coverage --key java --value-file samples/jacoco.xml 2>/dev/null || true
-            # SonarQube scan
+            - apt-get update -qq && apt-get install -y -qq default-jdk 2>/dev/null
+            - find samples -name "*.java" -exec javac {} + 2>/dev/null || true
             - pipe: sonarsource/sonarcloud-scan:2.0.0
               variables:
                 SONAR_TOKEN: $SONAR_TOKEN
@@ -38,26 +27,15 @@ pipelines:
   pull-requests:
     '**':
       - step:
-          name: Coverage + SonarQube Cloud — PR scan
+          name: SonarQube Cloud — PR scan
           clone:
             depth: full
           caches:
             - cargo
             - sonar
           script:
-            # Java: install JDK + JUnit + JaCoCo, compile, run tests, generate coverage
-            - apt-get update -qq && apt-get install -y -qq default-jdk wget 2>/dev/null
-            - wget -q https://repo1.maven.org/maven2/junit/junit/4.13.2/junit-4.13.2.jar -O /tmp/junit.jar
-            - wget -q https://repo1.maven.org/maven2/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar -O /tmp/hamcrest.jar
-            - wget -q https://repo1.maven.org/maven2/org/jacoco/org.jacoco.agent/0.8.11/org.jacoco.agent-0.8.11-runtime.jar -O /tmp/jacoco-agent.jar
-            - wget -q https://repo1.maven.org/maven2/org/jacoco/org.jacoco.cli/0.8.11/org.jacoco.cli-0.8.11-nodeps.jar -O /tmp/jacoco-cli.jar
-            - javac -cp /tmp/junit.jar samples/BadJava.java samples/BadJavaTest.java -d samples/out 2>/dev/null || true
-            - java -javaagent:/tmp/jacoco-agent.jar=destfile=samples/jacoco.exec -cp samples/out:/tmp/junit.jar:/tmp/hamcrest.jar org.junit.runner.JUnitCore BadJavaTest 2>/dev/null || true
-            - java -jar /tmp/jacoco-cli.jar report samples/jacoco.exec --classfiles samples/out --sourcefiles samples --xml samples/jacoco.xml 2>/dev/null || true
-            # Report Java coverage to DeepSource
-            - curl -sSL https://deepsource.io/cli | sh
-            - ./bin/deepsource report --analyzer test-coverage --key java --value-file samples/jacoco.xml 2>/dev/null || true
-            # SonarQube scan
+            - apt-get update -qq && apt-get install -y -qq default-jdk 2>/dev/null
+            - find samples -name "*.java" -exec javac {} + 2>/dev/null || true
             - pipe: sonarsource/sonarcloud-scan:2.0.0
               variables:
                 SONAR_TOKEN: $SONAR_TOKEN
