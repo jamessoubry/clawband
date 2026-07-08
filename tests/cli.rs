@@ -1962,6 +1962,50 @@ fn e2e_rm_subshell_backtick() {
     );
 }
 
+// ── issue #214: balanced-paren subshell extractor — false positive fix ────────
+
+#[test]
+fn e2e_subshell_python_c_inner_parens_passes() {
+    // Python function calls inside $() must not false-positive as nested subshells
+    let cmd = r#"API_KEY=$(aws secretsmanager get-secret-value --secret-id foo | python -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['SecretString'])")"#;
+    let out = run(&bash(cmd), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "inner parens in python -c must not trigger nested-subshell ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_subshell_with_deny_inner_denies_214() {
+    let out = run(&bash("echo $(rm -rf /)"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "deny pattern inside $() must deny: {out}"
+    );
+}
+
+#[test]
+fn e2e_rm_subshell_nested_asks_214() {
+    let out = run(&bash("rm -rf $(echo $(cat /etc/passwd))"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "genuinely nested subshell must ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_subshell_git_log_head_passes() {
+    let out = run(&bash("VAR=$(git log --format=%H | head -1)"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "clean subshell pipeline must pass: {out}"
+    );
+}
+
 // ── issue #131: error paths must emit deny, not ask ───────────────────────────
 // ask auto-approves in bypassPermissions mode; deny is the only safe fail-closed
 
