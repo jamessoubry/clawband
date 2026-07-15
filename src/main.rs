@@ -3779,7 +3779,7 @@ fn cmd_upgrade(args: &[String]) {
             eprintln!(
                 "clawband upgrade: could not parse tag_name from GitHub API response.\n\
                  Response snippet: {}",
-                &body.chars().take(200).collect::<String>()
+                body.chars().take(200).collect::<String>()
             );
             std::process::exit(1);
         }
