@@ -1,0 +1,41 @@
+image: rust:latest
+
+definitions:
+  caches:
+    cargo: ~/.cargo
+    sonar: ~/.sonar
+
+pipelines:
+  # Scan the main branch on push
+  branches:
+    clawband-base:
+      - step:
+          name: SonarQube Cloud — main branch scan
+          clone:
+            depth: full
+          caches:
+            - cargo
+            - sonar
+          script:
+            - apt-get update -qq && apt-get install -y -qq default-jdk 2>/dev/null
+            - find samples -name "*.java" -exec javac {} + 2>/dev/null || true
+            - pipe: sonarsource/sonarcloud-scan:2.0.0
+              variables:
+                SONAR_TOKEN: $SONAR_TOKEN
+
+  # Scan every pull request
+  pull-requests:
+    '**':
+      - step:
+          name: SonarQube Cloud — PR scan
+          clone:
+            depth: full
+          caches:
+            - cargo
+            - sonar
+          script:
+            - apt-get update -qq && apt-get install -y -qq default-jdk 2>/dev/null
+            - find samples -name "*.java" -exec javac {} + 2>/dev/null || true
+            - pipe: sonarsource/sonarcloud-scan:2.0.0
+              variables:
+                SONAR_TOKEN: $SONAR_TOKEN

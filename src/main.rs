@@ -3779,7 +3779,7 @@ fn cmd_upgrade(args: &[String]) {
             eprintln!(
                 "clawband upgrade: could not parse tag_name from GitHub API response.\n\
                  Response snippet: {}",
-                &body.chars().take(200).collect::<String>()
+                body.chars().take(200).collect::<String>()
             );
             std::process::exit(1);
         }
@@ -4542,6 +4542,56 @@ fn check_assign_then_exec(segments: &[String]) -> bool {
 // Returns None (pass) when all subshells are clean — eliminates false positives
 // like `git commit -F $(mktemp)` or `BRANCH=$(git branch --show-current)`.
 
+/// Iterative balanced-parenthesis extractor for top-level `$(…)` subshells.
+///
+/// Returns `(inner_cmds, stripped)`:
+/// - `inner_cmds`: trimmed inner content for each matched `$(…)` span
+/// - `stripped`: original string with every matched `$(…)` span removed
+///
+/// Unlike a regex approach, this correctly handles inner parens such as Python
+/// function calls (e.g. `json.loads(x)`, `sys.stdin.read()`) without stopping
+/// at the first `(` or `)` inside the subshell.
+fn extract_dollar_parens(s: &str) -> (Vec<String>, String) {
+    let mut inner_cmds: Vec<String> = Vec::new();
+    let mut stripped = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if i + 1 < len && bytes[i] == b'$' && bytes[i + 1] == b'(' {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < len && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                if depth > 0 {
+                    j += 1;
+                }
+            }
+            if depth == 0 {
+                // s[i+2..j] is the inner content; s[j] == ')'
+                let inner = s[i + 2..j].trim().to_string();
+                inner_cmds.push(inner);
+                i = j + 1;
+            } else {
+                // Unmatched $( — include in stripped and advance past it
+                stripped.push('$');
+                stripped.push('(');
+                i += 2;
+            }
+        } else {
+            // Advance one UTF-8 char at a time to handle multi-byte sequences
+            let ch = s[i..].chars().next().unwrap();
+            stripped.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    (inner_cmds, stripped)
+}
+
 fn check_subshells(
     command: &str,
     deny_pats: &[Pattern],
@@ -4564,13 +4614,13 @@ fn check_subshells(
         ));
     }
 
-    // Extract first-level $(...) and `...` content
-    let dp_re = Regex::new(r"\$\(([^()]*)\)").unwrap();
+    // Extract first-level $(...) using balanced-paren parser; backtick extractor unchanged.
+    let (dp_inner_cmds, dp_stripped) = extract_dollar_parens(command);
     let bt_re = Regex::new(r"`([^`]*)`").unwrap();
 
-    let inner_cmds: Vec<String> = dp_re
-        .captures_iter(command)
-        .map(|c| c[1].trim().to_string())
+    let inner_cmds: Vec<String> = dp_inner_cmds
+        .iter()
+        .cloned()
         .chain(
             bt_re
                 .captures_iter(command)
@@ -4579,10 +4629,14 @@ fn check_subshells(
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Check if any $( or ` remains after removing extracted subshells (nested case)
-    let stripped = dp_re.replace_all(command, "");
-    let stripped = bt_re.replace_all(&stripped, "");
-    let has_residual = stripped.contains("$(") || stripped.contains('`');
+    // Detect genuine nesting: a $() whose inner content itself contains $(),
+    // leftover unmatched $( after extraction, or nested backticks.
+    let nested_dp = dp_inner_cmds.iter().find(|s| s.contains("$(")).cloned();
+    let bt_stripped = bt_re.replace_all(&dp_stripped, "");
+    let has_residual = nested_dp.is_some()
+        || dp_stripped.contains("$(")
+        || bt_stripped.contains("$(")
+        || bt_stripped.contains('`');
 
     // Evaluate each inner command — deny beats ask
     let mut worst_ask: Option<String> = None;
@@ -4606,10 +4660,15 @@ fn check_subshells(
 
     // Inner commands are clean but nested subshells can't be fully evaluated
     if has_residual {
-        return Some((
-            "ask",
-            "Command contains nested subshell — review before running.".to_string(),
-        ));
+        let msg = if let Some(ref inner) = nested_dp {
+            let snippet: String = inner.chars().take(60).collect();
+            format!(
+                "Command contains nested subshell — review before running (nested in: {snippet})."
+            )
+        } else {
+            "Command contains nested subshell — review before running.".to_string()
+        };
+        return Some(("ask", msg));
     }
 
     // All subshells extracted and clean — pass through
@@ -6168,6 +6227,38 @@ mod tests {
     #[test]
     fn subshell_safe_content_passes() {
         assert_eq!(full_decision(r#"echo "version: $(cat VERSION)""#), None);
+    }
+
+    // ── issue #214: balanced-paren subshell extractor ─────────────────────────
+
+    #[test]
+    fn subshell_python_c_with_inner_parens_passes() {
+        // Python function calls inside $() must not trigger false-positive nesting
+        assert_eq!(
+            full_decision(
+                r#"API_KEY=$(aws secretsmanager get-secret-value --secret-id foo | python -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['SecretString'])")"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn subshell_with_deny_inner_denies_214() {
+        assert_eq!(full_decision("echo $(rm -rf /)"), Some("deny".into()));
+    }
+
+    #[test]
+    fn rm_subshell_nested_asks_214() {
+        // rm -rf $(subshell) fires at check_command level; nested content is additional signal
+        assert_eq!(
+            full_decision("rm -rf $(echo $(cat /etc/passwd))"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn subshell_git_log_head_passes() {
+        assert_eq!(full_decision("VAR=$(git log --format=%H | head -1)"), None);
     }
 
     // ── scan_script_file integration tests ────────────────────────────────────
