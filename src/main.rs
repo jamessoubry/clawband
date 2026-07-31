@@ -399,6 +399,87 @@ fn log_action(decision: &str, reason: &str, command: &str) {
     }
 }
 
+// ─── Repeated-ask suggestion ─────────────────────────────────────────────────
+
+fn approval_log_path() -> PathBuf {
+    config_dir().join("approval_log.json")
+}
+
+fn suggest_threshold() -> u64 {
+    env::var("CLAWBAND_SUGGEST_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
+
+/// Increment the ask counter for `pattern_name` in `~/.clawband/approval_log.json`.
+/// Returns a suggestion tip string once the count reaches the threshold.
+/// All I/O errors are silently ignored (best-effort).
+fn record_ask_and_suggest(pattern_name: &str, pattern_regex: &str) -> Option<String> {
+    let path = approval_log_path();
+
+    let mut counts: serde_json::Map<String, serde_json::Value> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let current = counts
+        .get(pattern_name)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let new_count = current + 1;
+    counts.insert(
+        pattern_name.to_string(),
+        serde_json::Value::Number(new_count.into()),
+    );
+
+    let json = serde_json::to_string_pretty(&counts).ok()?;
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&path, json).ok()?;
+
+    let threshold = suggest_threshold();
+    if new_count >= threshold {
+        Some(format!(
+            "\n\nTip: You've been asked about this {} times. Run: ! clawband allow '{}' to stop being asked.",
+            new_count, pattern_regex
+        ))
+    } else {
+        None
+    }
+}
+
+/// Extract `(label, regex)` from a standard ask reason string.
+/// Reason format: "Review before running — 'LABEL' matched in: ...\nTo always allow:\n  ! HOOK allow 'REGEX'\n"
+fn extract_ask_pattern(reason: &str) -> Option<(String, String)> {
+    let after_prefix = reason.strip_prefix("Review before running \u{2014} '")?;
+    let label_end = after_prefix.find('\'')?;
+    let label = after_prefix[..label_end].to_string();
+
+    let allow_line = reason
+        .lines()
+        .find(|l| l.trim_start().starts_with("! ") && l.contains(" allow '"))?;
+    let regex_start = allow_line.rfind(" allow '")?;
+    let after_allow = &allow_line[regex_start + " allow '".len()..];
+    let regex_end = after_allow.rfind('\'')?;
+    let regex = after_allow[..regex_end].to_string();
+
+    Some((label, regex))
+}
+
+/// If `reason` matches the standard ask format, record the ask and append a
+/// suggestion tip once the pattern reaches the configured threshold.
+/// Returns the (possibly augmented) reason string.
+fn maybe_append_ask_tip(reason: &str) -> String {
+    if let Some((label, regex)) = extract_ask_pattern(reason) {
+        if let Some(tip) = record_ask_and_suggest(&label, &regex) {
+            return format!("{}{}", reason, tip);
+        }
+    }
+    reason.to_string()
+}
+
 // ─── Pattern ──────────────────────────────────────────────────────────────────
 
 struct Pattern {
@@ -5294,6 +5375,11 @@ fn main() {
 
     // Core pattern check (deny/ask/pass)
     if let Some((decision, reason)) = check_command(&command, &deny_pats, &ask_pats, &allow_pats) {
+        let reason = if decision == "ask" {
+            maybe_append_ask_tip(&reason)
+        } else {
+            reason
+        };
         if decision == "ask" && mode == Mode::Claude {
             write_ask_breadcrumb(&command, &reason, &call_id);
         }
@@ -10721,5 +10807,129 @@ mod tests {
         // We test the logic indirectly since the real function reads $HOME/settings.json;
         // call reads_claude_dir so at least the helper is exercised.
         assert!(reads_claude_dir("cat ~/.claude/CLAUDE.md"));
+    }
+
+    // ── Repeated-ask suggestion (issue #218) ──────────────────────────────────
+
+    #[test]
+    fn extract_ask_pattern_parses_label_and_regex() {
+        let reason = "Review before running \u{2014} 'git reset --hard/--keep/--merge' matched in: git reset --hard HEAD\nTo always allow:\n  ! clawband allow '(?-i:git)\\s+reset\\s+--(?:hard|keep|merge)'\n";
+        let result = extract_ask_pattern(reason);
+        assert!(result.is_some(), "should parse standard ask reason");
+        let (label, regex) = result.unwrap();
+        assert_eq!(label, "git reset --hard/--keep/--merge");
+        assert_eq!(regex, "(?-i:git)\\s+reset\\s+--(?:hard|keep|merge)");
+    }
+
+    #[test]
+    fn extract_ask_pattern_returns_none_for_non_standard_reason() {
+        let reason = "Variable 'BAD' assigned in the command prefix is referenced as an argument.";
+        assert!(extract_ask_pattern(reason).is_none());
+    }
+
+    #[test]
+    fn record_ask_and_suggest_returns_none_below_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        // config_dir() returns $HOME/.clawband so the log lives in .clawband/
+        let log_path = dir.path().join(".clawband").join("approval_log.json");
+
+        // Manually drive the logic by calling record_ask_and_suggest with a
+        // custom path via CLAWBAND_SUGGEST_THRESHOLD env var override.
+        // We patch HOME so approval_log_path() resolves to our temp dir.
+        let old_home = env::var("HOME").ok();
+        env::set_var("HOME", dir.path());
+        env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "3");
+
+        // First ask: no tip
+        let tip1 = record_ask_and_suggest("git reset", "git\\s+reset");
+        assert!(tip1.is_none(), "first ask should not produce a tip");
+
+        // Second ask: still below threshold
+        let tip2 = record_ask_and_suggest("git reset", "git\\s+reset");
+        assert!(tip2.is_none(), "second ask should not produce a tip");
+
+        // Restore env
+        if let Some(h) = old_home {
+            env::set_var("HOME", h);
+        } else {
+            env::remove_var("HOME");
+        }
+        env::remove_var("CLAWBAND_SUGGEST_THRESHOLD");
+
+        // Log file must have been created with count=2
+        let content = fs::read_to_string(&log_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["git reset"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn record_ask_and_suggest_returns_tip_at_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let old_home = env::var("HOME").ok();
+        env::set_var("HOME", dir.path());
+        env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "3");
+
+        // Two calls below threshold
+        let _ = record_ask_and_suggest("dropdb", "dropdb\\s");
+        let _ = record_ask_and_suggest("dropdb", "dropdb\\s");
+        // Third call: at threshold
+        let tip = record_ask_and_suggest("dropdb", "dropdb\\s");
+        assert!(tip.is_some(), "third ask should produce a tip");
+        let tip_str = tip.unwrap();
+        assert!(tip_str.contains("3 times"), "tip should mention count");
+        assert!(tip_str.contains("dropdb\\s"), "tip should include regex");
+        assert!(
+            tip_str.contains("clawband allow"),
+            "tip should mention command"
+        );
+
+        // Restore env
+        if let Some(h) = old_home {
+            env::set_var("HOME", h);
+        } else {
+            env::remove_var("HOME");
+        }
+        env::remove_var("CLAWBAND_SUGGEST_THRESHOLD");
+    }
+
+    #[test]
+    fn suggest_threshold_env_var_override() {
+        env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "5");
+        assert_eq!(suggest_threshold(), 5);
+        env::remove_var("CLAWBAND_SUGGEST_THRESHOLD");
+        assert_eq!(suggest_threshold(), 3);
+    }
+
+    #[test]
+    fn maybe_append_ask_tip_augments_standard_reason_at_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_home = env::var("HOME").ok();
+        env::set_var("HOME", dir.path());
+        env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "1");
+
+        let reason = "Review before running \u{2014} 'dropdb' matched in: dropdb mydb\nTo always allow:\n  ! clawband allow 'dropdb'\n";
+        let result = maybe_append_ask_tip(reason);
+        assert!(
+            result.contains("Tip:"),
+            "tip should be appended at threshold"
+        );
+
+        if let Some(h) = old_home {
+            env::set_var("HOME", h);
+        } else {
+            env::remove_var("HOME");
+        }
+        env::remove_var("CLAWBAND_SUGGEST_THRESHOLD");
+    }
+
+    #[test]
+    fn maybe_append_ask_tip_unchanged_for_non_standard_reason() {
+        let reason = "Variable 'X' assigned in the command prefix is referenced as an argument.";
+        let result = maybe_append_ask_tip(reason);
+        assert_eq!(
+            result, reason,
+            "non-standard ask reason should be unchanged"
+        );
     }
 }
