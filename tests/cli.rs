@@ -3165,3 +3165,73 @@ fn e2e_claude_dir_read_unrelated_command_no_advisory() {
         "unrelated command must not emit advisory: {err}"
     );
 }
+
+// ── bypassPermissions mode (issue #219) ──────────────────────────────────────
+
+fn bash_with_bypass(command: &str) -> String {
+    format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":{:?}}},"claudeCoderSettings":{{"defaultMode":"bypassPermissions"}}}}"#,
+        command
+    )
+}
+
+#[test]
+fn e2e_bypass_suppresses_ask() {
+    // ask-tier command in bypassPermissions mode → silent pass (no output)
+    let out = run(&bash_with_bypass("git reset --hard HEAD~1"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "ask must be suppressed in bypassPermissions mode: {out}"
+    );
+}
+
+#[test]
+fn e2e_bypass_still_blocks_deny() {
+    // deny-tier command in bypassPermissions mode → still denied
+    let out = run(&bash_with_bypass("docker system prune"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "deny must still block in bypassPermissions mode: {out}"
+    );
+}
+
+#[test]
+fn e2e_bypass_env_var_suppresses_ask() {
+    // env var fallback: CLAUDE_CODE_DEFAULT_MODE=bypassPermissions
+    let out = run(
+        &bash("git reset --hard HEAD~1"),
+        &[("CLAUDE_CODE_DEFAULT_MODE", "bypassPermissions")],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        "ask must be suppressed via CLAUDE_CODE_DEFAULT_MODE env var: {out}"
+    );
+}
+
+#[test]
+fn e2e_bypass_env_var_still_blocks_deny() {
+    // env var: deny tier still blocks even in bypass mode
+    let out = run(
+        &bash("docker system prune"),
+        &[("CLAUDE_CODE_DEFAULT_MODE", "bypassPermissions")],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "deny must still block via CLAUDE_CODE_DEFAULT_MODE env var: {out}"
+    );
+}
+
+#[test]
+fn e2e_non_bypass_ask_fires_normally() {
+    // Without bypassPermissions, ask still fires
+    let out = run(&bash("git reset --hard HEAD~1"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "ask must fire normally when not in bypass mode: {out}"
+    );
+}
