@@ -5365,8 +5365,35 @@ fn main() {
         deny_pats.extend(self_protect_deny_patterns());
     }
 
+    // Detect bypassPermissions (YOLO) mode: ask-tier prompts are auto-approved
+    // by Claude Code in this mode, so surfacing them is misleading noise.
+    // Check the hook JSON first (claudeCoderSettings.defaultMode), then fall
+    // back to the CLAUDE_CODE_DEFAULT_MODE env var exported by Claude Code.
+    let bypass_permissions = {
+        let from_json = v["claudeCoderSettings"]["defaultMode"]
+            .as_str()
+            .map(|s| s.eq_ignore_ascii_case("bypassPermissions"))
+            .unwrap_or(false);
+        let from_env = env::var("CLAUDE_CODE_DEFAULT_MODE")
+            .map(|s| s.eq_ignore_ascii_case("bypassPermissions"))
+            .unwrap_or(false);
+        from_json || from_env
+    };
+
     // emit: log and render the decision via the active mode adapter.
+    // In bypassPermissions mode, ask decisions are silently allowed — only
+    // deny decisions block.
     let emit = |decision: &str, reason: &str| {
+        if bypass_permissions && decision == "ask" {
+            if log_enabled {
+                log_action(
+                    "allow",
+                    &format!("[bypass-suppressed] {}", reason),
+                    &command,
+                );
+            }
+            return;
+        }
         let effective = emit_decision(mode, ask_fallback, decision, reason);
         if log_enabled {
             log_action(&effective, reason, &command);
@@ -5375,12 +5402,12 @@ fn main() {
 
     // Core pattern check (deny/ask/pass)
     if let Some((decision, reason)) = check_command(&command, &deny_pats, &ask_pats, &allow_pats) {
-        let reason = if decision == "ask" {
+        let reason = if decision == "ask" && !bypass_permissions {
             maybe_append_ask_tip(&reason)
         } else {
             reason
         };
-        if decision == "ask" && mode == Mode::Claude {
+        if decision == "ask" && mode == Mode::Claude && !bypass_permissions {
             write_ask_breadcrumb(&command, &reason, &call_id);
         }
         emit(decision, &reason);
@@ -5431,7 +5458,7 @@ fn main() {
                     ),
                 ),
             };
-            if decision == "ask" && mode == Mode::Claude {
+            if decision == "ask" && mode == Mode::Claude && !bypass_permissions {
                 write_ask_breadcrumb(&command, &reason, &call_id);
             }
             emit(&decision, &reason);
@@ -5440,7 +5467,7 @@ fn main() {
         if let Some((decision, reason)) =
             scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
         {
-            if decision == "ask" && mode == Mode::Claude {
+            if decision == "ask" && mode == Mode::Claude && !bypass_permissions {
                 write_ask_breadcrumb(&command, &reason, &call_id);
             }
             emit(&decision, &reason);
