@@ -3235,3 +3235,35 @@ fn e2e_non_bypass_ask_fires_normally() {
         "ask must fire normally when not in bypass mode: {out}"
     );
 }
+
+// ── Builtin blessed-patterns (issue #220) ────────────────────────────────────
+
+#[test]
+fn e2e_builtin_allow_git_log_passes() {
+    let out = run(&bash("git log --oneline -5"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        "git log --oneline -5 must pass silently: {out}"
+    );
+}
+
+#[test]
+fn e2e_builtin_allow_jq_passes() {
+    let out = run(&bash("jq '.' -"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        "jq '.' - must pass silently: {out}"
+    );
+}
+
+#[test]
+fn e2e_builtin_allow_gh_pr_list_passes() {
+    let out = run(&bash("gh pr list"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        "gh pr list must pass silently: {out}"
+    );
+}

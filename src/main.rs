@@ -1146,6 +1146,36 @@ fn builtin_allow() -> Vec<Pattern> {
             "eval <subshell init/hook/shellenv>",
             r#"\beval\s+['"]?\$\(\s*[\w.-]+\s+(?:init|hook|shellenv)\b"#,
         ),
+        // ── Blessed AI-agent patterns ─────────────────────────────────────────
+        // Read-only git operations: safe to pass silently for any AI agent.
+        // Note: `branch` is excluded — `git branch -D` is a destructive ask-tier op.
+        (
+            "git read-only",
+            r"^git\s+(log|diff|status|show|fetch|ls-files|remote|tag|describe|shortlog|blame|grep|rev-parse|rev-list|cat-file|for-each-ref)\b",
+        ),
+        // Cargo dev subcommands: none of these destroy state.
+        (
+            "cargo dev",
+            r"^cargo\s+(build|test|check|clippy|fmt|doc|bench|metadata|tree)\b",
+        ),
+        // gh read-only: listing/viewing/watching CI.
+        (
+            "gh read",
+            r"^gh\s+(pr|issue|release|run|workflow)\s+(list|view|checks|status|watch|diff)\b",
+        ),
+        // gh mutations that AI agents issue routinely (create/edit/close PRs & issues).
+        (
+            "gh mutations",
+            r"^gh\s+(issue|pr)\s+(create|edit|close|reopen|comment)\b",
+        ),
+        // jq: pure data transform, never destructive.
+        ("jq", r"^jq\b"),
+        // python -c with only safe stdlib imports: pure data-processing, no fs/exec side-effects.
+        // subprocess and shutil are excluded — they can exec processes and delete files.
+        (
+            "python inline stdlib",
+            r#"^python3?\s+-c\s+['"]import\s+(sys|json|re|math|datetime|pathlib|collections|itertools|functools|hashlib|base64|uuid|csv|yaml|xml|html|urllib|http|logging|argparse|pprint|ast|copy|struct|io|string|textwrap|time|random|enum|typing|dataclasses)\b"#,
+        ),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -10958,5 +10988,32 @@ mod tests {
             result, reason,
             "non-standard ask reason should be unchanged"
         );
+    }
+
+    // ── Builtin blessed-patterns (issue #220) ─────────────────────────────────
+
+    #[test]
+    fn builtin_allow_git_status_silent() {
+        assert_eq!(decision("git status"), None);
+    }
+
+    #[test]
+    fn builtin_allow_cargo_test_silent() {
+        assert_eq!(decision("cargo test"), None);
+    }
+
+    #[test]
+    fn builtin_allow_git_push_force_still_denied() {
+        assert_eq!(decision("git push --force"), Some("deny".into()));
+    }
+
+    #[test]
+    fn builtin_allow_git_push_origin_main_not_blessed() {
+        // git push is not in the read-only allow list — it may ask or pass through
+        // depending on the ask-tier patterns, but it must not be silently allowed
+        // by the blessed list.
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("git push origin main"));
+        assert!(not_allowed, "git push origin main must not be blessed");
     }
 }
