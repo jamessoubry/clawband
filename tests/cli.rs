@@ -3267,3 +3267,25 @@ fn e2e_builtin_allow_gh_pr_list_passes() {
         "gh pr list must pass silently: {out}"
     );
 }
+
+#[test]
+fn e2e_builtin_allow_git_tag_delete_not_blessed() {
+    // git tag -d is destructive — must not be silently allowed.
+    let out = run(&bash("git tag -d v1.0"), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("allow"),
+        "git tag -d v1.0 must not be silently allowed: {out}"
+    );
+}
+
+#[test]
+fn e2e_builtin_allow_cargo_test_not_blessed() {
+    // cargo test runs project-controlled code — must not be silently allowed.
+    let out = run(&bash("cargo test"), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("allow"),
+        "cargo test must not be silently allowed: {out}"
+    );
+}

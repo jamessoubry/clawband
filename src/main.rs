@@ -1148,15 +1148,18 @@ fn builtin_allow() -> Vec<Pattern> {
         ),
         // ── Blessed AI-agent patterns ─────────────────────────────────────────
         // Read-only git operations: safe to pass silently for any AI agent.
-        // Note: `branch` is excluded — `git branch -D` is a destructive ask-tier op.
+        // Note: `branch`, `remote`, and `tag` are excluded — `git branch -D`,
+        // `git remote remove`, and `git tag -d` are destructive operations.
         (
             "git read-only",
-            r"^git\s+(log|diff|status|show|fetch|ls-files|remote|tag|describe|shortlog|blame|grep|rev-parse|rev-list|cat-file|for-each-ref)\b",
+            r"^git\s+(log|diff|status|show|fetch|ls-files|describe|shortlog|blame|grep|rev-parse|rev-list|cat-file|for-each-ref)\b",
         ),
-        // Cargo dev subcommands: none of these destroy state.
+        // Cargo code-analysis subcommands: none of these execute project code.
+        // `build`, `test`, and `bench` are excluded — they run project-controlled
+        // build.rs / test code / benchmarks, enabling arbitrary code execution.
         (
             "cargo dev",
-            r"^cargo\s+(build|test|check|clippy|fmt|doc|bench|metadata|tree)\b",
+            r"^cargo\s+(check|clippy|fmt|doc|metadata|tree)\b",
         ),
         // gh read-only: listing/viewing/watching CI.
         (
@@ -1170,12 +1173,6 @@ fn builtin_allow() -> Vec<Pattern> {
         ),
         // jq: pure data transform, never destructive.
         ("jq", r"^jq\b"),
-        // python -c with only safe stdlib imports: pure data-processing, no fs/exec side-effects.
-        // subprocess and shutil are excluded — they can exec processes and delete files.
-        (
-            "python inline stdlib",
-            r#"^python3?\s+-c\s+['"]import\s+(sys|json|re|math|datetime|pathlib|collections|itertools|functools|hashlib|base64|uuid|csv|yaml|xml|html|urllib|http|logging|argparse|pprint|ast|copy|struct|io|string|textwrap|time|random|enum|typing|dataclasses)\b"#,
-        ),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -10998,8 +10995,32 @@ mod tests {
     }
 
     #[test]
-    fn builtin_allow_cargo_test_silent() {
-        assert_eq!(decision("cargo test"), None);
+    fn builtin_allow_cargo_test_not_blessed() {
+        // cargo test runs project-controlled code — must not be silently allowed.
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("cargo test"));
+        assert!(not_allowed, "cargo test must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_cargo_build_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("cargo build --release"));
+        assert!(not_allowed, "cargo build must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_git_tag_delete_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("git tag -d v1.0"));
+        assert!(not_allowed, "git tag -d must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_git_remote_remove_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("git remote remove origin"));
+        assert!(not_allowed, "git remote remove must not be blessed");
     }
 
     #[test]
