@@ -993,7 +993,7 @@ fn builtin_ask() -> Vec<Pattern> {
         // `crontab <file>` installs a crontab from the file — different from
         // `crontab -l` (list) or `crontab -e` (edit) which start with `-`.
         // Pattern: crontab followed by whitespace then a non-flag argument.
-        ("crontab install from file", r"\bcrontab\s+[^-\s]"),
+        ("crontab install from file", r"^crontab\s+[^-\s]"),
         // ── chmod on sensitive paths or broad permissions (issue #31) ─────────
         // ASK (not deny) — chmod is legitimate but world-writable or -R on sensitive
         // paths warrants review.
@@ -8277,6 +8277,15 @@ mod tests {
     fn crontab_remove_passes() {
         // crontab -r is the remove flag — starts with -
         assert_eq!(decision("crontab -r"), None);
+    }
+
+    #[test]
+    fn crontab_prose_in_arg_passes() {
+        // "crontab" appearing inside a prose argument (issue #231) must not trigger
+        assert_eq!(
+            decision(r#"icm store -c "update system crontab via cron-inject.sh""#),
+            None
+        );
     }
 
     // ── F. Absolute-path direct execution scanning (issue #35) ───────────────

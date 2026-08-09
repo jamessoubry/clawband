@@ -3289,3 +3289,41 @@ fn e2e_builtin_allow_cargo_test_not_blessed() {
         "cargo test must not be silently allowed: {out}"
     );
 }
+
+// ── crontab false positive regression (issue #231) ───────────────────────────
+
+#[test]
+fn e2e_crontab_prose_in_arg_no_ask() {
+    // "crontab" inside a prose argument must not trigger the ask pattern (issue #231)
+    let out = run(
+        &bash(r#"icm store -c "update system crontab via cron-inject.sh""#),
+        &[],
+    );
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "icm store with crontab in prose arg must not trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_crontab_file_asks() {
+    // crontab /path/to/file installs a crontab — must ask
+    let out = run(&bash("crontab /tmp/jobs.txt"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "crontab /tmp/jobs.txt must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_crontab_flag_no_ask() {
+    // crontab -e is safe (flag argument) — must not ask
+    let out = run(&bash("crontab -e"), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "crontab -e must not trigger ask: {out}"
+    );
+}
