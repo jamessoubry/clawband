@@ -864,6 +864,16 @@ fn builtin_ask() -> Vec<Pattern> {
             "git branch -D",
             r"\bgit\s+branch\s+(?:(?-i:-D)\b|--delete\s+--force\b|--force\s+--delete\b)",
         ),
+        // git tag -d/--delete/-f/--force — deletes or force-overwrites tags
+        (
+            "git tag mutate",
+            r"\bgit\s+tag\s+(-d|-f|--delete|--force)\b",
+        ),
+        // git remote destructive subcommands — remove/set-url alter or delete remotes
+        (
+            "git remote mutate",
+            r"\bgit\s+remote\s+(remove|rm|set-url|set-head|prune)\b",
+        ),
         // docker rm -f — force-removes a running container
         (
             "docker rm -f",
@@ -1146,6 +1156,39 @@ fn builtin_allow() -> Vec<Pattern> {
             "eval <subshell init/hook/shellenv>",
             r#"\beval\s+['"]?\$\(\s*[\w.-]+\s+(?:init|hook|shellenv)\b"#,
         ),
+        // ── Blessed AI-agent patterns ─────────────────────────────────────────
+        // Read-only git operations: safe to pass silently for any AI agent.
+        // `branch` is excluded: the regex crate has no lookahead support, so we
+        // can't include it without also suppressing `git branch -D` (which must
+        // remain in the ask tier).  Bare `git branch` already passes silently
+        // since no ask/deny pattern matches it.
+        // `remote` and `tag` are excluded — no safe read-only subset worth adding.
+        // `fetch` is handled separately below — bare/remote-only forms only.
+        (
+            "git read-only",
+            r"^git\s+(log|diff|status|show|ls-files|describe|shortlog|blame|grep|rev-parse|rev-list|cat-file|for-each-ref)\b",
+        ),
+        // git fetch: allow bare form and fetch <remote> only.
+        // Flags like --prune/--force silently delete remote-tracking refs; forced
+        // refspecs with colon syntax (e.g. main:main) can overwrite remote branches.
+        // Remote name must start with a word character ([\w]) so --flag arguments
+        // (which start with '-') never match.
+        ("git fetch safe", r"^git\s+fetch(\s+\w[\w./-]*)?$"),
+        // fmt/metadata/tree only — check/clippy/doc run build.rs/proc macros;
+        // build/test/bench run project code directly.
+        ("cargo safe", r"^cargo\s+(fmt|metadata|tree)\b"),
+        // gh read-only: listing/viewing/watching CI.
+        (
+            "gh read",
+            r"^gh\s+(pr|issue|release|run|workflow)\s+(list|view|checks|status|watch|diff)\b",
+        ),
+        // gh mutations that AI agents issue routinely (create/edit/close PRs & issues).
+        (
+            "gh mutations",
+            r"^gh\s+(issue|pr)\s+(create|edit|close|reopen|comment)\b",
+        ),
+        // jq: pure data transform, never destructive.
+        ("jq", r"^jq\b"),
     ];
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
@@ -10958,5 +11001,98 @@ mod tests {
             result, reason,
             "non-standard ask reason should be unchanged"
         );
+    }
+
+    // ── Builtin blessed-patterns (issue #220) ─────────────────────────────────
+
+    #[test]
+    fn builtin_allow_git_status_silent() {
+        assert_eq!(decision("git status"), None);
+    }
+
+    #[test]
+    fn builtin_allow_cargo_test_not_blessed() {
+        // cargo test runs project-controlled code — must not be silently allowed.
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("cargo test"));
+        assert!(not_allowed, "cargo test must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_cargo_build_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("cargo build --release"));
+        assert!(not_allowed, "cargo build must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_git_tag_delete_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("git tag -d v1.0"));
+        assert!(not_allowed, "git tag -d must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_git_remote_remove_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("git remote remove origin"));
+        assert!(not_allowed, "git remote remove must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_git_push_force_still_denied() {
+        assert_eq!(decision("git push --force"), Some("deny".into()));
+    }
+
+    #[test]
+    fn builtin_allow_git_push_origin_main_not_blessed() {
+        // git push is not in the read-only allow list — it may ask or pass through
+        // depending on the ask-tier patterns, but it must not be silently allowed
+        // by the blessed list.
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("git push origin main"));
+        assert!(not_allowed, "git push origin main must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_git_fetch_origin_blessed() {
+        let al = builtin_allow();
+        assert!(
+            al.iter().any(|p| p.matches("git fetch origin")),
+            "git fetch origin must be blessed"
+        );
+    }
+
+    #[test]
+    fn builtin_allow_git_fetch_bare_blessed() {
+        let al = builtin_allow();
+        assert!(
+            al.iter().any(|p| p.matches("git fetch")),
+            "bare git fetch must be blessed"
+        );
+    }
+
+    #[test]
+    fn builtin_allow_git_fetch_prune_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("git fetch --prune"));
+        assert!(not_allowed, "git fetch --prune must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_git_fetch_force_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("git fetch --force"));
+        assert!(not_allowed, "git fetch --force must not be blessed");
+    }
+
+    #[test]
+    fn git_tag_delete_asks() {
+        assert_eq!(decision("git tag -d v1.0"), Some("ask".into()));
+    }
+
+    #[test]
+    fn git_remote_remove_asks() {
+        assert_eq!(decision("git remote remove origin"), Some("ask".into()));
     }
 }
