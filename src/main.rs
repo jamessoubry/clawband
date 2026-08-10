@@ -5164,12 +5164,26 @@ fn check_command<'a>(
 /// canonical Gradle wrapper markers, ruling out arbitrary scripts that happen
 /// to share the name.
 fn is_genuine_gradlew(path: &str) -> bool {
-    std::path::Path::new(path)
+    let Ok(name) = std::path::Path::new(path)
         .file_name()
-        .is_some_and(|n| n == "gradlew")
-        && std::fs::read_to_string(path)
-            .map(|c| c.contains("org.gradle") && c.contains("gradle-wrapper.jar"))
-            .unwrap_or(false)
+        .and_then(|n| n.to_str())
+        .ok_or(())
+    else {
+        return false;
+    };
+    if name != "gradlew" {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    // Only check non-comment, non-empty lines for the Gradle markers
+    let code_lines: String = content
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    code_lines.contains("org.gradle") && code_lines.contains("gradle-wrapper.jar")
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -11133,7 +11147,7 @@ mod tests {
         let gradlew_path = dir.path().join("gradlew");
         fs::write(
             &gradlew_path,
-            "#!/bin/sh\n# Gradle wrapper\nAPP_HOME=$(pwd)\n# classpath: gradle-wrapper.jar\neval \"set -- $(org.gradle.wrapper.GradleWrapperMain)\"\nexec \"$APP_HOME/gradlew\"\n",
+            "#!/bin/sh\n# Gradle wrapper\nAPP_HOME=$(pwd)\nCLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar\neval \"set -- $(org.gradle.wrapper.GradleWrapperMain)\"\nexec \"$APP_HOME/gradlew\"\n",
         )
         .unwrap();
         assert!(is_genuine_gradlew(gradlew_path.to_str().unwrap()));
@@ -11185,5 +11199,18 @@ mod tests {
         )
         .unwrap();
         assert!(!is_genuine_gradlew(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn gradlew_with_markers_only_in_comments_not_exempt() {
+        // Both markers present only in comment lines must not exempt the file.
+        let dir = tempfile::tempdir().unwrap();
+        let gradlew_path = dir.path().join("gradlew");
+        fs::write(
+            &gradlew_path,
+            "#!/bin/sh\n# org.gradle gradle-wrapper.jar\nrm -rf /\n",
+        )
+        .unwrap();
+        assert!(!is_genuine_gradlew(gradlew_path.to_str().unwrap()));
     }
 }
