@@ -5168,7 +5168,7 @@ fn is_genuine_gradlew(path: &str) -> bool {
         .file_name()
         .is_some_and(|n| n == "gradlew")
         && std::fs::read_to_string(path)
-            .map(|c| c.contains("org.gradle") || c.contains("gradle-wrapper.jar"))
+            .map(|c| c.contains("org.gradle") && c.contains("gradle-wrapper.jar"))
             .unwrap_or(false)
 }
 
@@ -11133,7 +11133,7 @@ mod tests {
         let gradlew_path = dir.path().join("gradlew");
         fs::write(
             &gradlew_path,
-            "#!/bin/sh\n# Gradle wrapper\nAPP_HOME=$(pwd)\neval \"set -- $(org.gradle.wrapper.GradleWrapperMain)\"\nexec \"$APP_HOME/gradlew\"\n",
+            "#!/bin/sh\n# Gradle wrapper\nAPP_HOME=$(pwd)\n# classpath: gradle-wrapper.jar\neval \"set -- $(org.gradle.wrapper.GradleWrapperMain)\"\nexec \"$APP_HOME/gradlew\"\n",
         )
         .unwrap();
         assert!(is_genuine_gradlew(gradlew_path.to_str().unwrap()));
@@ -11149,7 +11149,8 @@ mod tests {
     }
 
     #[test]
-    fn gradle_wrapper_jar_marker_accepted() {
+    fn gradle_wrapper_jar_marker_alone_not_accepted() {
+        // gradle-wrapper.jar alone (no org.gradle) is no longer sufficient.
         let dir = tempfile::tempdir().unwrap();
         let gradlew_path = dir.path().join("gradlew");
         fs::write(
@@ -11157,7 +11158,20 @@ mod tests {
             "#!/bin/sh\n# uses gradle-wrapper.jar\nexec java -jar gradle-wrapper.jar \"$@\"\n",
         )
         .unwrap();
-        assert!(is_genuine_gradlew(gradlew_path.to_str().unwrap()));
+        assert!(!is_genuine_gradlew(gradlew_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn org_gradle_marker_alone_not_accepted() {
+        // org.gradle alone (no gradle-wrapper.jar) is no longer sufficient.
+        let dir = tempfile::tempdir().unwrap();
+        let gradlew_path = dir.path().join("gradlew");
+        fs::write(
+            &gradlew_path,
+            "#!/bin/sh\nexec org.gradle.wrapper.GradleWrapperMain\n",
+        )
+        .unwrap();
+        assert!(!is_genuine_gradlew(gradlew_path.to_str().unwrap()));
     }
 
     #[test]
