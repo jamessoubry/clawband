@@ -3327,3 +3327,70 @@ fn e2e_crontab_flag_no_ask() {
         "crontab -e must not trigger ask: {out}"
     );
 }
+
+// ── Gradle wrapper eval false positive regression (issue #232) ───────────────
+
+#[test]
+fn e2e_gradlew_does_not_trigger_eval_ask() {
+    // Standard gradlew boilerplate contains `eval "set -- $(...)"`; scanning it
+    // must not produce an ask.
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let gradlew_path = dir.path().join("gradlew");
+    let mut f = std::fs::File::create(&gradlew_path).unwrap();
+    writeln!(
+        f,
+        r#"#!/bin/sh
+# Gradle wrapper (machine-generated)
+# Ref: https://docs.gradle.org/current/userguide/gradle_wrapper.html
+APP_HOME="$(cd "$(dirname "$0")" && pwd)"
+JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+exec java -classpath "$JAR" org.gradle.wrapper.GradleWrapperMain "$@"
+eval "set -- $(printf '%s\n' "$APP_ARGS" | xargs -n1)"
+"#
+    )
+    .unwrap();
+    let cmd = format!("bash {} build", gradlew_path.display());
+    let out = run(&bash(&cmd), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "./gradlew build must not trigger eval ask (issue #232): {out}"
+    );
+}
+
+#[test]
+fn e2e_gradlew_bash_dot_slash_does_not_trigger_eval_ask() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let gradlew_path = dir.path().join("gradlew");
+    let mut f = std::fs::File::create(&gradlew_path).unwrap();
+    writeln!(
+        f,
+        r#"#!/bin/sh
+APP_HOME="$(cd "$(dirname "$0")" && pwd)"
+JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+exec java -classpath "$JAR" org.gradle.wrapper.GradleWrapperMain "$@"
+eval "set -- $(printf '%s\n' "$APP_ARGS" | xargs -n1)"
+"#
+    )
+    .unwrap();
+    let cmd = format!("bash {} test", gradlew_path.display());
+    let out = run(&bash(&cmd), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "bash gradlew test must not trigger eval ask (issue #232): {out}"
+    );
+}
+
+#[test]
+fn e2e_eval_raw_command_still_asks() {
+    // eval as a raw command (not inside a scanned file) must still trigger ask.
+    let out = run(&bash(r#"eval "set -- $(echo foo)""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        r#"eval "set -- $(echo foo)" must still ask: {out}"#
+    );
+}

@@ -5507,14 +5507,21 @@ fn main() {
             emit(&decision, &reason);
             return;
         }
-        if let Some((decision, reason)) =
-            scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
-        {
-            if decision == "ask" && mode == Mode::Claude && !bypass_permissions {
-                write_ask_breadcrumb(&command, &reason, &call_id);
+        // Gradle wrapper is machine-generated boilerplate; its `eval "set -- $(...)"` is
+        // standard POSIX argument-parsing, not user code — skip content scanning entirely.
+        let is_gradlew = std::path::Path::new(&script_path)
+            .file_name()
+            .is_some_and(|n| n == "gradlew");
+        if !is_gradlew {
+            if let Some((decision, reason)) =
+                scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
+            {
+                if decision == "ask" && mode == Mode::Claude && !bypass_permissions {
+                    write_ask_breadcrumb(&command, &reason, &call_id);
+                }
+                emit(&decision, &reason);
+                return;
             }
-            emit(&decision, &reason);
-            return;
         }
     }
 
