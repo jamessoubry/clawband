@@ -4535,23 +4535,30 @@ fn is_inline_exec_context(segment: &str) -> bool {
     // Node, Deno, Perl, Ruby, Lua, PHP use -e for inline code.  Bundled flags
     // (e.g. `node -ep`) and preceding options with separate values
     // (e.g. `node --require fs -e`) are handled the same way as the shell group.
-    if Regex::new(r"(?i)\b(node|deno|perl|ruby|lua|php)\s+(?:\S+\s+)*-[a-z]*e[a-z]*\b")
+    // The long form --eval is also matched for Node/Deno.
+    if Regex::new(r"(?i)\b(node|deno)\s+(?:\S+\s+)*(?:--eval|-[a-z]*e[a-z]*)\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+    if Regex::new(r"(?i)\b(perl|ruby|lua|php)\s+(?:\S+\s+)*-[a-z]*e[a-z]*\b")
         .unwrap()
         .is_match(segment)
     {
         return true;
     }
 
-    // Node/Deno also support -p (--print) which evaluates an expression and
+    // Node/Deno also support -p / --print which evaluates an expression and
     // prints it — inline code execution even without -e.
-    if Regex::new(r"(?i)\b(node|deno)\s+(?:\S+\s+)*-[a-z]*p[a-z]*\b")
+    if Regex::new(r"(?i)\b(node|deno)\s+(?:\S+\s+)*(?:--print|-[a-z]*p[a-z]*)\b")
         .unwrap()
         .is_match(segment)
     {
         return true;
     }
 
-    // PHP uses -r (--run) to execute inline code without PHP tags.
+    // PHP uses -r to execute inline code without PHP tags.
     if Regex::new(r"(?i)\bphp\s+(?:\S+\s+)*-[a-z]*r[a-z]*\b")
         .unwrap()
         .is_match(segment)
@@ -8575,6 +8582,26 @@ mod tests {
             decision(r#"php -r "exec('id');""#),
             Some("ask".into()),
             "php -r inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn node_long_form_print_flag_detected_as_inline_exec() {
+        // node --print "evil" — long-form --print is equivalent to -p (Greptile P1, issue #238).
+        assert_eq!(
+            decision(r#"node --print "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
+            Some("ask".into()),
+            "node --print inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn node_long_form_eval_flag_detected_as_inline_exec() {
+        // node --eval "evil" — long-form --eval is equivalent to -e.
+        assert_eq!(
+            decision(r#"node --eval "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
+            Some("ask".into()),
+            "node --eval inline exec must still ask (issue #238)"
         );
     }
 
