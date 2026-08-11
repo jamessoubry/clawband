@@ -11068,6 +11068,30 @@ mod tests {
     }
 
     #[test]
+    fn builtin_allow_cargo_check_not_blessed() {
+        // cargo check runs build.rs/proc macros — must not be silently allowed.
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("cargo check"));
+        assert!(not_allowed, "cargo check must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_cargo_clippy_not_blessed() {
+        let al = builtin_allow();
+        let not_allowed = !al.iter().any(|p| p.matches("cargo clippy"));
+        assert!(not_allowed, "cargo clippy must not be blessed");
+    }
+
+    #[test]
+    fn builtin_allow_cargo_fmt_blessed() {
+        let al = builtin_allow();
+        assert!(
+            al.iter().any(|p| p.matches("cargo fmt")),
+            "cargo fmt must be blessed"
+        );
+    }
+
+    #[test]
     fn builtin_allow_git_tag_delete_not_blessed() {
         let al = builtin_allow();
         let not_allowed = !al.iter().any(|p| p.matches("git tag -d v1.0"));
