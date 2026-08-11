@@ -4521,22 +4521,21 @@ fn is_inline_exec_context(segment: &str) -> bool {
     // Shell interpreters and Python use -c for inline code.  The flag may be
     // bundled with other single-char flags (e.g. `bash -ce` means `-c` +
     // `-e`/exit-on-error), so we match any flag bundle that contains 'c'.
-    // Option tokens (--longopt or -shortopt) that appear between the interpreter
-    // name and the inline-exec flag are skipped via `(?:--?\S+\s+)*`, so e.g.
-    //   bash --norc -ce "code"   is still detected.
-    if Regex::new(
-        r"(?i)\b(bash|sh|zsh|dash|fish|python3?|python2)\s+(?:--?\S+\s+)*-[a-z]*c[a-z]*\b",
-    )
-    .unwrap()
-    .is_match(segment)
+    // Any whitespace-separated tokens between the interpreter name and the
+    // inline-exec flag are skipped via `(?:\S+\s+)*`, covering both short/long
+    // option flags (--norc, -x) and their separate value arguments (e.g. the
+    // `module` in `--require module`).
+    if Regex::new(r"(?i)\b(bash|sh|zsh|dash|fish|python3?|python2)\s+(?:\S+\s+)*-[a-z]*c[a-z]*\b")
+        .unwrap()
+        .is_match(segment)
     {
         return true;
     }
 
     // Node, Deno, Perl, Ruby, Lua, PHP use -e for inline code.  Bundled flags
-    // (e.g. `node -ep`) and preceding options (e.g. `node --no-warnings -e`)
-    // are handled the same way as the shell group above.
-    if Regex::new(r"(?i)\b(node|deno|perl|ruby|lua|php)\s+(?:--?\S+\s+)*-[a-z]*e[a-z]*\b")
+    // (e.g. `node -ep`) and preceding options with separate values
+    // (e.g. `node --require fs -e`) are handled the same way as the shell group.
+    if Regex::new(r"(?i)\b(node|deno|perl|ruby|lua|php)\s+(?:\S+\s+)*-[a-z]*e[a-z]*\b")
         .unwrap()
         .is_match(segment)
     {
@@ -8526,6 +8525,19 @@ mod tests {
             decision(r#"bash --norc -ce "docker system prune -a""#),
             Some("deny".into()),
             "bash --norc -ce inline exec must still deny (issue #238)"
+        );
+    }
+
+    #[test]
+    fn node_option_with_separate_value_before_e_flag_detected_as_inline_exec() {
+        // node --require fs -e "evil" — option with a separate value argument
+        // must not hide the inline-exec flag (Greptile P1, issue #238).
+        assert_eq!(
+            decision(
+                r#"node --require fs -e "require('child_process').spawnSync('rm', ['-rf', '/'])""#
+            ),
+            Some("ask".into()),
+            "node --require fs -e inline exec must still ask (issue #238)"
         );
     }
 
