@@ -3290,6 +3290,50 @@ fn e2e_builtin_allow_cargo_test_not_blessed() {
     );
 }
 
+#[test]
+fn e2e_builtin_allow_git_remote_remove_asks() {
+    // git remote remove is destructive — must prompt, not pass silently.
+    let out = run(&bash("git remote remove origin"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git remote remove origin must ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_builtin_allow_git_tag_delete_asks() {
+    // git tag -d is destructive — must prompt.
+    let out = run(&bash("git tag -d v1.0"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git tag -d v1.0 must ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_builtin_allow_cargo_check_not_blessed() {
+    // cargo check runs build.rs/proc macros — must not be silently allowed.
+    let out = run(&bash("cargo check"), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("allow"),
+        "cargo check must not be silently allowed: {out}"
+    );
+}
+
+#[test]
+fn e2e_builtin_allow_git_fetch_prune_not_blessed() {
+    // git fetch --prune silently deletes remote-tracking refs — must not be allowed.
+    let out = run(&bash("git fetch --prune"), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("allow"),
+        "git fetch --prune must not be silently allowed: {out}"
+    );
+}
+
 // ── crontab false positive regression (issue #231) ───────────────────────────
 
 #[test]
