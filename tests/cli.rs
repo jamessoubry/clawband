@@ -3536,3 +3536,39 @@ fn e2e_eval_inline_exec_still_scanned() {
         "eval with dangerous content must still deny (issue #233): {out}"
     );
 }
+
+#[test]
+fn e2e_node_options_before_e_flag_inline_exec_scanned() {
+    // node --no-warnings -e "evil" — options before -e must not suppress scanning (issue #238).
+    let out = run(
+        &bash(r#"node --no-warnings -e "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "node --no-warnings -e inline exec must still ask (issue #238): {out}"
+    );
+}
+
+#[test]
+fn e2e_bash_bundled_ce_flag_inline_exec_scanned() {
+    // bash -ce "evil" — bundled flags must not suppress scanning (issue #238).
+    let out = run(&bash(r#"bash -ce "docker system prune -a""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "bash -ce inline exec must still deny (issue #238): {out}"
+    );
+}
+
+#[test]
+fn e2e_bash_norc_bundled_ce_flag_inline_exec_scanned() {
+    // bash --norc -ce "evil" — preceding option + bundled flags (issue #238).
+    let out = run(&bash(r#"bash --norc -ce "docker system prune -a""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "bash --norc -ce inline exec must still deny (issue #238): {out}"
+    );
+}

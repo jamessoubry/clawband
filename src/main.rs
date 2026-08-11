@@ -4517,14 +4517,33 @@ fn is_inline_exec_context(segment: &str) -> bool {
     if Regex::new(r"(?i)\beval\s").unwrap().is_match(segment) {
         return true;
     }
-    // Interpreter + inline-code flag (-c or -e) anywhere in the segment.
-    // The word boundary after the flag letter prevents matching `-ce` or `-ec`
-    // compound flags that have a different meaning.
-    Regex::new(
-        r"(?i)\b(bash|sh|zsh|dash|fish|python3?|python2|node|deno|perl|ruby|lua|php)\s+-[ce]\b",
+
+    // Shell interpreters and Python use -c for inline code.  The flag may be
+    // bundled with other single-char flags (e.g. `bash -ce` means `-c` +
+    // `-e`/exit-on-error), so we match any flag bundle that contains 'c'.
+    // Option tokens (--longopt or -shortopt) that appear between the interpreter
+    // name and the inline-exec flag are skipped via `(?:--?\S+\s+)*`, so e.g.
+    //   bash --norc -ce "code"   is still detected.
+    if Regex::new(
+        r"(?i)\b(bash|sh|zsh|dash|fish|python3?|python2)\s+(?:--?\S+\s+)*-[a-z]*c[a-z]*\b",
     )
     .unwrap()
     .is_match(segment)
+    {
+        return true;
+    }
+
+    // Node, Deno, Perl, Ruby, Lua, PHP use -e for inline code.  Bundled flags
+    // (e.g. `node -ep`) and preceding options (e.g. `node --no-warnings -e`)
+    // are handled the same way as the shell group above.
+    if Regex::new(r"(?i)\b(node|deno|perl|ruby|lua|php)\s+(?:--?\S+\s+)*-[a-z]*e[a-z]*\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
+    false
 }
 
 fn check_write_then_execute(segments: &[String]) -> bool {
@@ -8474,6 +8493,39 @@ mod tests {
             decision(r#"node -e "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
             Some("ask".into()),
             "node -e inline exec with dangerous content must still ask"
+        );
+    }
+
+    #[test]
+    fn node_options_before_e_flag_detected_as_inline_exec() {
+        // node --no-warnings -e "evil" — options between interpreter and -e must
+        // not hide the inline-exec context (issue #238).
+        assert_eq!(
+            decision(
+                r#"node --no-warnings -e "require('child_process').spawnSync('rm', ['-rf', '/'])""#
+            ),
+            Some("ask".into()),
+            "node --no-warnings -e inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn bash_bundled_ce_flag_detected_as_inline_exec() {
+        // bash -ce "evil" — bundled -c flag must be detected (issue #238).
+        assert_eq!(
+            decision(r#"bash -ce "docker system prune -a""#),
+            Some("deny".into()),
+            "bash -ce inline exec must still deny (issue #238)"
+        );
+    }
+
+    #[test]
+    fn bash_norc_bundled_ce_flag_detected_as_inline_exec() {
+        // bash --norc -ce "evil" — preceding option + bundled -c flag (issue #238).
+        assert_eq!(
+            decision(r#"bash --norc -ce "docker system prune -a""#),
+            Some("deny".into()),
+            "bash --norc -ce inline exec must still deny (issue #238)"
         );
     }
 
