@@ -5158,6 +5158,34 @@ fn check_command<'a>(
     None
 }
 
+// ─── Gradle wrapper fingerprint ───────────────────────────────────────────────
+
+/// Returns true only when the file is both named "gradlew" and contains the
+/// canonical Gradle wrapper markers, ruling out arbitrary scripts that happen
+/// to share the name.
+fn is_genuine_gradlew(path: &str) -> bool {
+    let Ok(name) = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(())
+    else {
+        return false;
+    };
+    if name != "gradlew" {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    // Only check non-comment, non-empty lines for the Gradle markers
+    let code_lines: String = content
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    code_lines.contains("org.gradle") && code_lines.contains("gradle-wrapper.jar")
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -5507,14 +5535,19 @@ fn main() {
             emit(&decision, &reason);
             return;
         }
-        if let Some((decision, reason)) =
-            scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
-        {
-            if decision == "ask" && mode == Mode::Claude && !bypass_permissions {
-                write_ask_breadcrumb(&command, &reason, &call_id);
+        // Gradle wrapper is machine-generated boilerplate; its `eval "set -- $(...)"` is
+        // standard POSIX argument-parsing, not user code — skip content scanning entirely.
+        // Content fingerprint guards against arbitrary scripts named "gradlew".
+        if !is_genuine_gradlew(&script_path) {
+            if let Some((decision, reason)) =
+                scan_script_file(&script_path, &deny_pats, &ask_pats, &allow_pats)
+            {
+                if decision == "ask" && mode == Mode::Claude && !bypass_permissions {
+                    write_ask_breadcrumb(&command, &reason, &call_id);
+                }
+                emit(&decision, &reason);
+                return;
             }
-            emit(&decision, &reason);
-            return;
         }
     }
 
@@ -11103,5 +11136,81 @@ mod tests {
     #[test]
     fn git_remote_remove_asks() {
         assert_eq!(decision("git remote remove origin"), Some("ask".into()));
+    }
+
+    // ── gradlew content fingerprint ───────────────────────────────────────────
+
+    #[test]
+    fn genuine_gradlew_not_scanned() {
+        // A real Gradle wrapper containing the canonical marker must be skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let gradlew_path = dir.path().join("gradlew");
+        fs::write(
+            &gradlew_path,
+            "#!/bin/sh\n# Gradle wrapper\nAPP_HOME=$(pwd)\nCLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar\neval \"set -- $(org.gradle.wrapper.GradleWrapperMain)\"\nexec \"$APP_HOME/gradlew\"\n",
+        )
+        .unwrap();
+        assert!(is_genuine_gradlew(gradlew_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn fake_gradlew_is_scanned() {
+        // A script named "gradlew" but without Gradle markers is NOT a real wrapper.
+        let dir = tempfile::tempdir().unwrap();
+        let gradlew_path = dir.path().join("gradlew");
+        fs::write(&gradlew_path, "#!/bin/sh\nrm -rf /\n").unwrap();
+        assert!(!is_genuine_gradlew(gradlew_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn gradle_wrapper_jar_marker_alone_not_accepted() {
+        // gradle-wrapper.jar alone (no org.gradle) is no longer sufficient.
+        let dir = tempfile::tempdir().unwrap();
+        let gradlew_path = dir.path().join("gradlew");
+        fs::write(
+            &gradlew_path,
+            "#!/bin/sh\n# uses gradle-wrapper.jar\nexec java -jar gradle-wrapper.jar \"$@\"\n",
+        )
+        .unwrap();
+        assert!(!is_genuine_gradlew(gradlew_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn org_gradle_marker_alone_not_accepted() {
+        // org.gradle alone (no gradle-wrapper.jar) is no longer sufficient.
+        let dir = tempfile::tempdir().unwrap();
+        let gradlew_path = dir.path().join("gradlew");
+        fs::write(
+            &gradlew_path,
+            "#!/bin/sh\nexec org.gradle.wrapper.GradleWrapperMain\n",
+        )
+        .unwrap();
+        assert!(!is_genuine_gradlew(gradlew_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn non_gradlew_filename_not_exempt() {
+        // Even with Gradle content, a file not named "gradlew" is not exempt.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("build.sh");
+        fs::write(
+            &path,
+            "#!/bin/sh\nexec org.gradle.wrapper.GradleWrapperMain\n",
+        )
+        .unwrap();
+        assert!(!is_genuine_gradlew(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn gradlew_with_markers_only_in_comments_not_exempt() {
+        // Both markers present only in comment lines must not exempt the file.
+        let dir = tempfile::tempdir().unwrap();
+        let gradlew_path = dir.path().join("gradlew");
+        fs::write(
+            &gradlew_path,
+            "#!/bin/sh\n# org.gradle gradle-wrapper.jar\nrm -rf /\n",
+        )
+        .unwrap();
+        assert!(!is_genuine_gradlew(gradlew_path.to_str().unwrap()));
     }
 }
