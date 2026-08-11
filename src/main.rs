@@ -4542,6 +4542,23 @@ fn is_inline_exec_context(segment: &str) -> bool {
         return true;
     }
 
+    // Node/Deno also support -p (--print) which evaluates an expression and
+    // prints it — inline code execution even without -e.
+    if Regex::new(r"(?i)\b(node|deno)\s+(?:\S+\s+)*-[a-z]*p[a-z]*\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
+    // PHP uses -r (--run) to execute inline code without PHP tags.
+    if Regex::new(r"(?i)\bphp\s+(?:\S+\s+)*-[a-z]*r[a-z]*\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
     false
 }
 
@@ -8538,6 +8555,26 @@ mod tests {
             ),
             Some("ask".into()),
             "node --require fs -e inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn node_print_flag_detected_as_inline_exec() {
+        // node -p "evil" — -p (print/eval) is an inline exec mode like -e.
+        assert_eq!(
+            decision(r#"node -p "require('child_process').execSync('id').toString()""#),
+            Some("ask".into()),
+            "node -p inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn php_r_flag_detected_as_inline_exec() {
+        // php -r "evil" — -r runs inline PHP code without PHP tags.
+        assert_eq!(
+            decision(r#"php -r "exec('id');""#),
+            Some("ask".into()),
+            "php -r inline exec must still ask (issue #238)"
         );
     }
 
