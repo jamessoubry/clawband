@@ -4566,6 +4566,17 @@ fn is_inline_exec_context(segment: &str) -> bool {
         return true;
     }
 
+    // awk/gawk/mawk/nawk treat their first positional argument as an executable
+    // program (unless -f reads from a file, but we treat all awk calls as inline
+    // exec contexts to be safe — the cost is scanning file arguments, not skipping
+    // real programs).
+    if Regex::new(r"(?i)\b(g?awk|mawk|nawk)\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
     false
 }
 
@@ -8602,6 +8613,25 @@ mod tests {
             decision(r#"node --eval "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
             Some("ask".into()),
             "node --eval inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn awk_program_detected_as_inline_exec() {
+        // awk treats its first positional arg as an executable program.
+        assert_eq!(
+            decision(r#"awk 'BEGIN { system("id") }' /etc/passwd"#),
+            Some("ask".into()),
+            "awk inline program must still ask (issue #233)"
+        );
+    }
+
+    #[test]
+    fn gawk_program_detected_as_inline_exec() {
+        assert_eq!(
+            decision(r#"gawk 'BEGIN { system("rm -rf /") }' /etc/passwd"#),
+            Some("ask".into()),
+            "gawk inline program must still ask (issue #233)"
         );
     }
 
