@@ -4536,7 +4536,8 @@ fn is_inline_exec_context(segment: &str) -> bool {
     // (e.g. `node -ep`) and preceding options with separate values
     // (e.g. `node --require fs -e`) are handled the same way as the shell group.
     // The long form --eval is also matched for Node/Deno.
-    if Regex::new(r"(?i)\b(node|deno)\s+(?:\S+\s+)*(?:--eval|-[a-z]*e[a-z]*)\b")
+    // `nodejs` is the canonical binary name on Debian/Ubuntu systems.
+    if Regex::new(r"(?i)\b(node|nodejs|deno)\s+(?:\S+\s+)*(?:--eval|-[a-z]*e[a-z]*)\b")
         .unwrap()
         .is_match(segment)
     {
@@ -4551,7 +4552,7 @@ fn is_inline_exec_context(segment: &str) -> bool {
 
     // Node/Deno also support -p / --print which evaluates an expression and
     // prints it — inline code execution even without -e.
-    if Regex::new(r"(?i)\b(node|deno)\s+(?:\S+\s+)*(?:--print|-[a-z]*p[a-z]*)\b")
+    if Regex::new(r"(?i)\b(node|nodejs|deno)\s+(?:\S+\s+)*(?:--print|-[a-z]*p[a-z]*)\b")
         .unwrap()
         .is_match(segment)
     {
@@ -8632,6 +8633,27 @@ mod tests {
             decision(r#"gawk 'BEGIN { system("rm -rf /") }' /etc/passwd"#),
             Some("ask".into()),
             "gawk inline program must still ask (issue #233)"
+        );
+    }
+
+    #[test]
+    fn nodejs_e_flag_detected_as_inline_exec() {
+        // nodejs is the Debian/Ubuntu binary name for Node.js
+        assert_eq!(
+            decision(r#"nodejs -e "require('child_process').exec('id')""#),
+            Some("ask".into()),
+            "nodejs -e inline exec must still ask (issue #233)"
+        );
+    }
+
+    #[test]
+    fn nodejs_print_flag_detected_as_inline_exec() {
+        assert_eq!(
+            decision(
+                r#"nodejs --print "require('child_process').spawnSync('id').stdout.toString()""#
+            ),
+            Some("ask".into()),
+            "nodejs --print inline exec must still ask (issue #233)"
         );
     }
 
