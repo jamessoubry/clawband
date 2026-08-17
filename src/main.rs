@@ -4495,6 +4495,92 @@ fn is_pure_var_assignment(segment: &str) -> bool {
     .is_match(s)
 }
 
+/// Returns true when the segment contains a context where a quoted argument is
+/// directly executed as code — i.e. an inline-execution context.  This is
+/// checked against the FULL segment text rather than just the first word so
+/// that wrapper invocations such as `xargs sh -c "..."` and
+/// `find . -exec python3 -c "..." \;` are detected even though the outer
+/// command is not itself an interpreter.
+///
+/// Two categories are recognised:
+///   1. `eval` — always executes its argument verbatim.
+///   2. A known shell/scripting interpreter (`bash`, `sh`, `python3`, etc.)
+///      followed immediately by an inline-code flag (`-c` or `-e`) anywhere
+///      in the segment.  `bash script.sh "arg"` has no such flag and returns
+///      false, correctly treating the quoted arg as free-text metadata.
+///
+/// This is used to decide whether to strip static quoted arguments before
+/// pattern matching — free-text metadata args (--body, -m, -c for non-
+/// interpreters) should be stripped to avoid false positives (issue #233).
+fn is_inline_exec_context(segment: &str) -> bool {
+    // eval always executes its argument
+    if Regex::new(r"(?i)\beval\s").unwrap().is_match(segment) {
+        return true;
+    }
+
+    // Shell interpreters and Python use -c for inline code.  The flag may be
+    // bundled with other single-char flags (e.g. `bash -ce` means `-c` +
+    // `-e`/exit-on-error), so we match any flag bundle that contains 'c'.
+    // Any whitespace-separated tokens between the interpreter name and the
+    // inline-exec flag are skipped via `(?:\S+\s+)*`, covering both short/long
+    // option flags (--norc, -x) and their separate value arguments (e.g. the
+    // `module` in `--require module`).
+    if Regex::new(r"(?i)\b(bash|sh|zsh|dash|fish|python3?|python2)\s+(?:\S+\s+)*-[a-z]*c[a-z]*\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
+    // Node, Deno, Perl, Ruby, Lua, PHP use -e for inline code.  Bundled flags
+    // (e.g. `node -ep`) and preceding options with separate values
+    // (e.g. `node --require fs -e`) are handled the same way as the shell group.
+    // The long form --eval is also matched for Node/Deno.
+    // `nodejs` is the canonical binary name on Debian/Ubuntu systems.
+    if Regex::new(r"(?i)\b(node|nodejs|deno)\s+(?:\S+\s+)*(?:--eval|-[a-z]*e[a-z]*)\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+    if Regex::new(r"(?i)\b(perl|ruby|lua|php)\s+(?:\S+\s+)*-[a-z]*e[a-z]*\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
+    // Node/Deno also support -p / --print which evaluates an expression and
+    // prints it — inline code execution even without -e.
+    if Regex::new(r"(?i)\b(node|nodejs|deno)\s+(?:\S+\s+)*(?:--print|-[a-z]*p[a-z]*)\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
+    // PHP uses -r to execute inline code without PHP tags.
+    if Regex::new(r"(?i)\bphp\s+(?:\S+\s+)*-[a-z]*r[a-z]*\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
+    // awk/gawk/mawk/nawk treat their first positional argument as an executable
+    // program (unless -f reads from a file, but we treat all awk calls as inline
+    // exec contexts to be safe — the cost is scanning file arguments, not skipping
+    // real programs).
+    if Regex::new(r"(?i)\b(g?awk|mawk|nawk)\b")
+        .unwrap()
+        .is_match(segment)
+    {
+        return true;
+    }
+
+    false
+}
+
 fn check_write_then_execute(segments: &[String]) -> bool {
     if segments.len() < 2 {
         return false;
@@ -5067,8 +5153,42 @@ fn check_command<'a>(
         // ── Ask tier (suppressed when segment is allow-listed) ────────────────
 
         if !is_allowed {
-            // Check ask patterns against all forms; reason shows original segment
-            for &form in forms {
+            // For the ask tier, strip static quoted content from ALL forms for
+            // non-inline-exec commands (issue #233).  Free-text arguments such as
+            // `--body`, `-m`, `-c` for non-interpreters, and positional args to bash
+            // scripts are metadata — prose text inside them must not trigger security
+            // ask patterns.  Inline-exec contexts (bash -c "…", python3 -c "…",
+            // eval "…", xargs sh -c "…", etc.) retain full content so that dangerous
+            // code inside quoted args is still caught.
+            //
+            // The deny tier above uses a narrower stripping rule (data commands + pure
+            // var assignments only) because deny patterns often rely on PATHS inside
+            // quoted args (e.g. rm -rf '/' or psql -c 'DROP …').  The ask tier is
+            // broader here because ask patterns are advisory and a missed ask is a
+            // usability concern rather than a security bypass.
+            let ask_stripped: Option<Vec<String>> =
+                if is_inline_exec_context(segment) || is_inline_exec_context(&norm) {
+                    None // inline exec: scan the full content
+                } else {
+                    // Strip static quoted content from every form and deduplicate.
+                    let mut stripped: Vec<String> = Vec::new();
+                    for &f in forms {
+                        let s = strip_static_quoted_args(f);
+                        if !stripped.contains(&s) {
+                            stripped.push(s);
+                        }
+                    }
+                    Some(stripped)
+                };
+            let ask_refs_owned: Vec<&str>;
+            let forms_for_ask: &[&str] = if let Some(ref strings) = ask_stripped {
+                ask_refs_owned = strings.iter().map(|s| s.as_str()).collect();
+                &ask_refs_owned
+            } else {
+                forms
+            };
+
+            for &form in forms_for_ask {
                 for pat in ask_pats {
                     if pat.matches(form) {
                         return Some((
@@ -8318,6 +8438,222 @@ mod tests {
         assert_eq!(
             decision(r#"icm store -c "update system crontab via cron-inject.sh""#),
             None
+        );
+    }
+
+    // ── Free-text argument content scanning — issue #233 ─────────────────────
+    // Pattern matches inside quoted prose arguments (--body, -c for non-interpreters,
+    // positional args to scripts) must not fire — those arguments are metadata, not
+    // executable code.  The ask-tier stripping introduced in issue #233 prevents these
+    // false positives while keeping inline-exec contexts (bash -c, eval, etc.) scanned.
+
+    #[test]
+    fn gh_body_openssl_base64_no_ask() {
+        // Issue body mentioning "openssl base64 -d" as documentation must not ask.
+        // The ask-tier stripping removes the double-quoted body before pattern matching.
+        assert_eq!(
+            decision(r#"gh issue create --body "use openssl base64 -d to decode the payload""#),
+            None,
+            "gh --body mentioning openssl base64 must not trigger ask"
+        );
+    }
+
+    #[test]
+    fn gh_body_credentials_no_ask() {
+        // Issue body mentioning ~/.aws/credentials as a path reference must not ask.
+        assert_eq!(
+            decision(r#"gh issue create --body "check ~/.aws/credentials for the API key""#),
+            None,
+            "gh --body mentioning credentials path must not trigger ask"
+        );
+    }
+
+    #[test]
+    fn gh_body_system_call_no_ask() {
+        // Issue body describing a system() call pattern must not ask.
+        assert_eq!(
+            decision(r#"gh issue create --body "avoid system() calls in production code""#),
+            None,
+            "gh --body mentioning system() must not trigger ask"
+        );
+    }
+
+    #[test]
+    fn bash_script_crontab_arg_no_ask() {
+        // A positional argument to a bash script mentioning crontab is free text.
+        // The crontab pattern is also ^-anchored, so it never fires on bash args anyway,
+        // but verify the principle holds even for an unanchored match scenario.
+        assert_eq!(
+            decision(r#"bash notify-main.sh "crontab /etc/cron.d/app was installed""#),
+            None,
+            "bash script with crontab in prose arg must not trigger ask"
+        );
+    }
+
+    #[test]
+    fn icm_store_crontab_no_ask() {
+        // Memory content string with crontab mention must not ask.
+        assert_eq!(
+            decision(r#"icm store -c "deployed crontab /etc/cron.d/myapp successfully""#),
+            None,
+            "icm -c with crontab in prose must not trigger ask"
+        );
+    }
+
+    #[test]
+    fn bash_c_inline_exec_still_scanned() {
+        // bash -c IS an inline-exec context — its quoted arg must still be scanned.
+        assert_eq!(
+            decision(r#"bash -c "openssl base64 -d encoded.txt | bash""#),
+            Some("deny".into()),
+            "bash -c inline exec with dangerous content must still deny"
+        );
+    }
+
+    #[test]
+    fn eval_inline_exec_still_scanned() {
+        // eval always executes its argument — content must not be stripped.
+        // docker system prune is a deny pattern; it must still fire inside eval "…".
+        assert_eq!(
+            decision(r#"eval "docker system prune -a""#),
+            Some("deny".into()),
+            "eval with dangerous content must still deny"
+        );
+    }
+
+    #[test]
+    fn node_e_inline_exec_still_scanned() {
+        // node -e is an inline-exec context — content must be scanned.
+        assert_eq!(
+            decision(r#"node -e "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
+            Some("ask".into()),
+            "node -e inline exec with dangerous content must still ask"
+        );
+    }
+
+    #[test]
+    fn node_options_before_e_flag_detected_as_inline_exec() {
+        // node --no-warnings -e "evil" — options between interpreter and -e must
+        // not hide the inline-exec context (issue #238).
+        assert_eq!(
+            decision(
+                r#"node --no-warnings -e "require('child_process').spawnSync('rm', ['-rf', '/'])""#
+            ),
+            Some("ask".into()),
+            "node --no-warnings -e inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn bash_bundled_ce_flag_detected_as_inline_exec() {
+        // bash -ce "evil" — bundled -c flag must be detected (issue #238).
+        assert_eq!(
+            decision(r#"bash -ce "docker system prune -a""#),
+            Some("deny".into()),
+            "bash -ce inline exec must still deny (issue #238)"
+        );
+    }
+
+    #[test]
+    fn bash_norc_bundled_ce_flag_detected_as_inline_exec() {
+        // bash --norc -ce "evil" — preceding option + bundled -c flag (issue #238).
+        assert_eq!(
+            decision(r#"bash --norc -ce "docker system prune -a""#),
+            Some("deny".into()),
+            "bash --norc -ce inline exec must still deny (issue #238)"
+        );
+    }
+
+    #[test]
+    fn node_option_with_separate_value_before_e_flag_detected_as_inline_exec() {
+        // node --require fs -e "evil" — option with a separate value argument
+        // must not hide the inline-exec flag (Greptile P1, issue #238).
+        assert_eq!(
+            decision(
+                r#"node --require fs -e "require('child_process').spawnSync('rm', ['-rf', '/'])""#
+            ),
+            Some("ask".into()),
+            "node --require fs -e inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn node_print_flag_detected_as_inline_exec() {
+        // node -p "evil" — -p (print/eval) is an inline exec mode like -e.
+        assert_eq!(
+            decision(r#"node -p "require('child_process').execSync('id').toString()""#),
+            Some("ask".into()),
+            "node -p inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn php_r_flag_detected_as_inline_exec() {
+        // php -r "evil" — -r runs inline PHP code without PHP tags.
+        assert_eq!(
+            decision(r#"php -r "exec('id');""#),
+            Some("ask".into()),
+            "php -r inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn node_long_form_print_flag_detected_as_inline_exec() {
+        // node --print "evil" — long-form --print is equivalent to -p (Greptile P1, issue #238).
+        assert_eq!(
+            decision(r#"node --print "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
+            Some("ask".into()),
+            "node --print inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn node_long_form_eval_flag_detected_as_inline_exec() {
+        // node --eval "evil" — long-form --eval is equivalent to -e.
+        assert_eq!(
+            decision(r#"node --eval "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
+            Some("ask".into()),
+            "node --eval inline exec must still ask (issue #238)"
+        );
+    }
+
+    #[test]
+    fn awk_program_detected_as_inline_exec() {
+        // awk treats its first positional arg as an executable program.
+        assert_eq!(
+            decision(r#"awk 'BEGIN { system("id") }' /etc/passwd"#),
+            Some("ask".into()),
+            "awk inline program must still ask (issue #233)"
+        );
+    }
+
+    #[test]
+    fn gawk_program_detected_as_inline_exec() {
+        assert_eq!(
+            decision(r#"gawk 'BEGIN { system("rm -rf /") }' /etc/passwd"#),
+            Some("ask".into()),
+            "gawk inline program must still ask (issue #233)"
+        );
+    }
+
+    #[test]
+    fn nodejs_e_flag_detected_as_inline_exec() {
+        // nodejs is the Debian/Ubuntu binary name for Node.js
+        assert_eq!(
+            decision(r#"nodejs -e "require('child_process').exec('id')""#),
+            Some("ask".into()),
+            "nodejs -e inline exec must still ask (issue #233)"
+        );
+    }
+
+    #[test]
+    fn nodejs_print_flag_detected_as_inline_exec() {
+        assert_eq!(
+            decision(
+                r#"nodejs --print "require('child_process').spawnSync('id').stdout.toString()""#
+            ),
+            Some("ask".into()),
+            "nodejs --print inline exec must still ask (issue #233)"
         );
     }
 

@@ -3438,3 +3438,137 @@ fn e2e_eval_raw_command_still_asks() {
         r#"eval "set -- $(echo foo)" must still ask: {out}"#
     );
 }
+
+// ── free-text argument content scanning — issue #233 ─────────────────────────
+// Quoted arguments that are prose metadata (--body, -c for non-interpreters,
+// positional script args) must not trigger ask/deny patterns.  Inline-exec
+// contexts (bash -c, eval, etc.) must still be scanned.
+
+#[test]
+fn e2e_gh_body_openssl_base64_no_ask() {
+    // Issue body mentioning "openssl base64 -d" as documentation prose.
+    // The ask-tier stripping introduced in issue #233 prevents the false positive.
+    let out = run(
+        &bash(r#"gh issue create --body "use openssl base64 -d to decode the payload""#),
+        &[],
+    );
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "gh --body mentioning openssl base64 prose must not ask (issue #233): {out}"
+    );
+}
+
+#[test]
+fn e2e_gh_body_credentials_no_ask() {
+    // Issue body mentioning ~/.aws/credentials as a prose path reference.
+    let out = run(
+        &bash(r#"gh issue create --body "check ~/.aws/credentials for the API key""#),
+        &[],
+    );
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "gh --body mentioning credentials path prose must not ask (issue #233): {out}"
+    );
+}
+
+#[test]
+fn e2e_gh_body_system_call_no_ask() {
+    // Issue body describing a system() call pattern — prose, not executable code.
+    let out = run(
+        &bash(r#"gh issue create --body "avoid system() calls in production code""#),
+        &[],
+    );
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "gh --body mentioning system() prose must not ask (issue #233): {out}"
+    );
+}
+
+#[test]
+fn e2e_bash_script_crontab_arg_no_ask() {
+    // Positional argument to a bash script mentioning crontab — free-text metadata.
+    let out = run(
+        &bash(r#"bash notify-main.sh "crontab /etc/cron.d/app was installed""#),
+        &[],
+    );
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "bash script with crontab prose arg must not ask (issue #233): {out}"
+    );
+}
+
+#[test]
+fn e2e_icm_store_crontab_no_ask() {
+    // Memory content string mentioning crontab — free-text metadata, not executed.
+    let out = run(
+        &bash(r#"icm store -c "deployed crontab /etc/cron.d/myapp successfully""#),
+        &[],
+    );
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "icm -c with crontab prose must not ask (issue #233): {out}"
+    );
+}
+
+#[test]
+fn e2e_bash_c_inline_exec_still_scanned() {
+    // bash -c IS an inline-exec context — its quoted arg must still be scanned.
+    let out = run(&bash(r#"bash -c "docker system prune -a""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "bash -c inline exec with dangerous content must still deny (issue #233): {out}"
+    );
+}
+
+#[test]
+fn e2e_eval_inline_exec_still_scanned() {
+    // eval always executes its argument — must not be stripped.
+    let out = run(&bash(r#"eval "docker system prune""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "eval with dangerous content must still deny (issue #233): {out}"
+    );
+}
+
+#[test]
+fn e2e_node_options_before_e_flag_inline_exec_scanned() {
+    // node --no-warnings -e "evil" — options before -e must not suppress scanning (issue #238).
+    let out = run(
+        &bash(r#"node --no-warnings -e "require('child_process').spawnSync('rm', ['-rf', '/'])""#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "node --no-warnings -e inline exec must still ask (issue #238): {out}"
+    );
+}
+
+#[test]
+fn e2e_bash_bundled_ce_flag_inline_exec_scanned() {
+    // bash -ce "evil" — bundled flags must not suppress scanning (issue #238).
+    let out = run(&bash(r#"bash -ce "docker system prune -a""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "bash -ce inline exec must still deny (issue #238): {out}"
+    );
+}
+
+#[test]
+fn e2e_bash_norc_bundled_ce_flag_inline_exec_scanned() {
+    // bash --norc -ce "evil" — preceding option + bundled flags (issue #238).
+    let out = run(&bash(r#"bash --norc -ce "docker system prune -a""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "bash --norc -ce inline exec must still deny (issue #238): {out}"
+    );
+}
