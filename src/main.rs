@@ -125,7 +125,7 @@ fn resolve_mode(flag: Option<&str>, file_mode: Option<Mode>) -> Mode {
         }
     }
     // 2. Env var
-    if let Ok(v) = env::var("CLAWBAND_MODE") {
+    if let Ok(v) = env::var(ENV_CLAWBAND_MODE) {
         if let Some(m) = Mode::from_str(v.trim()) {
             return m;
         }
@@ -321,7 +321,7 @@ fn output(decision: &str, reason: &str) {
 }
 
 fn log_path() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".clawband.log")
+    PathBuf::from(env::var(ENV_HOME).unwrap_or_default()).join(".clawband.log")
 }
 
 fn log_marker() -> PathBuf {
@@ -331,7 +331,7 @@ fn log_marker() -> PathBuf {
 // Logging is on if CLAWBAND_LOG=1 OR the persistent marker (set by
 // `clawband log --enable`) exists — so logging survives without env-var fiddling.
 fn logging_enabled() -> bool {
-    env::var("CLAWBAND_LOG").as_deref() == Ok("1") || log_marker().exists()
+    env::var(ENV_CLAWBAND_LOG).as_deref() == Ok("1") || log_marker().exists()
 }
 
 // Return the last `n` non-empty lines of `content`, in order. Pure/testable.
@@ -406,7 +406,7 @@ fn approval_log_path() -> PathBuf {
 }
 
 fn suggest_threshold() -> u64 {
-    env::var("CLAWBAND_SUGGEST_THRESHOLD")
+    env::var(ENV_CLAWBAND_SUGGEST_THRESHOLD)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3)
@@ -1245,11 +1245,11 @@ fn load_patterns(path: &PathBuf) -> Vec<Pattern> {
 }
 
 fn config_dir() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".clawband")
+    PathBuf::from(env::var(ENV_HOME).unwrap_or_default()).join(".clawband")
 }
 
 fn project_config_dir() -> Option<PathBuf> {
-    let pwd = env::var("PWD").ok()?;
+    let pwd = env::var(ENV_PWD).ok()?;
     let path = PathBuf::from(pwd).join(".clawband");
     // Skip if it's the same as the global dir (home dir edge case)
     if path == config_dir() {
@@ -2222,7 +2222,7 @@ fn cmd_add_pattern(file: &str, args: &[String]) {
     }
 
     let cfg = if use_project {
-        PathBuf::from(env::var("PWD").unwrap_or_else(|_| ".".to_string())).join(".clawband")
+        PathBuf::from(env::var(ENV_PWD).unwrap_or_else(|_| ".".to_string())).join(".clawband")
     } else {
         config_dir()
     };
@@ -2259,7 +2259,7 @@ fn cmd_add_pattern(file: &str, args: &[String]) {
 
 /// Expand a leading `~/` or `~` to `$HOME/`.
 fn expand_home(s: &str) -> String {
-    let home = env::var("HOME").unwrap_or_default();
+    let home = env::var(ENV_HOME).unwrap_or_default();
     if let Some(rest) = s.strip_prefix("~/") {
         format!("{}/{}", home, rest)
     } else if s == "~" {
@@ -2446,7 +2446,7 @@ const PROTECT_PATHS_TEMPLATE: &str =
 (^|/)\\.envrc$\n";
 
 fn settings_path() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".claude/settings.json")
+    PathBuf::from(env::var(ENV_HOME).unwrap_or_default()).join(".claude/settings.json")
 }
 
 /// Write `content` to `path` atomically: write to a `.json.tmp` sibling first,
@@ -2464,7 +2464,7 @@ fn write_settings_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 fn hook_command_string() -> String {
     if let Ok(exe) = env::current_exe() {
         if let Ok(canon_exe) = fs::canonicalize(&exe) {
-            if let Ok(path) = env::var("PATH") {
+            if let Ok(path) = env::var(ENV_PATH) {
                 for dir in path.split(':') {
                     let candidate = PathBuf::from(dir).join("clawband");
                     if let Ok(canon) = fs::canonicalize(&candidate) {
@@ -2690,7 +2690,7 @@ fn edit_hook_present(settings: &serde_json::Value) -> bool {
 /// block if a line containing `command = "clawband --mode codex"` is absent.
 /// Always prints the snippet so the user can verify or add it manually.
 fn install_codex(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str) {
-    let home = env::var("HOME").unwrap_or_default();
+    let home = env::var(ENV_HOME).unwrap_or_default();
     let config_path = PathBuf::from(&home).join(".codex/config.toml");
     let snippet = format!(
         "\n[[hooks.PreToolUse]]\nmatcher = \"^(Bash|apply_patch)$\"\n\
@@ -2749,7 +2749,7 @@ fn install_codex(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str)
 
 /// Install clawband into `~/.gemini/settings.json`.  Idempotent.
 fn install_gemini(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str) {
-    let home = env::var("HOME").unwrap_or_default();
+    let home = env::var(ENV_HOME).unwrap_or_default();
     let config_path = PathBuf::from(&home).join(".gemini/settings.json");
     let command_str = format!("{hook_cmd} --mode gemini");
 
@@ -2836,7 +2836,7 @@ fn install_gemini(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str
 
 /// Install clawband into `~/.hermes/config.yaml`.  Idempotent.
 fn install_hermes(hook_cmd: &str, g: &str, y: &str, d: &str, r: &str, bold: &str) {
-    let home = env::var("HOME").unwrap_or_default();
+    let home = env::var(ENV_HOME).unwrap_or_default();
     let config_path = PathBuf::from(&home).join(".hermes/config.yaml");
     let command_str = format!("{hook_cmd} --mode hermes");
 
@@ -3350,7 +3350,7 @@ fn cmd_verify() -> i32 {
     }
 
     // 5. CLAWBAND_SKIP
-    if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
+    if env::var(ENV_CLAWBAND_SKIP).as_deref() == Ok("1") {
         println!("  {bad} {red}{bold}CLAWBAND_SKIP=1 — ALL CHECKS DISABLED{r}");
         failures += 1;
     } else {
@@ -4157,7 +4157,7 @@ fn cmd_help() {
 fn cmd_stats() {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
     let cfg = config_dir();
-    let home = env::var("HOME").unwrap_or_default();
+    let home = env::var(ENV_HOME).unwrap_or_default();
 
     let builtin_deny_count = builtin_deny().len();
     let builtin_ask_count = builtin_ask().len();
@@ -4172,10 +4172,10 @@ fn cmd_stats() {
     let (user_ask, ask_exists) = count_file("ask.patterns");
     let (user_allow, allow_exists) = count_file("allow.patterns");
 
-    let rtk = env::var("RTK_ENABLED").as_deref() == Ok("1");
-    let sqz = env::var("SQZ_ENABLED").as_deref() == Ok("1");
+    let rtk = env::var(ENV_RTK_ENABLED).as_deref() == Ok("1");
+    let sqz = env::var(ENV_SQZ_ENABLED).as_deref() == Ok("1");
     let logging = logging_enabled();
-    let skip = env::var("CLAWBAND_SKIP").as_deref() == Ok("1");
+    let skip = env::var(ENV_CLAWBAND_SKIP).as_deref() == Ok("1");
     let log_path = PathBuf::from(&home).join(".clawband.log");
 
     // Parse audit log if present
@@ -4976,6 +4976,15 @@ fn check_subshells(
 // Never changes the decision — purely advisory.
 
 const ENV_HOME: &str = "HOME";
+const ENV_PWD: &str = "PWD";
+const ENV_PATH: &str = "PATH";
+const ENV_CLAWBAND_MODE: &str = "CLAWBAND_MODE";
+const ENV_CLAWBAND_LOG: &str = "CLAWBAND_LOG";
+const ENV_CLAWBAND_SKIP: &str = "CLAWBAND_SKIP";
+const ENV_CLAWBAND_SUGGEST_THRESHOLD: &str = "CLAWBAND_SUGGEST_THRESHOLD";
+const ENV_RTK_ENABLED: &str = "RTK_ENABLED";
+const ENV_SQZ_ENABLED: &str = "SQZ_ENABLED";
+const ENV_CLAUDE_CODE_DEFAULT_MODE: &str = "CLAUDE_CODE_DEFAULT_MODE";
 
 /// Returns true if `cmd` appears to read from `~/.claude/` rather than write to it.
 fn reads_claude_dir(cmd: &str) -> bool {
@@ -5433,7 +5442,7 @@ fn main() {
 
     let log_enabled = logging_enabled();
 
-    if env::var("CLAWBAND_SKIP").as_deref() == Ok("1") {
+    if env::var(ENV_CLAWBAND_SKIP).as_deref() == Ok("1") {
         // Total bypass — emit a prominent warning so the operator knows checks are off,
         // then leave an audit trail in the log file when logging is enabled.
         eprintln!("[CLAWBAND] WARNING: CLAWBAND_SKIP=1 — all security checks are disabled");
@@ -5478,7 +5487,7 @@ fn main() {
         let abs_path = if std::path::Path::new(&expanded).is_absolute() {
             expanded.clone()
         } else {
-            let pwd = env::var("PWD").unwrap_or_default();
+            let pwd = env::var(ENV_PWD).unwrap_or_default();
             format!("{}/{}", pwd, expanded)
         };
 
@@ -5513,8 +5522,8 @@ fn main() {
     // cannot clobber each other's crumbs.
     let call_id = v["tool_use_id"].as_str().unwrap_or("").to_string();
 
-    let rtk_enabled = env::var("RTK_ENABLED").as_deref() == Ok("1");
-    let sqz_enabled = env::var("SQZ_ENABLED").as_deref() == Ok("1");
+    let rtk_enabled = env::var(ENV_RTK_ENABLED).as_deref() == Ok("1");
+    let sqz_enabled = env::var(ENV_SQZ_ENABLED).as_deref() == Ok("1");
 
     let command = if rtk_enabled {
         strip_rtk(&command)
@@ -5565,7 +5574,7 @@ fn main() {
             .as_str()
             .map(|s| s.eq_ignore_ascii_case("bypassPermissions"))
             .unwrap_or(false);
-        let from_env = env::var("CLAUDE_CODE_DEFAULT_MODE")
+        let from_env = env::var(ENV_CLAUDE_CODE_DEFAULT_MODE)
             .map(|s| s.eq_ignore_ascii_case("bypassPermissions"))
             .unwrap_or(false);
         from_json || from_env
@@ -7138,7 +7147,7 @@ mod tests {
     #[test]
     fn expand_home_tilde_slash() {
         // expand_home is tested with a real HOME env var
-        let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let home = env::var(ENV_HOME).unwrap_or_else(|_| "/root".to_string());
         let expanded = expand_home("~/.claude/settings.json");
         assert_eq!(expanded, format!("{}/.claude/settings.json", home));
     }
@@ -10465,7 +10474,7 @@ mod tests {
         let trusted_path = fake_home.join(".clawband/trusted");
         fs::write(&trusted_path, format!("{key} {hash}\n")).unwrap();
         // Override HOME for the duration of this assertion
-        let orig_home = std::env::var("HOME").unwrap_or_default();
+        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
         std::env::set_var("HOME", fake_home.to_str().unwrap());
         let result = is_project_allow_trusted(&allow_path);
         std::env::set_var("HOME", orig_home);
@@ -10491,7 +10500,7 @@ mod tests {
             format!("{key} {wrong_hash}\n"),
         )
         .unwrap();
-        let orig_home = std::env::var("HOME").unwrap_or_default();
+        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
         std::env::set_var("HOME", fake_home.to_str().unwrap());
         let result = is_project_allow_trusted(&allow_path);
         std::env::set_var("HOME", orig_home);
@@ -11284,7 +11293,7 @@ mod tests {
         // Manually drive the logic by calling record_ask_and_suggest with a
         // custom path via CLAWBAND_SUGGEST_THRESHOLD env var override.
         // We patch HOME so approval_log_path() resolves to our temp dir.
-        let old_home = env::var("HOME").ok();
+        let old_home = env::var(ENV_HOME).ok();
         env::set_var("HOME", dir.path());
         env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "3");
 
@@ -11314,7 +11323,7 @@ mod tests {
     fn record_ask_and_suggest_returns_tip_at_threshold() {
         let dir = tempfile::tempdir().unwrap();
 
-        let old_home = env::var("HOME").ok();
+        let old_home = env::var(ENV_HOME).ok();
         env::set_var("HOME", dir.path());
         env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "3");
 
@@ -11352,7 +11361,7 @@ mod tests {
     #[test]
     fn maybe_append_ask_tip_augments_standard_reason_at_threshold() {
         let dir = tempfile::tempdir().unwrap();
-        let old_home = env::var("HOME").ok();
+        let old_home = env::var(ENV_HOME).ok();
         env::set_var("HOME", dir.path());
         env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "1");
 
