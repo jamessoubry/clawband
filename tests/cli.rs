@@ -3612,3 +3612,18 @@ fn e2e_bash_norc_bundled_ce_flag_inline_exec_scanned() {
         "bash --norc -ce inline exec must still deny (issue #238): {out}"
     );
 }
+
+#[test]
+fn e2e_system_noun_in_prose_no_ask() {
+    // Issue #223: "system (noun)" with a space before the paren is English prose,
+    // not a Perl/Ruby/Lua system() call. Must not trigger ask.
+    let out = run(
+        &bash(r#"python3 -c "print('Azure OEM system (20.74.94.x) calling /api/v1/device')""#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        "prose 'system (...)' must not trigger ask (issue #223): {out}"
+    );
+}
