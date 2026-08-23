@@ -1095,6 +1095,46 @@ fn e2e_eval_subshell_wget_asks() {
     );
 }
 
+// ── --eval CLI flag false positive fix (issue #222) ──────────────────────
+
+#[test]
+fn e2e_mongosh_eval_flag_passes() {
+    let out = run(&bash(r#"mongosh --eval "db.collection.findOne()""#), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        r#"mongosh --eval must not trigger ask: {out}"#
+    );
+}
+
+#[test]
+fn e2e_mongosh_eval_flag_with_uri_passes() {
+    let out = run(
+        &bash(r#"mongosh mongodb://localhost:27017 --eval "db.stats()""#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        r#"mongosh with URI and --eval must not trigger ask: {out}"#
+    );
+}
+
+#[test]
+fn e2e_node_eval_flag_still_asks() {
+    // node --eval executes inline JS — must still be caught even though
+    // generic --eval CLI flags are now allowed (issue #222).
+    let out = run(
+        &bash(r#"node --eval "require('child_process').execSync('id')""#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        r#"node --eval inline exec must still ask: {out}"#
+    );
+}
+
 // ── curl -X DELETE cloud management APIs (issue #170) ────────────────────
 
 #[test]
