@@ -5146,10 +5146,11 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// Extract payload from echo or printf commands.
 /// Handles both quoted ("PAYLOAD", 'PAYLOAD') and unquoted PAYLOAD forms.
 fn extract_echo_payload(segment: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static ECHO_CMD_RE: OnceLock<Regex> = OnceLock::new();
     let trimmed = segment.trim();
 
-    // Match: echo or printf
-    let cmd_re = Regex::new(r"(?i)^(?:echo|printf)\s+").unwrap();
+    let cmd_re = ECHO_CMD_RE.get_or_init(|| Regex::new(r"(?i)^(?:echo|printf)\s+").unwrap());
     let m = cmd_re.find(trimmed)?;
     let after_cmd = &trimmed[m.end()..];
 
@@ -5183,7 +5184,9 @@ fn extract_echo_payload(segment: &str) -> Option<String> {
 /// Extract payload from a heredoc-style redirection (<<< PAYLOAD or <<< "PAYLOAD").
 /// Returns the payload after <<<.
 fn extract_heredoc_payload(segment: &str) -> Option<String> {
-    let heredoc_re = Regex::new(r"<<<\s+").unwrap();
+    use std::sync::OnceLock;
+    static HEREDOC_RE: OnceLock<Regex> = OnceLock::new();
+    let heredoc_re = HEREDOC_RE.get_or_init(|| Regex::new(r"<<<\s+").unwrap());
     if !heredoc_re.is_match(segment) {
         return None;
     }
@@ -5275,16 +5278,23 @@ fn check_encoded_payload<'a>(
     deny_pats: &[Pattern],
     ask_pats: &[Pattern],
 ) -> Option<(&'a str, String)> {
+    use std::sync::OnceLock;
+    static BASE64_DECODE_RE: OnceLock<Regex> = OnceLock::new();
+    static OPENSSL_ENC_RE: OnceLock<Regex> = OnceLock::new();
+    static XXD_REVERSE_RE: OnceLock<Regex> = OnceLock::new();
+    static ECHO_SOURCE_RE: OnceLock<Regex> = OnceLock::new();
+
     // Detect base64 -d, openssl base64 -d, or xxd -r
-    let has_base64_decode =
-        Regex::new(r"(?i)\b(?:base64|openssl\s+\S*\s*base64)\s+(?:-d|-D|--decode)\b")
-            .unwrap()
-            .is_match(segment);
-    let has_openssl_enc = Regex::new(r"(?i)\bopenssl\s+\S*enc\b.*-d\b")
-        .unwrap()
+    let has_base64_decode = BASE64_DECODE_RE
+        .get_or_init(|| {
+            Regex::new(r"(?i)\b(?:base64|openssl\s+\S*\s*base64)\s+(?:-d|-D|--decode)\b").unwrap()
+        })
         .is_match(segment);
-    let has_xxd_reverse = Regex::new(r"(?i)\bxxd\s+(?:-r|--revert)\b")
-        .unwrap()
+    let has_openssl_enc = OPENSSL_ENC_RE
+        .get_or_init(|| Regex::new(r"(?i)\bopenssl\s+\S*enc\b.*-d\b").unwrap())
+        .is_match(segment);
+    let has_xxd_reverse = XXD_REVERSE_RE
+        .get_or_init(|| Regex::new(r"(?i)\bxxd\s+(?:-r|--revert)\b").unwrap())
         .is_match(segment);
 
     if !has_base64_decode && !has_openssl_enc && !has_xxd_reverse {
@@ -5294,8 +5304,8 @@ fn check_encoded_payload<'a>(
     // For piped commands, only process if the data source is echo/printf/heredoc.
     // If pipe comes from a file or command (cat file.b64 | base64 -d), we can't inspect.
     // But echo PAYLOAD | base64 -d is inspectable.
-    let has_echo_source = Regex::new(r"(?i)^(?:echo|printf)\s+")
-        .unwrap()
+    let has_echo_source = ECHO_SOURCE_RE
+        .get_or_init(|| Regex::new(r"(?i)^(?:echo|printf)\s+").unwrap())
         .is_match(segment);
     let has_heredoc = segment.contains("<<<");
 
@@ -5324,7 +5334,7 @@ fn check_encoded_payload<'a>(
 // ─── Core check logic ────────────────────────────────────────────────────────
 // Returns Some(("deny"|"ask", reason)) or None for pass.
 // Does NOT perform script-file scanning (requires filesystem) or subshell checks.
-
+// skipcq: RS-R1000
 fn check_command<'a>(
     command: &str,
     deny_pats: &'a [Pattern],
