@@ -5054,10 +5054,287 @@ fn covered_by_permissions_allow(cmd: &str) -> bool {
     false
 }
 
+// ─── Base64/Hex decode-and-scan (issue #221) ─────────────────────────────────
+
+/// Decode a base64 string without external dependencies.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    const BASE64_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let input = s.trim().as_bytes();
+    let mut result = Vec::new();
+
+    // Remove whitespace and validate characters
+    let mut clean = Vec::new();
+    for &b in input {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' => clean.push(b),
+            b' ' | b'\t' | b'\n' | b'\r' => {} // Skip whitespace
+            _ => return None,                  // Invalid character
+        }
+    }
+
+    // Process in groups of 4 characters
+    let mut i = 0;
+    while i < clean.len() {
+        let chunk_len = std::cmp::min(4, clean.len() - i);
+
+        if chunk_len < 2 {
+            return None; // Need at least 2 characters
+        }
+
+        // Decode first two characters (always present)
+        let c1 = BASE64_CHARS.find(clean[i] as char)?;
+        let c2 = BASE64_CHARS.find(clean[i + 1] as char)?;
+        result.push(((c1 << 2) | (c2 >> 4)) as u8);
+
+        if chunk_len > 2 && clean[i + 2] != b'=' {
+            let c3 = BASE64_CHARS.find(clean[i + 2] as char)?;
+            result.push(((c2 << 4) | (c3 >> 2)) as u8);
+
+            if chunk_len > 3 && clean[i + 3] != b'=' {
+                let c4 = BASE64_CHARS.find(clean[i + 3] as char)?;
+                result.push(((c3 << 6) | c4) as u8);
+            }
+        }
+
+        i += 4;
+    }
+
+    Some(result)
+}
+
+/// Decode a hex string (pairs of hex digits) without external dependencies.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Skip whitespace
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        let high = match bytes[i] {
+            b'0'..=b'9' => bytes[i] - b'0',
+            b'a'..=b'f' => bytes[i] - b'a' + 10,
+            b'A'..=b'F' => bytes[i] - b'A' + 10,
+            _ => return None,
+        };
+        i += 1;
+
+        if i >= bytes.len() {
+            return None; // Odd number of hex digits
+        }
+
+        let low = match bytes[i] {
+            b'0'..=b'9' => bytes[i] - b'0',
+            b'a'..=b'f' => bytes[i] - b'a' + 10,
+            b'A'..=b'F' => bytes[i] - b'A' + 10,
+            _ => return None,
+        };
+        i += 1;
+
+        result.push((high << 4) | low);
+    }
+
+    Some(result)
+}
+
+/// Extract payload from echo or printf commands.
+/// Handles both quoted ("PAYLOAD", 'PAYLOAD') and unquoted PAYLOAD forms.
+fn extract_echo_payload(segment: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static ECHO_CMD_RE: OnceLock<Regex> = OnceLock::new();
+    let trimmed = segment.trim();
+
+    let cmd_re = ECHO_CMD_RE.get_or_init(|| Regex::new(r"(?i)^(?:echo|printf)\s+").unwrap());
+    let m = cmd_re.find(trimmed)?;
+    let after_cmd = &trimmed[m.end()..];
+
+    // Try quoted forms first
+    if let Some(stripped) = after_cmd.strip_prefix('"') {
+        if let Some(close) = stripped.find('"') {
+            return Some(stripped[..close].to_string());
+        }
+    } else if let Some(stripped) = after_cmd.strip_prefix('\'') {
+        if let Some(close) = stripped.find('\'') {
+            return Some(stripped[..close].to_string());
+        }
+    }
+
+    // Try unquoted form (everything until whitespace or pipe)
+    if let Some(end) =
+        after_cmd.find(|c: char| c.is_whitespace() || c == '|' || c == '>' || c == ';')
+    {
+        let payload = after_cmd[..end].trim();
+        if !payload.is_empty() {
+            return Some(payload.to_string());
+        }
+    } else if !after_cmd.trim().is_empty() {
+        // If no delimiter found, entire remainder is the payload
+        return Some(after_cmd.trim().to_string());
+    }
+
+    None
+}
+
+/// Extract payload from a heredoc-style redirection (<<< PAYLOAD or <<< "PAYLOAD").
+/// Returns the payload after <<<.
+fn extract_heredoc_payload(segment: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static HEREDOC_RE: OnceLock<Regex> = OnceLock::new();
+    let heredoc_re = HEREDOC_RE.get_or_init(|| Regex::new(r"<<<\s+").unwrap());
+    if !heredoc_re.is_match(segment) {
+        return None;
+    }
+
+    // Find the position after <<<
+    let m = heredoc_re.find(segment)?;
+    let after_heredoc = segment[m.end()..].trim();
+
+    if after_heredoc.is_empty() {
+        return None;
+    }
+
+    // Try quoted forms
+    if let Some(stripped) = after_heredoc.strip_prefix('"') {
+        if let Some(close) = stripped.find('"') {
+            return Some(stripped[..close].to_string());
+        }
+    } else if let Some(stripped) = after_heredoc.strip_prefix('\'') {
+        if let Some(close) = stripped.find('\'') {
+            return Some(stripped[..close].to_string());
+        }
+    }
+
+    // Unquoted form (until whitespace or pipe)
+    if let Some(end) = after_heredoc.find(|c: char| c.is_whitespace() || c == '|' || c == ';') {
+        Some(after_heredoc[..end].to_string())
+    } else {
+        Some(after_heredoc.to_string())
+    }
+}
+
+/// Scan decoded bytes for dangerous patterns.
+/// Returns Some(decision, reason) if dangerous, None if safe.
+fn scan_decoded_content(
+    decoded: &[u8],
+    deny_pats: &[Pattern],
+    ask_pats: &[Pattern],
+) -> Option<(&'static str, String)> {
+    // Try to decode as UTF-8; if it fails, assume it's binary and allow it
+    // (we can't scan binary payloads for text patterns)
+    let content = match std::str::from_utf8(decoded) {
+        Ok(s) => s,
+        Err(_) => return None, // Binary content — can't scan, allow it
+    };
+
+    // Split into segments and scan
+    let clean = strip_safe_pipes(content);
+    for segment in &split_segments(&clean) {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        // Check deny patterns
+        for pat in deny_pats {
+            if pat.matches(segment) {
+                return Some((
+                    "ask",
+                    format!(
+                        "Decoded content triggers dangerous pattern '{}': {}",
+                        pat.label, segment
+                    ),
+                ));
+            }
+        }
+
+        // Check ask patterns
+        for pat in ask_pats {
+            if pat.matches(segment) {
+                return Some((
+                    "ask",
+                    format!(
+                        "Decoded content triggers warning pattern '{}': {}",
+                        pat.label, segment
+                    ),
+                ));
+            }
+        }
+    }
+
+    None // Decoded content is safe
+}
+
+/// Check if command contains base64/hex decode with extractable payload.
+/// Returns Some(decision, reason) if the decoded content is dangerous.
+/// Returns None if the payload can't be extracted (falls back to existing ask).
+fn check_encoded_payload<'a>(
+    segment: &str,
+    deny_pats: &[Pattern],
+    ask_pats: &[Pattern],
+) -> Option<(&'a str, String)> {
+    use std::sync::OnceLock;
+    static BASE64_DECODE_RE: OnceLock<Regex> = OnceLock::new();
+    static OPENSSL_ENC_RE: OnceLock<Regex> = OnceLock::new();
+    static XXD_REVERSE_RE: OnceLock<Regex> = OnceLock::new();
+    static ECHO_SOURCE_RE: OnceLock<Regex> = OnceLock::new();
+
+    // Detect base64 -d, openssl base64 -d, or xxd -r
+    let has_base64_decode = BASE64_DECODE_RE
+        .get_or_init(|| {
+            Regex::new(r"(?i)\b(?:base64|openssl\s+\S*\s*base64)\s+(?:-d|-D|--decode)\b").unwrap()
+        })
+        .is_match(segment);
+    let has_openssl_enc = OPENSSL_ENC_RE
+        .get_or_init(|| Regex::new(r"(?i)\bopenssl\s+\S*enc\b.*-d\b").unwrap())
+        .is_match(segment);
+    let has_xxd_reverse = XXD_REVERSE_RE
+        .get_or_init(|| Regex::new(r"(?i)\bxxd\s+(?:-r|--revert)\b").unwrap())
+        .is_match(segment);
+
+    if !has_base64_decode && !has_openssl_enc && !has_xxd_reverse {
+        return None; // Not a decode command
+    }
+
+    // For piped commands, only process if the data source is echo/printf/heredoc.
+    // If pipe comes from a file or command (cat file.b64 | base64 -d), we can't inspect.
+    // But echo PAYLOAD | base64 -d is inspectable.
+    let has_echo_source = ECHO_SOURCE_RE
+        .get_or_init(|| Regex::new(r"(?i)^(?:echo|printf)\s+").unwrap())
+        .is_match(segment);
+    let has_heredoc = segment.contains("<<<");
+
+    if segment.contains('|') && !has_echo_source && !has_heredoc {
+        return None; // Can't inspect piped input from files/commands, fall back to ask
+    }
+
+    // Try to extract payload from echo/printf or heredoc
+    let payload = extract_echo_payload(segment).or_else(|| extract_heredoc_payload(segment));
+
+    let Some(payload) = payload else {
+        return None; // Can't extract payload, fall back to ask
+    };
+
+    // Decide which decoder to use based on command type
+    let decoded = if has_xxd_reverse {
+        decode_hex(payload.trim())
+    } else {
+        decode_base64(payload.trim())
+    }?;
+
+    // Scan decoded content
+    scan_decoded_content(&decoded, deny_pats, ask_pats)
+}
+
 // ─── Core check logic ────────────────────────────────────────────────────────
 // Returns Some(("deny"|"ask", reason)) or None for pass.
 // Does NOT perform script-file scanning (requires filesystem) or subshell checks.
-
+// skipcq: RS-R1000
 fn check_command<'a>(
     command: &str,
     deny_pats: &'a [Pattern],
@@ -5157,6 +5434,12 @@ fn check_command<'a>(
                     ));
                 }
             }
+        }
+
+        // Check for base64/hex decode with extractable payload (issue #221).
+        // If the payload is safe, continue; if dangerous, ask; if can't extract, fall through.
+        if let Some((dec, reason)) = check_encoded_payload(segment, deny_pats, ask_pats) {
+            return Some((dec, reason));
         }
 
         // ── Ask tier (suppressed when segment is allow-listed) ────────────────
@@ -7600,6 +7883,98 @@ mod tests {
     fn openssl_no_decode_passes() {
         // openssl used for certificate inspection — no decoding flag
         assert_eq!(decision("openssl x509 -in cert.pem -text"), None);
+    }
+
+    // ── base64/hex decode-and-scan (issue #221) ────────────────────────────────
+
+    #[test]
+    fn base64_echo_safe_payload_allows() {
+        // Safe base64 payload from echo — "echo hello" in base64
+        assert_eq!(decision("echo ZWNobyBoZWxsbw== | base64 -d"), None);
+    }
+
+    #[test]
+    fn base64_echo_dangerous_payload_asks() {
+        // Dangerous base64 payload — "rm -rf /" in base64
+        let result = decision("echo cm0gLXJmIC8= | base64 -d");
+        assert_eq!(result, Some("ask".into()));
+    }
+
+    #[test]
+    fn base64_heredoc_safe_payload_allows() {
+        // Safe heredoc syntax with base64
+        assert_eq!(decision("base64 -d <<< ZWNobyBoZWxsbw=="), None);
+    }
+
+    #[test]
+    fn base64_heredoc_dangerous_payload_asks() {
+        // Dangerous heredoc syntax with base64
+        let result = decision("base64 -d <<< cm0gLXJmIC8=");
+        assert_eq!(result, Some("ask".into()));
+    }
+
+    #[test]
+    fn base64_piped_file_passes() {
+        // Piped input from file can't be inspected — falls back to existing ask patterns
+        // base64 piped to non-interpreter has no ask pattern, so it passes
+        assert_eq!(decision("cat file.b64 | base64 -d"), None);
+    }
+
+    #[test]
+    fn base64_uppercase_d_safe_allows() {
+        // macOS -D variant with safe payload
+        assert_eq!(decision("echo ZWNobyBoZWxsbw== | base64 -D"), None);
+    }
+
+    #[test]
+    fn base64_uppercase_d_dangerous_asks() {
+        // macOS -D variant with dangerous payload
+        let result = decision("echo cm0gLXJmIC8= | base64 -D");
+        assert_eq!(result, Some("ask".into()));
+    }
+
+    #[test]
+    fn base64_long_decode_safe_allows() {
+        // --decode with safe payload
+        assert_eq!(decision("echo ZWNobyBoZWxsbw== | base64 --decode"), None);
+    }
+
+    #[test]
+    fn xxd_reverse_safe_payload_allows() {
+        // Safe hex payload from echo (hex for "echo hello")
+        assert_eq!(decision("echo 6563686f2068656c6c6f | xxd -r"), None);
+    }
+
+    #[test]
+    fn xxd_reverse_dangerous_payload_asks() {
+        // Dangerous hex payload (hex for "rm -rf /")
+        let result = decision("echo 726d202d7266202f | xxd -r");
+        assert_eq!(result, Some("ask".into()));
+    }
+
+    #[test]
+    fn xxd_revert_flag_safe_allows() {
+        // --revert long form with safe payload
+        assert_eq!(decision("echo 6563686f2068656c6c6f | xxd --revert"), None);
+    }
+
+    #[test]
+    fn base64_binary_payload_allows() {
+        // Binary payload (not UTF-8) should allow since we can't scan it
+        assert_eq!(decision("echo AAAA | base64 -d"), None);
+    }
+
+    #[test]
+    fn base64_printf_safe_allows() {
+        // printf variant with safe payload
+        assert_eq!(decision("printf ZWNobyBoZWxsbw== | base64 -d"), None);
+    }
+
+    #[test]
+    fn base64_printf_dangerous_asks() {
+        // printf variant with dangerous payload
+        let result = decision("printf cm0gLXJmIC8= | base64 -d");
+        assert_eq!(result, Some("ask".into()));
     }
 
     // ── symlink hardening: edit_candidates ────────────────────────────────────
