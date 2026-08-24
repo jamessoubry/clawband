@@ -968,7 +968,7 @@ fn builtin_ask() -> Vec<Pattern> {
         // ── Perl/Ruby/Lua coarse process-execution and file-deletion patterns ─
         // (issue #32) — less common runtimes; keep broad but anchored to call shape.
         // `system(` and `exec(` — subprocess execution in Perl, Ruby, Lua
-        ("system() call", r"\bsystem\s*\("),
+        ("system() call", r"\bsystem\("),
         ("exec() call", r"\bexec\s*\("),
         // Ruby `File.delete` / `File.unlink`
         ("ruby File.delete/unlink", r"\bFile\.(delete|unlink)\b"),
@@ -8380,6 +8380,19 @@ mod tests {
     #[test]
     fn perl_system_call_asks() {
         assert_eq!(decision(r#"perl -e "system('ls')""#), Some("ask".into()));
+    }
+
+    #[test]
+    fn system_noun_in_prose_no_ask() {
+        // Issue #223: "system (noun)" in English prose must not trigger ask.
+        // The space between "system" and "(" is prose, not a function call.
+        assert_eq!(
+            decision(
+                r#"python3 -c "print('Azure OEM system (20.74.94.x) calling /api/v1/device')""#
+            ),
+            None,
+            "prose 'system (...)' must not trigger ask"
+        );
     }
 
     #[test]
