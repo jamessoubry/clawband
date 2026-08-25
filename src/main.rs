@@ -5670,6 +5670,7 @@ fn check_command<'a>(
 // Deny patterns are checked first (deny always beats protected-ask) — this avoids
 // a contrived command that matches both a deny pattern and a protected-ask pattern
 // getting the weaker outcome.
+// skipcq: RS-R1000
 fn check_protected_ask(
     command: &str,
     protected_ask_pats: &[Pattern],
@@ -5739,6 +5740,7 @@ fn is_genuine_gradlew(path: &str) -> bool {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+// skipcq: RS-R1000
 fn main() {
     // CLI subcommands — pull out any leading `--mode <val>` first so it doesn't
     // shadow subcommand matching, then hand the remainder to the subcommand.
