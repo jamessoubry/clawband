@@ -3627,3 +3627,74 @@ fn e2e_system_noun_in_prose_no_ask() {
         "prose 'system (...)' must not trigger ask (issue #223): {out}"
     );
 }
+
+// ─── Protected-ask e2e tests ──────────────────────────────────────────────────
+
+/// Build a JSON payload simulating bypassPermissions (YOLO) mode.
+fn bash_yolo(command: &str) -> String {
+    format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":{:?}}},"claudeCoderSettings":{{"defaultMode":"bypassPermissions"}}}}"#,
+        command
+    )
+}
+
+#[test]
+fn e2e_protected_ask_settings_json_prompts_in_yolo() {
+    // Writing to ~/.claude/settings.json must produce "ask" even in YOLO mode.
+    // In normal mode: ask
+    let out_normal = run(
+        &bash(r#"echo '{"permissions":{}}' > ~/.claude/settings.json"#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out_normal),
+        Some("ask"),
+        "settings.json write must ask in normal mode: {out_normal}"
+    );
+
+    // In bypassPermissions mode: must STILL ask (not silently allow)
+    let out_yolo = run(
+        &bash_yolo(r#"echo '{"permissions":{}}' > ~/.claude/settings.json"#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out_yolo),
+        Some("ask"),
+        "settings.json write must ask even in YOLO mode (protected-ask): {out_yolo}"
+    );
+}
+
+#[test]
+fn e2e_protected_ask_bashrc_prompts_in_yolo() {
+    // Writing to ~/.bashrc must produce "ask" even in YOLO mode.
+    let out_yolo = run(&bash_yolo(r#"echo 'alias ll=ls' >> ~/.bashrc"#), &[]);
+    assert_eq!(
+        decision(&out_yolo),
+        Some("ask"),
+        "~/.bashrc write must ask in YOLO mode: {out_yolo}"
+    );
+}
+
+#[test]
+fn e2e_protected_ask_ssh_config_prompts_in_yolo() {
+    // Writing to ~/.ssh/config must produce "ask" even in YOLO mode via tee.
+    let out_yolo = run(&bash_yolo("tee ~/.ssh/config"), &[]);
+    assert_eq!(
+        decision(&out_yolo),
+        Some("ask"),
+        "tee ~/.ssh/config must ask in YOLO mode: {out_yolo}"
+    );
+}
+
+#[test]
+fn e2e_regular_ask_suppressed_in_yolo() {
+    // Sanity-check: a command that triggers regular ask (not protected-ask)
+    // MUST be suppressed (no output) in YOLO mode.
+    // `go run` is an ask-tier command; it is not a protected-ask target.
+    let out_yolo = run(&bash_yolo("go run main.go"), &[]);
+    assert_eq!(
+        decision(&out_yolo),
+        None, // silent allow in YOLO mode
+        "regular ask (go run) must be suppressed in YOLO mode: {out_yolo}"
+    );
+}
