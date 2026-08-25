@@ -132,11 +132,87 @@ fn e2e_skip_warning_emitted_to_stderr() {
 }
 
 #[test]
-fn e2e_non_bash_tool_without_protect_is_noop() {
-    // Write tool, no protect.paths in the test HOME -> no decision (allow).
+fn e2e_non_bash_tool_non_sensitive_path_is_noop() {
+    // Write tool to a non-sensitive path: no decision (pass through).
+    // /etc/passwd doesn't match any builtin edit-protection pattern.
     let json = r#"{"tool_name":"Write","tool_input":{"file_path":"/etc/passwd"}}"#;
     let out = run(json, &[]);
     assert_eq!(decision(&out), None);
+}
+
+#[test]
+fn e2e_write_tool_settings_json_asks_without_protect() {
+    // Write to ~/.claude/settings.json must produce ask (protected-ask rendered as ask)
+    // even without a protect.paths file — built-in patterns fire unconditionally.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"~/.claude/settings.json","content":"{}"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "Write to ~/.claude/settings.json must ask via built-in protection: {out}"
+    );
+}
+
+#[test]
+fn e2e_write_tool_clawband_hook_binary_denied_without_protect() {
+    // Write to ~/.claude/hooks/clawband must be denied (hard deny, self-protection)
+    // even without a protect.paths file.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"~/.claude/hooks/clawband","content":""}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Write to ~/.claude/hooks/clawband must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_write_tool_bashrc_asks_without_protect() {
+    // Write to ~/.bashrc must produce ask (protected-ask) without protect.paths.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"~/.bashrc","content":""}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "Write to ~/.bashrc must ask via built-in protection: {out}"
+    );
+}
+
+#[test]
+fn e2e_write_tool_ssh_key_asks_without_protect() {
+    // Write to ~/.ssh/id_rsa must produce ask (protected-ask) without protect.paths.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"~/.ssh/id_rsa","content":""}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "Write to ~/.ssh/id_rsa must ask via built-in protection: {out}"
+    );
+}
+
+#[test]
+fn e2e_edit_tool_aws_credentials_asks_without_protect() {
+    // Edit tool (not just Write) must also fire built-in protection.
+    let json = r#"{"tool_name":"Edit","tool_input":{"file_path":"~/.aws/credentials","old_string":"x","new_string":"y"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "Edit to ~/.aws/credentials must ask via built-in protection: {out}"
+    );
+}
+
+#[test]
+fn e2e_write_tool_cargo_bin_clawband_denied() {
+    // Write to ~/.cargo/bin/clawband must be hard-denied (self-protection).
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"~/.cargo/bin/clawband","content":""}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Write to ~/.cargo/bin/clawband must be denied: {out}"
+    );
 }
 
 #[test]
