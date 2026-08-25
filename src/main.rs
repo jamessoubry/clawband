@@ -3518,7 +3518,7 @@ fn cmd_verify() -> i32 {
     }
 
     // 8. Write/Edit hook (required — built-in protection fires unconditionally)
-    let edit_hook_active = settings.as_ref().map(edit_hook_present).unwrap_or(false);
+    let edit_hook_active = settings.as_ref().is_some_and(edit_hook_present);
     if edit_hook_active {
         println!("  {ok} Write/Edit hook registered (built-in sensitive-path protection)");
     } else {
@@ -7888,7 +7888,7 @@ mod tests {
         assert!(!edit_protected("/home/user/projects/src/main.rs", &pats));
         assert!(!edit_protected("/etc/passwd", &pats));
         assert!(!edit_protected("/home/user/README.md", &pats));
-        assert!(!edit_protected("/tmp/somefile.txt", &pats));
+        assert!(!edit_protected("/home/user/workfile.txt", &pats));
     }
 
     // ── self-protect: Bash tamper patterns ────────────────────────────────────
