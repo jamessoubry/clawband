@@ -1226,6 +1226,64 @@ fn builtin_protected_ask() -> Vec<Pattern> {
     specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
 }
 
+// ─── Built-in Write/Edit tool protection patterns ────────────────────────────
+// These fire on Write/Edit/MultiEdit/NotebookEdit tool calls, not Bash commands.
+// Patterns are matched against the target file path (absolute or tilde form).
+
+/// Hard-deny paths for Write/Edit tool: clawband's own executable files.
+/// Overwriting these would disable all hook protection.
+fn builtin_edit_deny() -> Vec<Pattern> {
+    let specs: &[(&str, &str)] = &[
+        // clawband hook binary — overwriting disables all PreToolUse protection
+        (
+            "write to ~/.claude/hooks/clawband",
+            r"\.claude/hooks/clawband$",
+        ),
+        // clawband cargo binary — same rationale
+        ("write to ~/.cargo/bin/clawband", r"\.cargo/bin/clawband$"),
+    ];
+    specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
+}
+
+/// Protected-ask paths for Write/Edit tool: sensitive config and credential files.
+/// Always prompts even in bypassPermissions (YOLO) mode.
+fn builtin_edit_protected_ask() -> Vec<Pattern> {
+    let specs: &[(&str, &str)] = &[
+        // Claude Code settings — controls hook installation and agent permissions
+        (
+            "write to ~/.claude/settings.json",
+            r"\.claude/settings(?:\.local)?\.json$",
+        ),
+        // CLAUDE.md — agent instructions file
+        ("write to ~/.claude/CLAUDE.md", r"\.claude/CLAUDE\.md$"),
+        // Any file under ~/.claude/hooks/ (hook binaries and scripts)
+        ("write to ~/.claude/hooks/", r"\.claude/hooks/"),
+        // clawband user pattern files
+        (
+            "write to ~/.clawband/*.patterns",
+            r"\.clawband/[^/]*\.patterns$",
+        ),
+        // Shell startup files — sourced on every new shell; a persistent backdoor vector
+        (
+            "write to shell rc (~/.bashrc / ~/.zshrc / ~/.profile / etc.)",
+            r"(?:^|/)\.(?:bashrc|zshrc|profile|bash_profile|bash_login)$",
+        ),
+        // AWS credentials and config — cloud access keys
+        (
+            "write to ~/.aws/credentials or ~/.aws/config",
+            r"\.aws/(?:credentials|config)$",
+        ),
+        // SSH files (private keys, authorized_keys, config)
+        ("write to ~/.ssh/", r"\.ssh/"),
+        // Git identity config
+        (
+            "write to ~/.gitconfig or ~/.git-credentials",
+            r"\.(?:gitconfig|git-credentials)$",
+        ),
+    ];
+    specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
+}
+
 // ─── Built-in allow patterns (exemptions from ask/deny) ──────────────────────
 
 fn builtin_allow() -> Vec<Pattern> {
@@ -3127,7 +3185,31 @@ fn cmd_install(extra_args: &[String]) {
         println!("  {d}already registered in {}{r}", path.display());
     }
 
-    // 3. Self-protect (--protect flag)
+    // 2b. Wire the Write/Edit hook (unconditional — built-in protection is always on).
+    // Re-read settings in case step 2 just wrote them.
+    let mut settings_edit: serde_json::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if register_edit_hook(&mut settings_edit, &command) {
+        match serde_json::to_string_pretty(&settings_edit) {
+            Ok(out) => {
+                if write_settings_atomic(&path, &(out + "\n")).is_ok() {
+                    println!(
+                        "  {g}registered{r} PreToolUse Write|Edit|MultiEdit|NotebookEdit hook → {d}{}{r}",
+                        command
+                    );
+                } else {
+                    println!("  {y}failed to write {}{r}", path.display());
+                }
+            }
+            Err(_) => println!("  {y}failed to serialize settings{r}"),
+        }
+    } else {
+        println!("  {d}edit hook already registered{r}");
+    }
+
+    // 3. Self-protect (--protect flag) — seeds protect.paths for user-defined paths.
     if protect {
         println!("\n{bold}Self-protect{r}");
 
@@ -3139,30 +3221,6 @@ fn cmd_install(extra_args: &[String]) {
             println!("  {g}created{r} {}", pp.display());
         } else {
             println!("  {y}failed{r} to create {}", pp.display());
-        }
-
-        // Re-read settings (may have been written above)
-        let mut settings2: serde_json::Value = fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        if register_edit_hook(&mut settings2, &command) {
-            match serde_json::to_string_pretty(&settings2) {
-                Ok(out) => {
-                    if write_settings_atomic(&path, &(out + "\n")).is_ok() {
-                        println!(
-                            "  {g}registered{r} PreToolUse Write|Edit|MultiEdit|NotebookEdit hook → {d}{}{r}",
-                            command
-                        );
-                    } else {
-                        println!("  {y}failed to write {}{r}", path.display());
-                    }
-                }
-                Err(_) => println!("  {y}failed to serialize settings{r}"),
-            }
-        } else {
-            println!("  {d}edit hook already registered{r}");
         }
 
         println!();
@@ -3459,16 +3517,24 @@ fn cmd_verify() -> i32 {
         failures += 1;
     }
 
-    // 8. Self-protect status (informational — no failure if off)
+    // 8. Write/Edit hook (required — built-in protection fires unconditionally)
+    let edit_hook_active = settings.as_ref().is_some_and(edit_hook_present);
+    if edit_hook_active {
+        println!("  {ok} Write/Edit hook registered (built-in sensitive-path protection)");
+    } else {
+        println!("  {bad} Write/Edit hook NOT registered — run: clawband install");
+        failures += 1;
+    }
+
+    // 9. Self-protect status (informational — no failure if off)
     let sp_paths_active = protect_active();
-    let sp_hook_active = settings.as_ref().map(edit_hook_present).unwrap_or(false);
-    if sp_paths_active && sp_hook_active {
-        println!("  {ok} self-protect: active (protect.paths + Write/Edit hook registered)");
-    } else if !sp_paths_active && !sp_hook_active {
-        println!("  {d}self-protect: off{r}  {d}(run: clawband install --protect to enable){r}");
+    if sp_paths_active {
+        println!(
+            "  {ok} self-protect: active (protect.paths present — user-defined paths guarded)"
+        );
     } else {
         println!(
-            "  {warn} self-protect: partial (paths_active={sp_paths_active}, edit_hook={sp_hook_active})"
+            "  {d}self-protect: off{r}  {d}(run: clawband install --protect to add user-defined protected paths){r}"
         );
     }
 
@@ -5885,14 +5951,11 @@ fn main() {
     }
 
     // ── Write/Edit/MultiEdit/NotebookEdit guard ──────────────────────────────
-    // These tools are only hooked when --protect was used at install time.
-    // This path always runs in Claude mode (the edit-protect hook is always
-    // wired for Claude); output() shim preserves the existing Claude format.
+    // Built-in patterns fire unconditionally; user protect.paths patterns are
+    // also checked when protect_active() (i.e. a protect.paths file exists).
+    // output() shim uses Claude format (the edit hook is Claude-only).
     let tool_name = v["tool_name"].as_str().unwrap_or("");
     if matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
-        if !protect_active() {
-            return;
-        }
         // Detect target path: file_path (Write/Edit/MultiEdit) or notebook_path
         // (NotebookEdit).  Also accept `path` as a generic alias used by some agents.
         let raw_path = if tool_name == "NotebookEdit" {
@@ -5915,19 +5978,72 @@ fn main() {
             format!("{}/{}", pwd, expanded)
         };
 
-        let pats = protect_patterns();
         // Check the original raw path, the expanded-absolute path, and any
         // canonicalized paths (resolves symlinks and `..` so symlink bypass
         // is not possible even when the target does not yet exist).
         let mut candidates = edit_candidates(&abs_path);
         candidates.push(raw_path.to_string());
-        let protected = candidates.iter().any(|c| edit_protected(c, &pats));
-        if protected {
-            let reason = format!("clawband protects this path from edits: {}", abs_path);
+
+        // Load user allow patterns so users can whitelist specific paths.
+        let cfg = config_dir();
+        let mut allow_pats: Vec<Pattern> = load_patterns(&cfg.join("allow.patterns"));
+        if let Some(proj) = project_config_dir() {
+            let project_allow = proj.join("allow.patterns");
+            if project_allow.exists() && is_project_allow_trusted(&project_allow) {
+                allow_pats.extend(load_patterns(&project_allow));
+            }
+        }
+        let path_allowed = |c: &str| allow_pats.iter().any(|p| p.matches(c));
+
+        // 1. Hard deny: clawband's own executables — overwriting disables protection.
+        let edit_deny_pats = builtin_edit_deny();
+        if candidates
+            .iter()
+            .any(|c| edit_protected(c, &edit_deny_pats))
+            && !candidates.iter().any(|c| path_allowed(c))
+        {
+            let reason = format!(
+                "clawband: write to this path is denied (self-protection): {}",
+                abs_path
+            );
             if log_enabled {
                 log_action("deny", &reason, &abs_path);
             }
             output("deny", &reason);
+            return;
+        }
+
+        // 2. User protect.paths patterns (requires protect_active()).
+        // Checked before builtin ask so that an explicit user deny takes precedence.
+        if protect_active() {
+            let pats = protect_patterns();
+            if candidates.iter().any(|c| edit_protected(c, &pats))
+                && !candidates.iter().any(|c| path_allowed(c))
+            {
+                let reason = format!("clawband protects this path from edits: {}", abs_path);
+                if log_enabled {
+                    log_action("deny", &reason, &abs_path);
+                }
+                output("deny", &reason);
+                return;
+            }
+        }
+
+        // 3. Built-in sensitive-path ask: always prompts for sensitive config /
+        //    credential files, even in bypassPermissions (YOLO) mode.
+        //    "protected-ask" is an internal tier; rendered as "ask" for Claude Code.
+        let edit_protected_ask_pats = builtin_edit_protected_ask();
+        if candidates
+            .iter()
+            .any(|c| edit_protected(c, &edit_protected_ask_pats))
+            && !candidates.iter().any(|c| path_allowed(c))
+        {
+            let reason = format!("clawband: sensitive path — confirm write to: {}", abs_path);
+            if log_enabled {
+                log_action("protected-ask", &reason, &abs_path);
+            }
+            output("ask", &reason);
+            return;
         }
         return;
     }
@@ -7652,6 +7768,127 @@ mod tests {
             "/absolute/path/file.txt"
         );
         assert_eq!(expand_home("relative/path"), "relative/path");
+    }
+
+    // ── builtin_edit_deny: hard-deny patterns for Write/Edit tool ─────────────
+
+    #[test]
+    fn builtin_edit_deny_clawband_hook_binary_matched() {
+        let pats = builtin_edit_deny();
+        assert!(
+            edit_protected("/home/user/.claude/hooks/clawband", &pats),
+            "hook binary must be hard-denied"
+        );
+        assert!(
+            edit_protected("~/.claude/hooks/clawband", &pats),
+            "tilde-form hook binary must be hard-denied"
+        );
+    }
+
+    #[test]
+    fn builtin_edit_deny_cargo_bin_clawband_matched() {
+        let pats = builtin_edit_deny();
+        assert!(
+            edit_protected("/home/user/.cargo/bin/clawband", &pats),
+            "cargo binary must be hard-denied"
+        );
+        assert!(
+            edit_protected("~/.cargo/bin/clawband", &pats),
+            "tilde-form cargo binary must be hard-denied"
+        );
+    }
+
+    #[test]
+    fn builtin_edit_deny_other_hook_binaries_not_matched() {
+        let pats = builtin_edit_deny();
+        assert!(
+            !edit_protected("/home/user/.claude/hooks/other-tool", &pats),
+            "other hook binaries must not be denied"
+        );
+        assert!(
+            !edit_protected("/etc/passwd", &pats),
+            "unrelated path must not be denied"
+        );
+    }
+
+    // ── builtin_edit_protected_ask: sensitive-path patterns ───────────────────
+
+    #[test]
+    fn builtin_edit_protected_ask_settings_json_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(edit_protected("/home/user/.claude/settings.json", &pats));
+        assert!(edit_protected("~/.claude/settings.json", &pats));
+        assert!(edit_protected(
+            "/home/user/.claude/settings.local.json",
+            &pats
+        ));
+    }
+
+    #[test]
+    fn builtin_edit_protected_ask_claude_md_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(edit_protected("/home/user/.claude/CLAUDE.md", &pats));
+        assert!(edit_protected("~/.claude/CLAUDE.md", &pats));
+    }
+
+    #[test]
+    fn builtin_edit_protected_ask_hooks_dir_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(edit_protected("/home/user/.claude/hooks/some-hook", &pats));
+        assert!(edit_protected("~/.claude/hooks/my-hook", &pats));
+    }
+
+    #[test]
+    fn builtin_edit_protected_ask_clawband_patterns_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(edit_protected("/home/user/.clawband/deny.patterns", &pats));
+        assert!(edit_protected("~/.clawband/ask.patterns", &pats));
+        assert!(edit_protected("~/.clawband/allow.patterns", &pats));
+    }
+
+    #[test]
+    fn builtin_edit_protected_ask_shell_rc_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(edit_protected("/home/user/.bashrc", &pats));
+        assert!(edit_protected("/home/user/.zshrc", &pats));
+        assert!(edit_protected("/home/user/.profile", &pats));
+        assert!(edit_protected("/home/user/.bash_profile", &pats));
+        assert!(edit_protected("/home/user/.bash_login", &pats));
+        assert!(edit_protected("~/.bashrc", &pats));
+    }
+
+    #[test]
+    fn builtin_edit_protected_ask_aws_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(edit_protected("/home/user/.aws/credentials", &pats));
+        assert!(edit_protected("/home/user/.aws/config", &pats));
+        assert!(edit_protected("~/.aws/credentials", &pats));
+    }
+
+    #[test]
+    fn builtin_edit_protected_ask_ssh_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(edit_protected("/home/user/.ssh/id_rsa", &pats));
+        assert!(edit_protected("/home/user/.ssh/config", &pats));
+        assert!(edit_protected("/home/user/.ssh/authorized_keys", &pats));
+        assert!(edit_protected("~/.ssh/id_ed25519", &pats));
+    }
+
+    #[test]
+    fn builtin_edit_protected_ask_gitconfig_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(edit_protected("/home/user/.gitconfig", &pats));
+        assert!(edit_protected("/home/user/.git-credentials", &pats));
+        assert!(edit_protected("~/.gitconfig", &pats));
+    }
+
+    #[test]
+    fn builtin_edit_protected_ask_normal_paths_not_matched() {
+        let pats = builtin_edit_protected_ask();
+        assert!(!edit_protected("/home/user/projects/src/main.rs", &pats));
+        assert!(!edit_protected("/etc/passwd", &pats));
+        assert!(!edit_protected("/home/user/README.md", &pats));
+        assert!(!edit_protected("/home/user/workfile.txt", &pats));
     }
 
     // ── self-protect: Bash tamper patterns ────────────────────────────────────
