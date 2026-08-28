@@ -2901,6 +2901,24 @@ fn edit_hook_present(settings: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true if the Agent spawn guard hook is registered.
+fn agent_hook_present(settings: &serde_json::Value) -> bool {
+    settings["hooks"]["PreToolUse"]
+        .as_array()
+        .map(|entries| {
+            entries.iter().any(|e| {
+                let matcher = e["matcher"].as_str().unwrap_or("");
+                matcher == "Agent"
+                    && e["hooks"].as_array().is_some_and(|hooks| {
+                        hooks
+                            .iter()
+                            .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
+                    })
+            })
+        })
+        .unwrap_or(false)
+}
+
 // ─── Agent-specific install wiring ───────────────────────────────────────────
 
 /// Install clawband into `~/.codex/config.toml`.  Idempotent — only appends the
@@ -3621,7 +3639,16 @@ fn cmd_verify() -> i32 {
         failures += 1;
     }
 
-    // 9. Self-protect status (informational — no failure if off)
+    // 9. Agent hook (required — guards bypassPermissions escalation via Agent spawns)
+    let agent_hook_active = settings.as_ref().is_some_and(agent_hook_present);
+    if agent_hook_active {
+        println!("  {ok} Agent hook registered (bypassPermissions spawn guard)");
+    } else {
+        println!("  {bad} Agent hook NOT registered — run: clawband install");
+        failures += 1;
+    }
+
+    // 10. Self-protect status (informational — no failure if off)
     let sp_paths_active = protect_active();
     if sp_paths_active {
         println!(
@@ -8279,6 +8306,24 @@ mod tests {
         assert!(edit_hook_present(&s));
         // Total entries = 2
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    }
+
+    // ── agent_hook_present ────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_hook_present_true_when_registered() {
+        let mut s = serde_json::json!({});
+        assert!(!agent_hook_present(&s));
+        register_agent_hook(&mut s, "clawband");
+        assert!(agent_hook_present(&s));
+    }
+
+    #[test]
+    fn agent_hook_present_false_for_bash_only() {
+        let mut s = serde_json::json!({});
+        register_hook(&mut s, "clawband");
+        // Bash entry alone must not satisfy agent_hook_present.
+        assert!(!agent_hook_present(&s));
     }
 
     // ── register_agent_hook ───────────────────────────────────────────────────
