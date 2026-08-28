@@ -2783,6 +2783,51 @@ fn register_edit_hook(settings: &mut serde_json::Value, command: &str) -> bool {
     *pre_val != before
 }
 
+/// Register a third PreToolUse hook entry with matcher "Agent" pointing at the
+/// same clawband main command.  Idempotent — does nothing if an entry whose
+/// matcher is exactly "Agent" already has a clawband main command.
+/// Returns true if the settings were modified.
+fn register_agent_hook(settings: &mut serde_json::Value, command: &str) -> bool {
+    use serde_json::json;
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let obj = settings.as_object_mut().unwrap();
+    let hooks_obj = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks_obj.is_object() {
+        *hooks_obj = json!({});
+    }
+    let pre_val = hooks_obj
+        .as_object_mut()
+        .unwrap()
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]));
+    if !pre_val.is_array() {
+        *pre_val = json!([]);
+    }
+    let before = pre_val.clone();
+    let pre = pre_val.as_array_mut().unwrap();
+
+    // Check if an "Agent" matcher entry already has a clawband main command.
+    let already = pre.iter().any(|e| {
+        let matcher = e["matcher"].as_str().unwrap_or("");
+        matcher == "Agent"
+            && e["hooks"].as_array().is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
+            })
+    });
+    if already {
+        return false;
+    }
+
+    let hook = json!({"type": "command", "command": command});
+    pre.push(json!({"matcher": "Agent", "hooks": [hook]}));
+
+    *pre_val != before
+}
+
 /// True if a command is the clawband PostToolUse companion (`clawband post`).
 fn is_clawband_post_command(cmd: &str) -> bool {
     let mut toks = cmd.split_whitespace();
@@ -3234,6 +3279,29 @@ fn cmd_install(extra_args: &[String]) {
         }
     } else {
         println!("  {d}edit hook already registered{r}");
+    }
+
+    // 2c. Wire the Agent hook — guards subagent spawns that request bypassPermissions.
+    let mut settings_agent: serde_json::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if register_agent_hook(&mut settings_agent, &command) {
+        match serde_json::to_string_pretty(&settings_agent) {
+            Ok(out) => {
+                if write_settings_atomic(&path, &(out + "\n")).is_ok() {
+                    println!(
+                        "  {g}registered{r} PreToolUse Agent hook → {d}{}{r}",
+                        command
+                    );
+                } else {
+                    println!("  {y}failed to write {}{r}", path.display());
+                }
+            }
+            Err(_) => println!("  {y}failed to serialize settings{r}"),
+        }
+    } else {
+        println!("  {d}agent hook already registered{r}");
     }
 
     // 3. Self-protect (--protect flag) — seeds protect.paths for user-defined paths.
@@ -6075,6 +6143,30 @@ fn main() {
         return;
     }
 
+    // ── Agent tool guard ──────────────────────────────────────────────────────
+    // Claude Code fires a PreToolUse event with tool_name "Agent" when the
+    // model spawns a subagent.  The tool_input.permissionMode field carries
+    // the mode the model is requesting for the subagent.  A subagent must not
+    // be allowed to escalate beyond the parent session's permission level by
+    // explicitly requesting bypassPermissions; deny such attempts here.
+    // Normal spawns (no permissionMode or a mode that does not escalate) are
+    // allowed through without further inspection — the parent session's own
+    // deny/ask rules continue to protect it.
+    if tool_name == "Agent" {
+        let permission_mode = v["tool_input"]["permissionMode"].as_str().unwrap_or("");
+        if permission_mode.eq_ignore_ascii_case("bypassPermissions") {
+            let reason = "clawband: Agent spawn with permissionMode:bypassPermissions denied \
+                          — a subagent must not escalate to bypass mode";
+            if log_enabled {
+                log_action("deny", reason, "Agent(permissionMode:bypassPermissions)");
+            }
+            emit_decision(mode, ask_fallback, "deny", reason);
+            return;
+        }
+        // Normal agent spawn — allow without further inspection.
+        return;
+    }
+
     // ── Command tool path ─────────────────────────────────────────────────────
     // Accept tool_input.command regardless of tool_name: Claude Code uses
     // tool_name "Bash", Codex uses "Bash", Hermes uses "terminal", Gemini
@@ -8187,6 +8279,41 @@ mod tests {
         assert!(edit_hook_present(&s));
         // Total entries = 2
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    }
+
+    // ── register_agent_hook ───────────────────────────────────────────────────
+
+    #[test]
+    fn register_agent_hook_into_empty_settings() {
+        let mut s = serde_json::json!({});
+        assert!(register_agent_hook(&mut s, "clawband"));
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matcher"].as_str(), Some("Agent"));
+    }
+
+    #[test]
+    fn register_agent_hook_is_idempotent() {
+        let mut s = serde_json::json!({});
+        assert!(register_agent_hook(&mut s, "clawband"));
+        assert!(!register_agent_hook(&mut s, "clawband"));
+    }
+
+    #[test]
+    fn register_agent_hook_does_not_disturb_bash_or_edit_entries() {
+        let mut s = serde_json::json!({});
+        assert!(register_hook(&mut s, "clawband"));
+        assert!(register_edit_hook(&mut s, "clawband"));
+        assert!(register_agent_hook(&mut s, "clawband"));
+        // Bash entry still present
+        assert!(clawband_hook_present(&s));
+        // Edit entry still present
+        assert!(edit_hook_present(&s));
+        // Total entries = 3
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
+        // Agent entry is last
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr[2]["matcher"].as_str(), Some("Agent"));
     }
 
     // ── uninstall: remove_clawband_hooks ──────────────────────────────────────
