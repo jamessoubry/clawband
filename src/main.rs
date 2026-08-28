@@ -3195,6 +3195,7 @@ fn install_openclaw(hook_cmd: &str, g: &str, _y: &str, d: &str, r: &str, bold: &
     println!("  config to point the plugin at a non-PATH binary location.");
 }
 
+// skipcq: RS-R1000
 fn cmd_install(extra_args: &[String]) {
     let protect = extra_args.iter().any(|a| a == "--protect");
     let post = extra_args.iter().any(|a| a == "--post");
