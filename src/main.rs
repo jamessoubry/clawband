@@ -2887,7 +2887,7 @@ fn register_post_hook(settings: &mut serde_json::Value, command: &str) -> bool {
 fn edit_hook_present(settings: &serde_json::Value) -> bool {
     settings["hooks"]["PreToolUse"]
         .as_array()
-        .map(|entries| {
+        .is_some_and(|entries| {
             entries.iter().any(|e| {
                 let matcher = e["matcher"].as_str().unwrap_or("");
                 matcher.contains("Edit")
@@ -2898,14 +2898,13 @@ fn edit_hook_present(settings: &serde_json::Value) -> bool {
                     })
             })
         })
-        .unwrap_or(false)
 }
 
 /// Returns true if the Agent spawn guard hook is registered.
 fn agent_hook_present(settings: &serde_json::Value) -> bool {
     settings["hooks"]["PreToolUse"]
         .as_array()
-        .map(|entries| {
+        .is_some_and(|entries| {
             entries.iter().any(|e| {
                 let matcher = e["matcher"].as_str().unwrap_or("");
                 matcher == "Agent"
@@ -2916,7 +2915,6 @@ fn agent_hook_present(settings: &serde_json::Value) -> bool {
                     })
             })
         })
-        .unwrap_or(false)
 }
 
 // ─── Agent-specific install wiring ───────────────────────────────────────────
