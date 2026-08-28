@@ -1640,7 +1640,7 @@ fn variable_name_from_path(path: &str) -> Option<String> {
 fn detect_interpreter(content: &str) -> Option<&'static str> {
     let interp_line = content.lines().next()?.strip_prefix("#!")?;
     let tokens: Vec<&str> = interp_line.split_whitespace().collect();
-    let interp = if tokens.first().map(|t| t.ends_with("/env")).unwrap_or(false) {
+    let interp = if tokens.first().is_some_and(|t| t.ends_with("/env")) {
         tokens.get(1).copied().unwrap_or("")
     } else {
         tokens.first().copied().unwrap_or("")
@@ -2133,8 +2133,7 @@ fn normalize_segment(segment: &str) -> (String, Vec<String>) {
         if rest
             .chars()
             .next()
-            .map(|c| c.is_alphabetic() || c == '_')
-            .unwrap_or(false)
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
         {
             s = rest.to_string();
         }
@@ -2673,7 +2672,7 @@ fn is_clawband_main_command(cmd: &str) -> bool {
 fn clawband_hook_present(settings: &serde_json::Value) -> bool {
     let pre = settings["hooks"]["PreToolUse"]
         .as_array()
-        .map(|entries| {
+        .is_some_and(|entries| {
             entries.iter().any(|e| {
                 e["hooks"].as_array().is_some_and(|hooks| {
                     hooks
@@ -2681,8 +2680,7 @@ fn clawband_hook_present(settings: &serde_json::Value) -> bool {
                         .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
                 })
             })
-        })
-        .unwrap_or(false);
+        });
     pre || post_hook_present(settings)
 }
 
@@ -2842,7 +2840,7 @@ fn is_clawband_post_command(cmd: &str) -> bool {
 fn post_hook_present(settings: &serde_json::Value) -> bool {
     settings["hooks"]["PostToolUse"]
         .as_array()
-        .map(|entries| {
+        .is_some_and(|entries| {
             entries.iter().any(|e| {
                 e["hooks"].as_array().is_some_and(|hooks| {
                     hooks
@@ -2851,7 +2849,6 @@ fn post_hook_present(settings: &serde_json::Value) -> bool {
                 })
             })
         })
-        .unwrap_or(false)
 }
 
 /// Register the PostToolUse `clawband post` hook (matcher Bash). Idempotent.
@@ -3617,9 +3614,7 @@ fn cmd_verify() -> i32 {
     let dp = builtin_deny();
     let ap = builtin_ask();
     let no_allow: Vec<Pattern> = vec![];
-    let blocks = check_command("rm -rf /", &dp, &ap, &no_allow)
-        .map(|(d, _)| d == "deny")
-        .unwrap_or(false);
+    let blocks = check_command("rm -rf /", &dp, &ap, &no_allow).is_some_and(|(d, _)| d == "deny");
     let passes = check_command("ls -la", &dp, &ap, &no_allow).is_none();
     if blocks && passes {
         println!("  {ok} self-test: engine blocks destructive + passes safe commands");
@@ -4899,8 +4894,7 @@ fn check_write_then_execute(segments: &[String]) -> bool {
     segments.iter().any(|s| {
         exec_re.captures_iter(s).any(|c| {
             c.get(1)
-                .map(|m| written.contains(&path_basename(m.as_str())))
-                .unwrap_or(false)
+                .is_some_and(|m| written.contains(&path_basename(m.as_str())))
         })
     })
 }
@@ -5062,8 +5056,7 @@ fn check_fetch_then_exec(segments: &[String]) -> bool {
     segments.iter().any(|s| {
         exec_re.captures_iter(s).any(|c| {
             c.get(1)
-                .map(|m| fetched.contains(&path_basename(m.as_str()).to_string()))
-                .unwrap_or(false)
+                .is_some_and(|m| fetched.contains(&path_basename(m.as_str()).to_string()))
         })
     })
 }
@@ -5102,12 +5095,11 @@ fn check_assign_then_exec(segments: &[String]) -> bool {
         exec_re
             .captures(seg)
             .and_then(|c| c.get(1))
-            .map(|m| {
+            .is_some_and(|m| {
                 assigned
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(m.as_str()))
             })
-            .unwrap_or(false)
     })
 }
 
