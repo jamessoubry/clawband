@@ -1640,7 +1640,7 @@ fn variable_name_from_path(path: &str) -> Option<String> {
 fn detect_interpreter(content: &str) -> Option<&'static str> {
     let interp_line = content.lines().next()?.strip_prefix("#!")?;
     let tokens: Vec<&str> = interp_line.split_whitespace().collect();
-    let interp = if tokens.first().map(|t| t.ends_with("/env")).unwrap_or(false) {
+    let interp = if tokens.first().is_some_and(|t| t.ends_with("/env")) {
         tokens.get(1).copied().unwrap_or("")
     } else {
         tokens.first().copied().unwrap_or("")
@@ -2133,8 +2133,7 @@ fn normalize_segment(segment: &str) -> (String, Vec<String>) {
         if rest
             .chars()
             .next()
-            .map(|c| c.is_alphabetic() || c == '_')
-            .unwrap_or(false)
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
         {
             s = rest.to_string();
         }
@@ -2673,7 +2672,7 @@ fn is_clawband_main_command(cmd: &str) -> bool {
 fn clawband_hook_present(settings: &serde_json::Value) -> bool {
     let pre = settings["hooks"]["PreToolUse"]
         .as_array()
-        .map(|entries| {
+        .is_some_and(|entries| {
             entries.iter().any(|e| {
                 e["hooks"].as_array().is_some_and(|hooks| {
                     hooks
@@ -2681,8 +2680,7 @@ fn clawband_hook_present(settings: &serde_json::Value) -> bool {
                         .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
                 })
             })
-        })
-        .unwrap_or(false);
+        });
     pre || post_hook_present(settings)
 }
 
@@ -2783,6 +2781,51 @@ fn register_edit_hook(settings: &mut serde_json::Value, command: &str) -> bool {
     *pre_val != before
 }
 
+/// Register a third PreToolUse hook entry with matcher "Agent" pointing at the
+/// same clawband main command.  Idempotent — does nothing if an entry whose
+/// matcher is exactly "Agent" already has a clawband main command.
+/// Returns true if the settings were modified.
+fn register_agent_hook(settings: &mut serde_json::Value, command: &str) -> bool {
+    use serde_json::json;
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let obj = settings.as_object_mut().unwrap();
+    let hooks_obj = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks_obj.is_object() {
+        *hooks_obj = json!({});
+    }
+    let pre_val = hooks_obj
+        .as_object_mut()
+        .unwrap()
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]));
+    if !pre_val.is_array() {
+        *pre_val = json!([]);
+    }
+    let before = pre_val.clone();
+    let pre = pre_val.as_array_mut().unwrap();
+
+    // Check if an "Agent" matcher entry already has a clawband main command.
+    let already = pre.iter().any(|e| {
+        let matcher = e["matcher"].as_str().unwrap_or("");
+        matcher == "Agent"
+            && e["hooks"].as_array().is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
+            })
+    });
+    if already {
+        return false;
+    }
+
+    let hook = json!({"type": "command", "command": command});
+    pre.push(json!({"matcher": "Agent", "hooks": [hook]}));
+
+    *pre_val != before
+}
+
 /// True if a command is the clawband PostToolUse companion (`clawband post`).
 fn is_clawband_post_command(cmd: &str) -> bool {
     let mut toks = cmd.split_whitespace();
@@ -2797,7 +2840,7 @@ fn is_clawband_post_command(cmd: &str) -> bool {
 fn post_hook_present(settings: &serde_json::Value) -> bool {
     settings["hooks"]["PostToolUse"]
         .as_array()
-        .map(|entries| {
+        .is_some_and(|entries| {
             entries.iter().any(|e| {
                 e["hooks"].as_array().is_some_and(|hooks| {
                     hooks
@@ -2806,7 +2849,6 @@ fn post_hook_present(settings: &serde_json::Value) -> bool {
                 })
             })
         })
-        .unwrap_or(false)
 }
 
 /// Register the PostToolUse `clawband post` hook (matcher Bash). Idempotent.
@@ -2842,7 +2884,7 @@ fn register_post_hook(settings: &mut serde_json::Value, command: &str) -> bool {
 fn edit_hook_present(settings: &serde_json::Value) -> bool {
     settings["hooks"]["PreToolUse"]
         .as_array()
-        .map(|entries| {
+        .is_some_and(|entries| {
             entries.iter().any(|e| {
                 let matcher = e["matcher"].as_str().unwrap_or("");
                 matcher.contains("Edit")
@@ -2853,7 +2895,23 @@ fn edit_hook_present(settings: &serde_json::Value) -> bool {
                     })
             })
         })
-        .unwrap_or(false)
+}
+
+/// Returns true if the Agent spawn guard hook is registered.
+fn agent_hook_present(settings: &serde_json::Value) -> bool {
+    settings["hooks"]["PreToolUse"]
+        .as_array()
+        .is_some_and(|entries| {
+            entries.iter().any(|e| {
+                let matcher = e["matcher"].as_str().unwrap_or("");
+                matcher == "Agent"
+                    && e["hooks"].as_array().is_some_and(|hooks| {
+                        hooks
+                            .iter()
+                            .any(|h| h["command"].as_str().is_some_and(is_clawband_main_command))
+                    })
+            })
+        })
 }
 
 // ─── Agent-specific install wiring ───────────────────────────────────────────
@@ -3137,6 +3195,7 @@ fn install_openclaw(hook_cmd: &str, g: &str, _y: &str, d: &str, r: &str, bold: &
     println!("  config to point the plugin at a non-PATH binary location.");
 }
 
+// skipcq: RS-R1000
 fn cmd_install(extra_args: &[String]) {
     let protect = extra_args.iter().any(|a| a == "--protect");
     let post = extra_args.iter().any(|a| a == "--post");
@@ -3234,6 +3293,29 @@ fn cmd_install(extra_args: &[String]) {
         }
     } else {
         println!("  {d}edit hook already registered{r}");
+    }
+
+    // 2c. Wire the Agent hook — guards subagent spawns that request bypassPermissions.
+    let mut settings_agent: serde_json::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if register_agent_hook(&mut settings_agent, &command) {
+        match serde_json::to_string_pretty(&settings_agent) {
+            Ok(out) => {
+                if write_settings_atomic(&path, &(out + "\n")).is_ok() {
+                    println!(
+                        "  {g}registered{r} PreToolUse Agent hook → {d}{}{r}",
+                        command
+                    );
+                } else {
+                    println!("  {y}failed to write {}{r}", path.display());
+                }
+            }
+            Err(_) => println!("  {y}failed to serialize settings{r}"),
+        }
+    } else {
+        println!("  {d}agent hook already registered{r}");
     }
 
     // 3. Self-protect (--protect flag) — seeds protect.paths for user-defined paths.
@@ -3533,9 +3615,7 @@ fn cmd_verify() -> i32 {
     let dp = builtin_deny();
     let ap = builtin_ask();
     let no_allow: Vec<Pattern> = vec![];
-    let blocks = check_command("rm -rf /", &dp, &ap, &no_allow)
-        .map(|(d, _)| d == "deny")
-        .unwrap_or(false);
+    let blocks = check_command("rm -rf /", &dp, &ap, &no_allow).is_some_and(|(d, _)| d == "deny");
     let passes = check_command("ls -la", &dp, &ap, &no_allow).is_none();
     if blocks && passes {
         println!("  {ok} self-test: engine blocks destructive + passes safe commands");
@@ -3553,7 +3633,16 @@ fn cmd_verify() -> i32 {
         failures += 1;
     }
 
-    // 9. Self-protect status (informational — no failure if off)
+    // 9. Agent hook (required — guards bypassPermissions escalation via Agent spawns)
+    let agent_hook_active = settings.as_ref().is_some_and(agent_hook_present);
+    if agent_hook_active {
+        println!("  {ok} Agent hook registered (bypassPermissions spawn guard)");
+    } else {
+        println!("  {bad} Agent hook NOT registered — run: clawband install");
+        failures += 1;
+    }
+
+    // 10. Self-protect status (informational — no failure if off)
     let sp_paths_active = protect_active();
     if sp_paths_active {
         println!(
@@ -4806,8 +4895,7 @@ fn check_write_then_execute(segments: &[String]) -> bool {
     segments.iter().any(|s| {
         exec_re.captures_iter(s).any(|c| {
             c.get(1)
-                .map(|m| written.contains(&path_basename(m.as_str())))
-                .unwrap_or(false)
+                .is_some_and(|m| written.contains(&path_basename(m.as_str())))
         })
     })
 }
@@ -4969,8 +5057,7 @@ fn check_fetch_then_exec(segments: &[String]) -> bool {
     segments.iter().any(|s| {
         exec_re.captures_iter(s).any(|c| {
             c.get(1)
-                .map(|m| fetched.contains(&path_basename(m.as_str()).to_string()))
-                .unwrap_or(false)
+                .is_some_and(|m| fetched.contains(&path_basename(m.as_str()).to_string()))
         })
     })
 }
@@ -5009,12 +5096,11 @@ fn check_assign_then_exec(segments: &[String]) -> bool {
         exec_re
             .captures(seg)
             .and_then(|c| c.get(1))
-            .map(|m| {
+            .is_some_and(|m| {
                 assigned
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(m.as_str()))
             })
-            .unwrap_or(false)
     })
 }
 
@@ -6072,6 +6158,30 @@ fn main() {
             output("ask", &reason);
             return;
         }
+        return;
+    }
+
+    // ── Agent tool guard ──────────────────────────────────────────────────────
+    // Claude Code fires a PreToolUse event with tool_name "Agent" when the
+    // model spawns a subagent.  The tool_input.permissionMode field carries
+    // the mode the model is requesting for the subagent.  A subagent must not
+    // be allowed to escalate beyond the parent session's permission level by
+    // explicitly requesting bypassPermissions; deny such attempts here.
+    // Normal spawns (no permissionMode or a mode that does not escalate) are
+    // allowed through without further inspection — the parent session's own
+    // deny/ask rules continue to protect it.
+    if tool_name == "Agent" {
+        let permission_mode = v["tool_input"]["permissionMode"].as_str().unwrap_or("");
+        if permission_mode.eq_ignore_ascii_case("bypassPermissions") {
+            let reason = "clawband: Agent spawn with permissionMode:bypassPermissions denied \
+                          — a subagent must not escalate to bypass mode";
+            if log_enabled {
+                log_action("deny", reason, "Agent(permissionMode:bypassPermissions)");
+            }
+            emit_decision(mode, ask_fallback, "deny", reason);
+            return;
+        }
+        // Normal agent spawn — allow without further inspection.
         return;
     }
 
@@ -8187,6 +8297,59 @@ mod tests {
         assert!(edit_hook_present(&s));
         // Total entries = 2
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    }
+
+    // ── agent_hook_present ────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_hook_present_true_when_registered() {
+        let mut s = serde_json::json!({});
+        assert!(!agent_hook_present(&s));
+        register_agent_hook(&mut s, "clawband");
+        assert!(agent_hook_present(&s));
+    }
+
+    #[test]
+    fn agent_hook_present_false_for_bash_only() {
+        let mut s = serde_json::json!({});
+        register_hook(&mut s, "clawband");
+        // Bash entry alone must not satisfy agent_hook_present.
+        assert!(!agent_hook_present(&s));
+    }
+
+    // ── register_agent_hook ───────────────────────────────────────────────────
+
+    #[test]
+    fn register_agent_hook_into_empty_settings() {
+        let mut s = serde_json::json!({});
+        assert!(register_agent_hook(&mut s, "clawband"));
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matcher"].as_str(), Some("Agent"));
+    }
+
+    #[test]
+    fn register_agent_hook_is_idempotent() {
+        let mut s = serde_json::json!({});
+        assert!(register_agent_hook(&mut s, "clawband"));
+        assert!(!register_agent_hook(&mut s, "clawband"));
+    }
+
+    #[test]
+    fn register_agent_hook_does_not_disturb_bash_or_edit_entries() {
+        let mut s = serde_json::json!({});
+        assert!(register_hook(&mut s, "clawband"));
+        assert!(register_edit_hook(&mut s, "clawband"));
+        assert!(register_agent_hook(&mut s, "clawband"));
+        // Bash entry still present
+        assert!(clawband_hook_present(&s));
+        // Edit entry still present
+        assert!(edit_hook_present(&s));
+        // Total entries = 3
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
+        // Agent entry is last
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr[2]["matcher"].as_str(), Some("Agent"));
     }
 
     // ── uninstall: remove_clawband_hooks ──────────────────────────────────────

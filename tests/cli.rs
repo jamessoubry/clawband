@@ -3827,3 +3827,53 @@ fn e2e_self_protect_cp_from_hook_passes() {
     let out = run(&bash("cp ~/.claude/hooks/clawband /tmp/clawband.bak"), &[]);
     assert_eq!(decision(&out), None, "cp from hook path must pass: {out}");
 }
+
+// ── Agent tool spawn guard (issue #230) ──────────────────────────────────────
+
+#[test]
+fn e2e_agent_bypass_permissions_denied() {
+    // Agent spawn with permissionMode:bypassPermissions must be hard-denied.
+    let json = r#"{"tool_name":"Agent","tool_input":{"prompt":"do something","permissionMode":"bypassPermissions"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Agent spawn requesting bypassPermissions must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_agent_bypass_permissions_case_insensitive() {
+    // bypassPermissions check must be case-insensitive.
+    let json = r#"{"tool_name":"Agent","tool_input":{"prompt":"do something","permissionMode":"BYPASSPERMISSIONS"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "Agent spawn requesting BYPASSPERMISSIONS (upper-case) must be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_agent_normal_spawn_passes() {
+    // Agent spawn without a permissionMode must be allowed (returns None = silent allow).
+    let json = r#"{"tool_name":"Agent","tool_input":{"prompt":"summarise the logs"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "Normal Agent spawn must pass through silently: {out}"
+    );
+}
+
+#[test]
+fn e2e_agent_default_mode_spawn_passes() {
+    // Agent spawn with permissionMode:default must be allowed.
+    let json = r#"{"tool_name":"Agent","tool_input":{"prompt":"review the code","permissionMode":"default"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "Agent spawn with permissionMode:default must pass through silently: {out}"
+    );
+}
