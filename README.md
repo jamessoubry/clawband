@@ -10,8 +10,8 @@ Written in Rust: single binary, sub-millisecond execution, proper regex engine.
 
 Claude Code runs shell commands via its `Bash` tool. This hook intercepts every command before execution and:
 
-- **Hard-blocks** commands matching known destructive patterns (no user prompt — just denied)
-- **Prompts for approval** on risky-but-legitimate commands where intent is ambiguous
+- **Hard-blocks** commands matching known destructive patterns (no user prompt — just denied) — this holds unconditionally, even in `bypassPermissions`/YOLO mode
+- **Prompts for approval** on risky-but-legitimate commands where intent is ambiguous — but only when Claude Code is *not* in `bypassPermissions` mode; in YOLO mode these are silently allowed instead (see [Default decision](#default-decision--make-clawband-the-sole-gatekeeper) below), since no prompt would reach you anyway
 - **Loads user-defined pattern files** so you can customise behaviour without touching the binary
 
 ### Why compound-command splitting matters
@@ -481,7 +481,7 @@ full details, prerequisites, and the `CLAWBAND_BIN` override.
 Claude Code evaluates permissions in this order:
 
 1. **Claude Code's built-in deny list** (`settings.json → permissions.deny`) — blocks immediately; clawband's hook never fires
-2. **clawband PreToolUse hook** — deny blocks, ask prompts, allow passes
+2. **clawband PreToolUse hook** — deny blocks (always), ask prompts (unless in `bypassPermissions` mode, where it's silently allowed instead), allow passes
 3. **Claude Code's built-in allow list** (`settings.json → permissions.allow`) — allows without prompting
 
 If a command is being silently blocked and clawband shows nothing, check your Claude Code deny list first:
