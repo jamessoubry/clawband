@@ -1771,8 +1771,21 @@ fn scan_script_file(
                     ));
                 }
             }
+            // Ask tier: strip static quoted content before matching for
+            // non-inline-exec lines, mirroring check_command's ask-tier logic
+            // (issue #233). Without this, prose/labels inside string literals
+            // — e.g. `echo "--- docker exec (Harris's method) ---"` — trigger
+            // ask patterns meant for real function calls (issue #247).
+            // Inline-exec contexts (`python3 -c "exec(x)"`, `perl -e 'exec($cmd)'`,
+            // `eval "..."`, etc.) retain full content so genuine dangerous code
+            // inside quoted args is still caught.
+            let ask_target: String = if is_inline_exec_context(segment) {
+                segment.to_string()
+            } else {
+                strip_static_quoted_args(segment)
+            };
             for pat in ask_pats {
-                if pat.matches(segment) {
+                if pat.matches(&ask_target) {
                     return Some((
                         "ask".into(),
                         with_suggestion(
@@ -9081,6 +9094,69 @@ mod tests {
             None,
             "prose 'system (...)' must not trigger ask"
         );
+    }
+
+    #[test]
+    fn exec_prose_in_echo_no_ask() {
+        // Issue #247: "exec (Harris's method)" is a parenthetical aside in an
+        // echo label, not a function call. Must not trigger ask.
+        assert_eq!(
+            decision(r#"echo "--- docker exec (Harris's method) ---""#),
+            None,
+            "prose 'exec (...)' inside an echo string must not trigger ask"
+        );
+    }
+
+    #[test]
+    fn exec_call_in_inline_python_asks() {
+        assert_eq!(
+            decision(r#"python3 -c "exec(x)""#),
+            Some("ask".into()),
+            "genuine exec() call inside inline python must still ask"
+        );
+    }
+
+    #[test]
+    fn exec_prose_in_echo_script_file_no_ask() {
+        // Issue #247: "exec (...)" as a parenthetical aside inside an echo
+        // label/string, when scanned from a script file, must not trigger
+        // the exec() ask pattern. The false positive only reproduced via
+        // scan_script_file (bash script.sh), not the direct check_command
+        // path, because the script-file scanner lacked the quoted-content
+        // stripping that check_command already applies to the ask tier.
+        let f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        fs::write(
+            f.path(),
+            "#!/bin/bash\necho \"--- docker exec (Harris's method) ---\"\n",
+        )
+        .unwrap();
+        let result = scan_script_file(
+            f.path().to_str().unwrap(),
+            &deny_pats(),
+            &ask_pats(),
+            &no_allow(),
+        );
+        assert_eq!(
+            result, None,
+            "prose 'exec (...)' inside an echo string must not trigger ask: {result:?}"
+        );
+    }
+
+    #[test]
+    fn exec_real_call_in_script_file_still_asks() {
+        // Issue #247 regression guard: a genuine exec() call inside inline
+        // interpreter code must still be caught when scanned from a script
+        // file, even after excluding echo/prose false positives.
+        let f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        fs::write(f.path(), "#!/bin/bash\npython3 -c \"exec(user_input)\"\n").unwrap();
+        let result = scan_script_file(
+            f.path().to_str().unwrap(),
+            &deny_pats(),
+            &ask_pats(),
+            &no_allow(),
+        )
+        .map(|(d, _)| d);
+        assert_eq!(result, Some("ask".into()));
     }
 
     #[test]

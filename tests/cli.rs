@@ -3877,3 +3877,55 @@ fn e2e_agent_default_mode_spawn_passes() {
         "Agent spawn with permissionMode:default must pass through silently: {out}"
     );
 }
+
+// ── issue #247: exec() ask pattern false positive on echo/prose strings ──────
+
+#[test]
+fn e2e_exec_prose_in_echo_no_ask() {
+    // "exec (Harris's method)" is a parenthetical aside in an echo label,
+    // not a real exec() function call. Must not trigger ask.
+    let out = run(
+        &bash(r#"echo "--- docker exec (Harris's method) ---""#),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        "prose 'exec (...)' inside an echo string must not trigger ask (issue #247): {out}"
+    );
+}
+
+#[test]
+fn e2e_exec_prose_in_echo_script_file_no_ask() {
+    // Same false positive, but via the script-file scanner (scan_script_file),
+    // which is where the bug actually reproduced: it lacked the quoted-content
+    // stripping that check_command's ask tier already applies.
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        f,
+        "#!/bin/bash\necho \"--- docker exec (Harris's method) ---\""
+    )
+    .unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "prose 'exec (...)' inside an echo string in a script file must not trigger ask (issue #247): {out}"
+    );
+}
+
+#[test]
+fn e2e_exec_real_call_in_script_file_still_asks() {
+    // Genuine exec() calls inside inline interpreter code must still be
+    // caught when scanned from a script file.
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\npython3 -c \"exec(user_input)\"").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "genuine exec() call in a script file must still ask (issue #247): {out}"
+    );
+}
