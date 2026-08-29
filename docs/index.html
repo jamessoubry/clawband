@@ -36,7 +36,7 @@
         "name": "Claude Code keeps asking me to approve every command — how do I reduce the prompts without losing safety?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Keep approvals on and add trusted commands to clawband's allow.patterns so you stop being asked about them; or turn approvals off entirely (bypassPermissions) and let clawband hard-block only the genuinely dangerous commands."
+          "text": "Keep approvals on and add trusted commands to clawband's allow.patterns so you stop being asked about them; or turn approvals off entirely (bypassPermissions) and let clawband hard-block only the genuinely dangerous commands. Note that clawband's own ask-tier prompts are also suppressed in bypassPermissions mode — deny is what still protects you there."
         }
       },
       {
@@ -45,6 +45,22 @@
         "acceptedAnswer": {
           "@type": "Answer",
           "text": "The built-in deny list matches the whole command as a glob and never looks inside a compound command, so 'echo hi && rm -rf /' sails through. clawband splits on &&, ||, and ;, scans script files before execution, inspects subshells, and catches write-then-execute tricks."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Does clawband suppress its own ask-tier prompts in bypassPermissions / YOLO mode?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. clawband detects bypassPermissions mode from the hook's JSON input or the CLAUDE_CODE_DEFAULT_MODE environment variable, and silently allows ask-tier commands instead of prompting, since no prompt would reach you anyway. Deny-tier patterns are unaffected and keep hard-blocking unconditionally."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Can clawband replace Claude Code's native permission prompts entirely?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes, set default_decision = allow in ~/.clawband/config. Unmatched commands then get an explicit allow from clawband instead of falling through to Claude Code's native permission prompt, making clawband the sole gatekeeper alongside its own deny/ask patterns."
         }
       }
     ]
@@ -602,6 +618,7 @@
         <h3>Go autonomous, with guardrails</h3>
         <p>Turn off all of Claude Code's permission prompts (<code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">bypassPermissions</code> mode). Your agent runs freely without grinding to a halt every few seconds.</p>
         <p>clawband becomes your safety net — automatically blocking filesystem destruction, supply-chain attacks, and infra wipeouts before they execute. Semi-autonomous without the terror.</p>
+        <p><strong>Note:</strong> in this mode clawband's <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">ask</code>-tier prompts are automatically suppressed (Claude Code wouldn't show them anyway when permissions are bypassed), so <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">deny</code> is your only real backstop here — the ask tier only gates behaviour when approvals are on (Mode A).</p>
       </div>
     </div>
   </div>
@@ -625,7 +642,7 @@
       <div class="step">
         <div class="num">03</div>
         <h3>Deny, ask, or pass</h3>
-        <p>Catastrophic patterns are hard-blocked. Risky-but-legitimate ones prompt for approval. Everything else passes instantly.</p>
+        <p>Catastrophic patterns are hard-blocked, unconditionally — even in <code style="font-size:.82rem;background:#010409;padding:.1em .4em;border-radius:4px;color:#4f9cf9">bypassPermissions</code> mode. Risky-but-legitimate ones prompt for approval when approvals are on, but are silently allowed in bypassPermissions mode (no prompt to suppress). Everything else passes instantly.</p>
       </div>
       <div class="step">
         <div class="num">04</div>
@@ -848,12 +865,22 @@
 
     <div class="faq-item">
       <div class="faq-q">Claude Code keeps asking me to approve every command — how do I reduce the prompts without losing safety?</div>
-      <div class="faq-a">That's "approval fatigue." Two options: keep approvals on and add commands you trust to clawband's <code>allow.patterns</code> so you stop being asked about them; or turn approvals off entirely (bypassPermissions) and let clawband hard-block only the genuinely dangerous commands. Either way you stop rubber-stamping safe commands while staying protected from catastrophic ones.</div>
+      <div class="faq-a">That's "approval fatigue." Two options: keep approvals on and add commands you trust to clawband's <code>allow.patterns</code> so you stop being asked about them; or turn approvals off entirely (bypassPermissions) and let clawband hard-block only the genuinely dangerous commands. Note that in bypassPermissions mode, clawband's own <code>ask</code>-tier prompts are also suppressed (Claude Code wouldn't surface them either) — <code>deny</code> is what's still protecting you there. Either way you stop rubber-stamping safe commands while staying protected from catastrophic ones.</div>
     </div>
 
     <div class="faq-item">
       <div class="faq-q">How is this different from Claude Code's built-in permission deny list?</div>
       <div class="faq-a">The built-in deny list matches the whole command as a glob, so it never looks inside a compound command — <code>echo hi &amp;&amp; rm -rf /</code> sails through. clawband splits on <code>&amp;&amp;</code>, <code>||</code>, and <code>;</code>, scans script files before execution, inspects subshells, and catches write-then-execute tricks. It's a real parser, not a string match.</div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">Does clawband suppress its own ask-tier prompts in bypassPermissions / YOLO mode?</div>
+      <div class="faq-a">Yes. clawband detects bypassPermissions mode (from the hook's JSON input or the <code>CLAUDE_CODE_DEFAULT_MODE</code> environment variable) and, when it's active, silently allows anything that would have been an <code>ask</code>-tier decision instead of prompting — a prompt would never be shown to you anyway once permissions are bypassed. <code>deny</code>-tier patterns are unaffected and keep hard-blocking unconditionally, so deny is the tier doing all the work while you're in YOLO mode.</div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">Can I make clawband the sole gatekeeper instead of falling back to Claude Code's native prompts?</div>
+      <div class="faq-a">Yes — set <code>default_decision = allow</code> in <code>~/.clawband/config</code>. By default, a command that matches none of clawband's patterns falls through to Claude Code's native permission system, which prompts generically for anything not already on its own allow list. With <code>default_decision = allow</code>, clawband instead emits an explicit <code>allow</code> for unmatched commands, so only your <code>deny</code>/<code>ask</code> patterns stop or prompt anything — there's no native permission prompt to route around. (There's also <code>default_decision = ask</code>, which reviews everything not explicitly allowed; the default remains <code>passthrough</code>.)</div>
     </div>
 
     <div class="faq-item">
