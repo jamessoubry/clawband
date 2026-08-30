@@ -1799,9 +1799,18 @@ fn scan_script_file(
                 }
             }
             // Chained-script detection: record first match but keep scanning
-            // so deny/ask patterns on later lines still take priority.
+            // so deny/ask patterns on later lines still take priority. If
+            // treeband already vetted the target file's exact, unmodified
+            // content via AST and found nothing, skip the redundant "contents
+            // not scanned" ask — see treeband_receipt_allows for the safety
+            // argument (this can only remove a duplicate prompt, never
+            // suppress a real one).
             if chained_match.is_none() && is_chained_script_invocation(segment) {
-                chained_match = Some(raw_line.trim().to_string());
+                let already_vetted = chained_script_target_path(segment)
+                    .is_some_and(|target| treeband_receipt_allows(&target));
+                if !already_vetted {
+                    chained_match = Some(raw_line.trim().to_string());
+                }
             }
         }
     }
@@ -1842,6 +1851,97 @@ fn is_chained_script_invocation(segment: &str) -> bool {
     let direct_re = DIRECT_RE.get_or_init(|| Regex::new(r"(?i)^\s*\./\S+").unwrap());
     if direct_re.is_match(segment) {
         return true;
+    }
+    false
+}
+
+/// Extracts the target file path from a chained-script invocation, if any —
+/// the same three shapes `is_chained_script_invocation` recognizes, but
+/// returning the path argument itself so the caller can check whether
+/// treeband already vetted that exact file (see `treeband_receipt_allows`).
+fn chained_script_target_path(segment: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static INTERP_RE: OnceLock<Regex> = OnceLock::new();
+    static SOURCE_RE: OnceLock<Regex> = OnceLock::new();
+    static DIRECT_RE: OnceLock<Regex> = OnceLock::new();
+    let interp_re = INTERP_RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(?:bash|sh|zsh|python3?|ruby|perl|node)\s+([^-\s]\S*)").unwrap()
+    });
+    if let Some(c) = interp_re.captures(segment) {
+        return c.get(1).map(|m| m.as_str().to_string());
+    }
+    let source_re = SOURCE_RE.get_or_init(|| Regex::new(r"(?i)^\s*(?:source|\.)\s+(\S+)").unwrap());
+    if let Some(c) = source_re.captures(segment) {
+        return c.get(1).map(|m| m.as_str().to_string());
+    }
+    let direct_re = DIRECT_RE.get_or_init(|| Regex::new(r"(?i)^\s*(\./\S+)").unwrap());
+    if let Some(c) = direct_re.captures(segment) {
+        return c.get(1).map(|m| m.as_str().to_string());
+    }
+    None
+}
+
+/// Extensions treeband v0.1+ actually parses. Only for these does an "allow"
+/// receipt mean anything — for everything else (notably .sh/.bash, which
+/// treeband cannot parse at all) clawband remains the sole content authority
+/// and this must never be consulted.
+fn treeband_supports_extension(path: &str) -> bool {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "py" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "rs"
+    )
+}
+
+/// True only if treeband has a fresh "allow" receipt for the exact,
+/// unmodified content of `path` — i.e. treeband's AST scan already vetted
+/// this file for dynamic-eval-style constructs and found nothing. Used to
+/// skip clawband's own "contents not scanned" ask for a chained script
+/// invocation when a stronger, more precise check already ran.
+///
+/// Fails safe in every direction: missing treeband install, missing/expired
+/// receipt, unreadable file, or a content-hash mismatch (the file changed
+/// since treeband scanned it — TOCTOU) all fall through to `false`, which
+/// means the caller keeps its original behavior (ask). This function can
+/// only ever remove a redundant prompt, never suppress a real one, because
+/// clawband's deny/ask pattern matching on the segment runs independently of
+/// this check and is not gated by it.
+fn treeband_receipt_allows(path: &str) -> bool {
+    if !treeband_supports_extension(path) {
+        return false;
+    }
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let receipt_path = format!("{home}/.clawband/treeband-receipts.jsonl");
+    let Ok(receipts) = fs::read_to_string(&receipt_path) else {
+        return false;
+    };
+    let Ok(canonical_target) = fs::canonicalize(path) else {
+        return false;
+    };
+    let canonical_target = canonical_target.to_string_lossy().into_owned();
+    let Ok(current_content) = fs::read_to_string(path) else {
+        return false;
+    };
+    let current_hash = format!("{:016x}", fnv1a_64(current_content.as_bytes()));
+
+    // Receipts are append-only; scan from the end so the most recent entry
+    // for this path wins (a file can legitimately be rewritten and
+    // re-scanned multiple times).
+    for line in receipts.lines().rev() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(entry_path) = entry.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if entry_path != canonical_target {
+            continue;
+        }
+        let decision = entry.get("decision").and_then(|v| v.as_str());
+        let hash = entry.get("hash").and_then(|v| v.as_str());
+        return decision == Some("allow") && hash == Some(current_hash.as_str());
     }
     false
 }
@@ -3405,6 +3505,15 @@ fn cmd_install(extra_args: &[String]) {
     };
     println!("\n{g}{done_msg}{r}");
     println!("{d}Verify anytime with: clawband verify{r}");
+    if matches!(install_mode, Some(Mode::Claude) | None) {
+        println!(
+            "{d}Tip: clawband guards shell commands via regex — it has no visibility into \
+the content of files being written. For that, consider installing treeband \
+(https://github.com/jamessoubry/treeband), a tree-sitter AST guard for the same \
+Write/Edit/MultiEdit hooks that catches real eval()/exec()-style calls in file content \
+without false-positiving on comments or string literals.{r}"
+        );
+    }
 }
 
 // Remove every clawband hook command from hooks.PreToolUse and hooks.PostToolUse.
@@ -12919,5 +13028,213 @@ mod tests {
         );
         // And check_command must indeed deny it
         assert_eq!(decision(cmd), Some("deny".to_string()));
+    }
+
+    // ── treeband receipt integration ─────────────────────────────────────────
+
+    #[test]
+    fn chained_script_target_path_extracts_interpreter_arg() {
+        assert_eq!(
+            chained_script_target_path("python3 helper.py"),
+            Some("helper.py".to_string())
+        );
+        assert_eq!(
+            chained_script_target_path("bash scripts/setup.sh"),
+            Some("scripts/setup.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn chained_script_target_path_extracts_source_arg() {
+        assert_eq!(
+            chained_script_target_path("source ./env.sh"),
+            Some("./env.sh".to_string())
+        );
+        assert_eq!(
+            chained_script_target_path(". config.sh"),
+            Some("config.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn chained_script_target_path_extracts_direct_exec() {
+        assert_eq!(
+            chained_script_target_path("./deploy.sh"),
+            Some("./deploy.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn chained_script_target_path_none_for_unrelated_command() {
+        assert_eq!(chained_script_target_path("echo hello"), None);
+    }
+
+    #[test]
+    fn treeband_supports_extension_matches_known_languages() {
+        for path in [
+            "a.py", "a.js", "a.mjs", "a.cjs", "a.jsx", "a.ts", "a.tsx", "a.rs",
+        ] {
+            assert!(
+                treeband_supports_extension(path),
+                "{path} should be treeband-supported"
+            );
+        }
+    }
+
+    #[test]
+    fn treeband_supports_extension_rejects_shell_and_unknown() {
+        for path in ["a.sh", "a.bash", "a.go", "noext"] {
+            assert!(
+                !treeband_supports_extension(path),
+                "{path} must not be treeband-supported"
+            );
+        }
+    }
+
+    #[test]
+    fn treeband_receipt_allows_true_for_matching_allow_receipt() {
+        let tmp = std::env::temp_dir().join(format!("cb_treeband_ok_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".clawband")).unwrap();
+        let target = tmp.join("clean.py");
+        fs::write(&target, "print('hi')").unwrap();
+        let hash = format!("{:016x}", fnv1a_64(b"print('hi')"));
+        let canonical = fs::canonicalize(&target).unwrap();
+        let receipt = serde_json::json!({
+            "path": canonical.to_string_lossy(),
+            "hash": hash,
+            "decision": "allow",
+            "timestamp": 0
+        });
+        fs::write(
+            tmp.join(".clawband/treeband-receipts.jsonl"),
+            format!("{receipt}\n"),
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.to_str().unwrap());
+        let result = treeband_receipt_allows(target.to_str().unwrap());
+        std::env::set_var("HOME", orig_home);
+
+        assert!(
+            result,
+            "matching allow receipt with correct hash must be trusted"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn treeband_receipt_allows_false_when_file_changed_since_receipt() {
+        let tmp = std::env::temp_dir().join(format!("cb_treeband_stale_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".clawband")).unwrap();
+        let target = tmp.join("clean.py");
+        fs::write(&target, "print('hi')").unwrap();
+        // Receipt recorded a DIFFERENT hash than the file's current content —
+        // the file was modified after treeband scanned it (TOCTOU).
+        let canonical = fs::canonicalize(&target).unwrap();
+        let receipt = serde_json::json!({
+            "path": canonical.to_string_lossy(),
+            "hash": "0000000000000000",
+            "decision": "allow",
+            "timestamp": 0
+        });
+        fs::write(
+            tmp.join(".clawband/treeband-receipts.jsonl"),
+            format!("{receipt}\n"),
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.to_str().unwrap());
+        let result = treeband_receipt_allows(target.to_str().unwrap());
+        std::env::set_var("HOME", orig_home);
+
+        assert!(!result, "hash mismatch (modified file) must not be trusted");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn treeband_receipt_allows_false_when_decision_was_ask() {
+        let tmp = std::env::temp_dir().join(format!("cb_treeband_ask_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".clawband")).unwrap();
+        let target = tmp.join("bad.py");
+        fs::write(&target, "eval(x)").unwrap();
+        let hash = format!("{:016x}", fnv1a_64(b"eval(x)"));
+        let canonical = fs::canonicalize(&target).unwrap();
+        let receipt = serde_json::json!({
+            "path": canonical.to_string_lossy(),
+            "hash": hash,
+            "decision": "ask",
+            "timestamp": 0
+        });
+        fs::write(
+            tmp.join(".clawband/treeband-receipts.jsonl"),
+            format!("{receipt}\n"),
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.to_str().unwrap());
+        let result = treeband_receipt_allows(target.to_str().unwrap());
+        std::env::set_var("HOME", orig_home);
+
+        assert!(
+            !result,
+            "a treeband 'ask' decision must never be treated as a skip signal"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn treeband_receipt_allows_false_for_shell_extension_even_with_receipt() {
+        // Sanity check on the extension gate: even a well-formed matching
+        // "allow" receipt must not apply to a .sh target, since treeband
+        // cannot parse shell at all — clawband must remain sole authority.
+        let tmp = std::env::temp_dir().join(format!("cb_treeband_sh_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".clawband")).unwrap();
+        let target = tmp.join("script.sh");
+        fs::write(&target, "echo hi").unwrap();
+        let hash = format!("{:016x}", fnv1a_64(b"echo hi"));
+        let canonical = fs::canonicalize(&target).unwrap();
+        let receipt = serde_json::json!({
+            "path": canonical.to_string_lossy(),
+            "hash": hash,
+            "decision": "allow",
+            "timestamp": 0
+        });
+        fs::write(
+            tmp.join(".clawband/treeband-receipts.jsonl"),
+            format!("{receipt}\n"),
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.to_str().unwrap());
+        let result = treeband_receipt_allows(target.to_str().unwrap());
+        std::env::set_var("HOME", orig_home);
+
+        assert!(!result, ".sh files must never consult treeband receipts");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn treeband_receipt_allows_false_when_no_receipt_file_exists() {
+        let tmp = std::env::temp_dir().join(format!("cb_treeband_none_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("clean.py");
+        fs::write(&target, "print('hi')").unwrap();
+
+        let orig_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.to_str().unwrap());
+        let result = treeband_receipt_allows(target.to_str().unwrap());
+        std::env::set_var("HOME", orig_home);
+
+        assert!(!result, "missing receipt file must fail safe (false)");
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

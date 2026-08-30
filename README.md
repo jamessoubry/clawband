@@ -504,6 +504,15 @@ Removing the entry from that list lets clawband's ask/deny patterns take over as
 - **Force-push gaps** — `git push :<branch>` (colon-prefix deletion) and `git push origin +main` (plus-refspec force) are not blocked by the force-push pattern; use `--delete` / `--force-with-lease` instead.
 - **Commit messages containing blocked patterns** — if a commit message itself contains a pattern like `rm -rf /` (e.g. documenting a fix), clawband will block the `git commit` command. Workaround: write the message to a temp file and use `git commit -F /tmp/msg.txt`, or rephrase to avoid the literal pattern.
 - **Fail-closed on parse error** — if clawband cannot read or parse the hook input (stdin read failure, malformed JSON), it emits `deny` and blocks the command. It does **not** fail-open.
+- **No content inspection on Write/Edit/MultiEdit** — clawband's Write/Edit hook only checks *where* a file is being written (sensitive paths like `settings.json`, credentials, SSH keys); it does not scan the content of the file being written for dangerous code constructs (`eval()`, `exec()`, etc.). See [treeband](#companion-treeband-file-content-ast-guard) below for that.
+
+### Companion: treeband (file-content AST guard)
+
+clawband's own scanning is regex/text-based — solid for shell commands, but structurally unable to tell a real `eval(x)` call apart from `// eval(x)` in a comment or `"eval(x)"` in a string literal, since it never parses actual code structure. [treeband](https://github.com/jamessoubry/treeband) is a sibling project that fills exactly that gap: it registers on the same `Write|Edit|MultiEdit` hook, parses the file content being written with [tree-sitter](https://tree-sitter.github.io/), and matches AST structure instead of text — so a rule for "a real call to `eval`" only ever matches an actual call expression, never a comment or string that happens to contain the same characters.
+
+If you have both installed, clawband's own chained-script check (`bash scripts/setup.sh`, `python3 helper.py`, etc. — see issue #178) will skip its "contents not scanned" prompt when treeband has already vetted that exact, unmodified file's content and found nothing — no double-asking for the same risk on languages treeband supports (Python, JS, TS, Rust). For everything else, including all shell scripts (treeband doesn't parse Bash), clawband remains the sole and unchanged authority.
+
+`clawband install` prints a one-line tip about treeband on every run; it's entirely optional and the two work independently if you only install one.
 
 ### Known shell obfuscation bypasses (issue #129)
 

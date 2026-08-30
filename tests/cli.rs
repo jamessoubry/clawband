@@ -3194,6 +3194,130 @@ fn e2e_chained_clean_script_passes() {
     );
 }
 
+// ── treeband receipt integration: skip redundant chained-script ask ─────────
+
+/// Same FNV-1a-64 algorithm as clawband's `fnv1a_64` / treeband's `fnv1a_hex`
+/// — duplicated here since this test binary has no access to clawband's
+/// internals, only its stdin/stdout contract.
+fn fnv1a_64_hex(data: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[test]
+fn e2e_chained_script_skips_ask_with_matching_treeband_receipt() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".clawband")).unwrap();
+
+    let target = home.path().join("helper.py");
+    let target_content = "print('hi')";
+    std::fs::write(&target, target_content).unwrap();
+    let canonical_target = std::fs::canonicalize(&target).unwrap();
+
+    let receipt = format!(
+        r#"{{"path":{:?},"hash":"{}","decision":"allow","timestamp":0}}"#,
+        canonical_target.to_string_lossy(),
+        fnv1a_64_hex(target_content.as_bytes())
+    );
+    std::fs::write(
+        home.path().join(".clawband/treeband-receipts.jsonl"),
+        format!("{receipt}\n"),
+    )
+    .unwrap();
+
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\npython3 {}", canonical_target.display()).unwrap();
+    let outer_path = f.path().to_str().unwrap().to_string();
+
+    let out = run(
+        &bash(&format!("bash {outer_path}")),
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        "matching treeband allow receipt must skip the redundant chained-script ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_chained_script_still_asks_when_receipt_hash_is_stale() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".clawband")).unwrap();
+
+    let target = home.path().join("helper.py");
+    std::fs::write(&target, "print('hi')").unwrap();
+    let canonical_target = std::fs::canonicalize(&target).unwrap();
+
+    // Receipt hash does not match the file's current content — file changed
+    // since treeband scanned it (TOCTOU); must not be trusted.
+    let receipt = format!(
+        r#"{{"path":{:?},"hash":"0000000000000000","decision":"allow","timestamp":0}}"#,
+        canonical_target.to_string_lossy()
+    );
+    std::fs::write(
+        home.path().join(".clawband/treeband-receipts.jsonl"),
+        format!("{receipt}\n"),
+    )
+    .unwrap();
+
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\npython3 {}", canonical_target.display()).unwrap();
+    let outer_path = f.path().to_str().unwrap().to_string();
+
+    let out = run(
+        &bash(&format!("bash {outer_path}")),
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "stale/mismatched receipt must not suppress the ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_chained_script_still_asks_for_shell_target_even_with_allow_receipt() {
+    // Extension gate: treeband can't parse shell, so an allow receipt for a
+    // .sh target (however it got there) must never be consulted.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".clawband")).unwrap();
+
+    let target = home.path().join("helper.sh");
+    let target_content = "echo hi";
+    std::fs::write(&target, target_content).unwrap();
+    let canonical_target = std::fs::canonicalize(&target).unwrap();
+
+    let receipt = format!(
+        r#"{{"path":{:?},"hash":"{}","decision":"allow","timestamp":0}}"#,
+        canonical_target.to_string_lossy(),
+        fnv1a_64_hex(target_content.as_bytes())
+    );
+    std::fs::write(
+        home.path().join(".clawband/treeband-receipts.jsonl"),
+        format!("{receipt}\n"),
+    )
+    .unwrap();
+
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    writeln!(f, "#!/bin/bash\nbash {}", canonical_target.display()).unwrap();
+    let outer_path = f.path().to_str().unwrap().to_string();
+
+    let out = run(
+        &bash(&format!("bash {outer_path}")),
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        ".sh targets must never consult treeband receipts: {out}"
+    );
+}
+
 // ── issue #179: shebang-based interpreter detection for direct ./script execution ──
 
 #[test]
