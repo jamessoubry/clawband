@@ -1926,24 +1926,56 @@ fn treeband_receipt_allows(path: &str) -> bool {
     };
     let current_hash = format!("{:016x}", fnv1a_64(current_content.as_bytes()));
 
-    // Receipts are append-only; scan from the end so the most recent entry
-    // for this path wins (a file can legitimately be rewritten and
-    // re-scanned multiple times).
-    for line in receipts.lines().rev() {
+    // Receipts are append-only; keep only the latest line per path (a file
+    // can legitimately be rewritten and re-scanned multiple times) — this
+    // doubles as opportunistic compaction of the whole file (see
+    // compact_treeband_receipts) since we're already parsing every line.
+    let total_lines = receipts.lines().count();
+    let mut latest_per_path: std::collections::HashMap<String, &str> =
+        std::collections::HashMap::new();
+    for line in receipts.lines() {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         let Some(entry_path) = entry.get("path").and_then(|v| v.as_str()) else {
             continue;
         };
-        if entry_path != canonical_target {
-            continue;
-        }
-        let decision = entry.get("decision").and_then(|v| v.as_str());
-        let hash = entry.get("hash").and_then(|v| v.as_str());
-        return decision == Some("allow") && hash == Some(current_hash.as_str());
+        latest_per_path.insert(entry_path.to_string(), line);
     }
-    false
+
+    let result = latest_per_path
+        .get(&canonical_target)
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .is_some_and(|entry| {
+            let decision = entry.get("decision").and_then(|v| v.as_str());
+            let hash = entry.get("hash").and_then(|v| v.as_str());
+            decision == Some("allow") && hash == Some(current_hash.as_str())
+        });
+
+    if latest_per_path.len() < total_lines {
+        compact_treeband_receipts(&receipt_path, latest_per_path.values().copied());
+    }
+    result
+}
+
+/// Rewrites the receipts file to one line per path (the latest entry for
+/// each), atomically. Best-effort housekeeping only — never affects the
+/// permission decision already computed by the caller.
+///
+/// Uses temp-file-then-rename rather than truncate-and-rewrite in place:
+/// treeband appends with its own independent hook invocation and no lock
+/// between the two processes, so an in-place rewrite could race a
+/// concurrent append and either interleave badly or drop it. A rename is
+/// atomic on the same filesystem — a concurrent reader/writer never
+/// observes a half-written file, and treeband's own next append (opened
+/// with `OpenOptions::append`) is unaffected either way.
+fn compact_treeband_receipts<'a>(receipt_path: &str, lines: impl Iterator<Item = &'a str>) {
+    let compacted: String = lines.map(|l| format!("{l}\n")).collect();
+    let tmp_path = format!("{receipt_path}.tmp.{}", std::process::id());
+    if fs::write(&tmp_path, compacted).is_err() {
+        return;
+    }
+    let _ = fs::rename(&tmp_path, receipt_path);
 }
 
 // ─── Git force push check ─────────────────────────────────────────────────────
@@ -13235,6 +13267,68 @@ mod tests {
         std::env::set_var("HOME", orig_home);
 
         assert!(!result, "missing receipt file must fail safe (false)");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn treeband_receipt_allows_compacts_duplicate_path_entries() {
+        let tmp = std::env::temp_dir().join(format!("cb_treeband_compact_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".clawband")).unwrap();
+        let target = tmp.join("clean.py");
+        fs::write(&target, "print('hi')").unwrap();
+        let canonical = fs::canonicalize(&target).unwrap();
+        let hash = format!("{:016x}", fnv1a_64(b"print('hi')"));
+
+        // Three receipts for the same path (re-scanned three times) plus an
+        // unrelated path — five lines total, two unique paths.
+        let stale = serde_json::json!({
+            "path": canonical.to_string_lossy(), "hash": "0000000000000000",
+            "decision": "ask", "timestamp": 0
+        });
+        let latest = serde_json::json!({
+            "path": canonical.to_string_lossy(), "hash": hash,
+            "decision": "allow", "timestamp": 2
+        });
+        let other = serde_json::json!({
+            "path": "/some/other/file.py", "hash": "1111111111111111",
+            "decision": "allow", "timestamp": 1
+        });
+        let receipt_path = tmp.join(".clawband/treeband-receipts.jsonl");
+        fs::write(
+            &receipt_path,
+            format!("{stale}\n{other}\n{stale}\n{latest}\n{other}\n"),
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.to_str().unwrap());
+        let result = treeband_receipt_allows(target.to_str().unwrap());
+        std::env::set_var("HOME", orig_home);
+
+        assert!(result, "latest entry for the target path must win");
+
+        let compacted = fs::read_to_string(&receipt_path).unwrap();
+        let line_count = compacted.lines().count();
+        assert_eq!(
+            line_count, 2,
+            "5 lines across 2 unique paths must compact to 2: {compacted}"
+        );
+        assert!(
+            compacted.contains("\"decision\":\"allow\"") && compacted.contains(&hash),
+            "compacted file must keep the latest (allow) entry, not the stale one: {compacted}"
+        );
+        // No leftover temp file from the atomic rename.
+        let leftovers: Vec<_> = fs::read_dir(tmp.join(".clawband"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file must not survive the rename: {leftovers:?}"
+        );
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }
