@@ -14,6 +14,8 @@ Claude Code runs shell commands via its `Bash` tool. This hook intercepts every 
 - **Prompts for approval** on risky-but-legitimate commands where intent is ambiguous — but only when Claude Code is *not* in `bypassPermissions` mode; in YOLO mode these are silently allowed instead (see [Default decision](#default-decision--make-clawband-the-sole-gatekeeper) below), since no prompt would reach you anyway
 - **Loads user-defined pattern files** so you can customise behaviour without touching the binary
 
+It also intercepts `Write`/`Edit`/`MultiEdit`/`NotebookEdit` for path-based protection (see [Self-protection](#self-protection)) and, on the content actually being written, AST-based structural checks — see [AST content guard](#ast-content-guard).
+
 ### Why compound-command splitting matters
 
 A naive check on the full command string misses chained attacks like:
@@ -283,6 +285,26 @@ A project-level `.clawband/protect.paths` (in the current working directory) is 
 
 `clawband verify` reports whether self-protect is active (both protect.paths present and the Write/Edit hook registered).
 
+## AST content guard
+
+Every other check in this document is regex/text-based — solid for shell commands and file *paths*, but structurally unable to tell a real `eval(x)` call apart from `// eval(x)` in a comment or `"eval(x)"` in a string literal, since none of them ever parse actual code structure. On every `Write`/`Edit`/`MultiEdit` call, clawband now also parses the content being written with [tree-sitter](https://tree-sitter.github.io/) and matches AST *structure* instead of text — a rule for "a real call to `eval`" only ever matches an actual call expression, never a comment or string that happens to contain the same characters:
+
+```js
+// clawband: ignored — this is a comment, not code
+const msg = "eval(x) is dangerous"; // clawband: ignored — this is a string literal
+result = eval(userInput); // clawband: flagged — this is a real call expression
+```
+
+**Status**: one rule (`dynamic-eval`: flags `eval()`/`Function()` in JS/TS, `eval()`/`exec()` in Python) across 4 languages (Rust, Python, JavaScript, TypeScript) — a proof of the mechanism, not a complete rule set. Unsupported languages and Rust (no rule yet) fail open: the path-based checks above still apply, this only ever adds coverage, it never removes it. Runs in the same `PreToolUse` handler as the path checks — deny (self-protection, protect.paths) always takes priority over an AST-guard `ask`, since the handler returns as soon as an earlier, higher-severity check fires.
+
+### Why parse the whole file every time, not incrementally
+
+tree-sitter supports incremental reparsing (reusing a previous parse tree plus an edit description to reparse only the changed region) — but that optimization exists for editors tracking a long-lived buffer across many small keystrokes, where reparsing the complete file after every keystroke would be needless work. A `PreToolUse` hook gets one full-file snapshot per call and exits; there is no previous tree to reuse and no live buffer to track. [ast-grep reached the same conclusion for the same reason](https://ast-grep.github.io/blog/tree-sitter-rust-rewrite) — it targets AI coding agents that hand it complete file snapshots, not editors tracking keystroke deltas, so incremental parsing brings no benefit for that workload. Full reparse per invocation is the correct choice here, not a missed optimization.
+
+### Why this exists as a hook, not an MCP tool
+
+Several tools already combine real tree-sitter parsing with agent-facing checks — [ast-grep](https://github.com/ast-grep/ast-grep) (structural search/rewrite), [code-graph-mcp](https://github.com/sdsrss/code-graph-mcp) and [budget-aware-mcp](https://github.com/Doorman11991/budget-aware-mcp) (call-graph/impact analysis), [LiuHe](https://github.com/wulun811/LiuHe) (a tree-sitter daemon with a pre-write `edit_sandbox` MCP tool). All of them are genuinely useful — and all of them are something an agent has to *choose* to call. Nothing stops a rushed, careless, or prompt-injected agent from just calling `Write` directly and skipping the check entirely. The same argument that justifies clawband existing as a hook instead of an MCP tool for shell commands — a hook runs outside the model as a separate process, so it can't be talked past — applies equally to file content. This is the one lane those tools don't cover: AST-aware and mandatory at the same time.
+
 ## CLI commands
 
 ```sh
@@ -500,6 +522,7 @@ Removing the entry from that list lets clawband's ask/deny patterns take over as
 - **Force-push gaps** — `git push :<branch>` (colon-prefix deletion) and `git push origin +main` (plus-refspec force) are not blocked by the force-push pattern; use `--delete` / `--force-with-lease` instead.
 - **Commit messages containing blocked patterns** — if a commit message itself contains a pattern like `rm -rf /` (e.g. documenting a fix), clawband will block the `git commit` command. Workaround: write the message to a temp file and use `git commit -F /tmp/msg.txt`, or rephrase to avoid the literal pattern.
 - **Fail-closed on parse error** — if clawband cannot read or parse the hook input (stdin read failure, malformed JSON), it emits `deny` and blocks the command. It does **not** fail-open.
+- **AST content guard covers one rule so far** — `dynamic-eval` (`eval`/`Function`/`exec`) across Python/JS/TS; Rust has no rule yet and any other language falls open (see [AST content guard](#ast-content-guard) above). This augments, not replaces, path-based Write/Edit protection.
 
 ### Known shell obfuscation bypasses (issue #129)
 

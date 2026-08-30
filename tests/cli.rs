@@ -202,6 +202,100 @@ fn e2e_edit_tool_aws_credentials_asks_without_protect() {
     );
 }
 
+// ── AST content guard (ported from treeband) ─────────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_real_eval_call_in_js() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"eval(x);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "real eval() call must ask: {out}"
+    );
+    assert!(out.contains("dynamic-eval"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_eval_in_js_comment() {
+    // The entire reason this module exists over regex: a comment mentioning
+    // eval must not be flagged, unlike a naive text search would.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"// eval(x) is bad\nfunction f(){return 1;}"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "eval mentioned in a comment must not ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_ast_guard_ignores_eval_in_js_string_literal() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const s = \"call eval(x) here\";"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "eval mentioned in a string literal must not ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_ast_guard_flags_real_eval_call_in_python() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"eval(user_input)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_exec_in_python() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"exec(user_input)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_allows_unsupported_language_fail_open() {
+    // .go has no rules yet — must fail open, not fail closed.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.go","content":"eval(x)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_edit_tool_flags_real_eval_via_new_string() {
+    let json = r#"{"tool_name":"Edit","tool_input":{"file_path":"a.py","old_string":"x","new_string":"eval(user_input)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "Edit tool new_string must be scanned too: {out}"
+    );
+}
+
+#[test]
+fn e2e_ast_guard_allows_edit_with_no_eval() {
+    let json = r#"{"tool_name":"Edit","tool_input":{"file_path":"a.js","old_string":"x","new_string":"const x = 1 + 1;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_path_deny_takes_priority_over_ast_ask() {
+    // Self-protection deny must win even if the content would also trigger
+    // the AST guard — severity ordering (deny > ask) falls out of the
+    // existing early-return control flow.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"~/.cargo/bin/clawband","content":"eval(x)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "self-protection deny must take priority over the AST guard: {out}"
+    );
+}
+
 #[test]
 fn e2e_write_tool_cargo_bin_clawband_denied() {
     // Write to ~/.cargo/bin/clawband must be hard-denied (self-protection).
