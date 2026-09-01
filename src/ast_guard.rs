@@ -21,11 +21,15 @@
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor};
 
+/// A single rule match against a file's content — which rule fired and why.
 pub struct Finding {
+    /// Short rule identifier, e.g. `"dynamic-eval"`.
     pub rule: &'static str,
+    /// Human-readable explanation shown to the user in the `ask` prompt.
     pub reason: &'static str,
 }
 
+/// A language `ast_guard` can parse and run rules against.
 pub enum Lang {
     Rust,
     Python,
