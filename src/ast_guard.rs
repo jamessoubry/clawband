@@ -31,13 +31,16 @@ pub struct Finding {
 
 /// A language `ast_guard` can parse and run rules against.
 pub enum Lang {
-    /// `.rs` — no rules yet (see `rules_for`).
+    /// `.rs` — `shell-invoking-subprocess` (`Command::new("sh"/"bash"/...).arg("-c")`).
     Rust,
-    /// `.py` / `.pyi` — `dynamic-eval` (`eval`/`exec`).
+    /// `.py` / `.pyi` — `dynamic-eval` (`eval`/`exec`), `shell-invoking-subprocess`
+    /// (`subprocess.*(shell=True)`, `os.system`/`os.popen`).
     Python,
-    /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`).
+    /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`),
+    /// `shell-invoking-subprocess` (`.exec`/`.execSync`).
     JavaScript,
-    /// `.ts` / `.tsx` — `dynamic-eval` (`eval`/`Function`).
+    /// `.ts` / `.tsx` — `dynamic-eval` (`eval`/`Function`),
+    /// `shell-invoking-subprocess` (`.exec`/`.execSync`).
     TypeScript,
 }
 
@@ -64,24 +67,94 @@ fn ts_language(lang: &Lang) -> TsLanguage {
     }
 }
 
-/// v0.1 rule set (ported as-is from treeband). Each rule is a tree-sitter
-/// query, not a regex — it matches AST structure, so `// eval(x)` in a
-/// comment or `"eval(x)"` in a string literal never matches, unlike a naive
-/// text search.
+/// Rule set. `dynamic-eval` was ported as-is from treeband;
+/// `shell-invoking-subprocess` (issue #253) was added directly in clawband.
+/// Each rule is a tree-sitter query, not a regex — it matches AST structure,
+/// so `// eval(x)` in a comment or `"eval(x)"` in a string literal never
+/// matches, unlike a naive text search.
 fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     // (rule_name, query, reason)
+    //
+    // IMPORTANT — predicate placement: `#eq?`/`#match?` predicates must be
+    // written INSIDE the closing paren of the pattern node they scope to,
+    // not after it. Placing them after (as a sibling of the top-level
+    // pattern) silently turns them into unrelated, effectively-unconstrained
+    // top-level patterns of their own — the query still compiles, but the
+    // predicates are never actually applied, and the "structural" match
+    // fires on any node satisfying the bare shape. Verified empirically
+    // while building the shell-invoking-subprocess rule (issue #253): a
+    // predicate-after-the-paren query matched 176 unrelated nodes in a
+    // one-line test file. Every query below has been tested this way
+    // (correct predicate placement, both true- and false-positive cases)
+    // before being committed — see the PR description for the verification
+    // matrix rather than re-deriving it from scratch when adding a new rule.
+    let shell_invoking_reason = "shell-invoking call — if any part of the command/argument is not a fixed literal, this is a command-injection surface; prefer exec'ing the program directly with an argv array";
     match lang {
-        Lang::JavaScript | Lang::TypeScript => vec![(
-            "dynamic-eval",
-            r#"(call_expression function: (identifier) @fn (#match? @fn "^(eval|Function)$"))"#,
-            "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
+        Lang::JavaScript | Lang::TypeScript => vec![
+            (
+                "dynamic-eval",
+                r#"(call_expression function: (identifier) @fn (#match? @fn "^(eval|Function)$"))"#,
+                "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
+            ),
+            (
+                "shell-invoking-subprocess",
+                r#"(call_expression
+  function: (member_expression
+    property: (property_identifier) @method)
+  (#match? @method "^(exec|execSync)$"))"#,
+                shell_invoking_reason,
+            ),
+        ],
+        Lang::Python => vec![
+            (
+                "dynamic-eval",
+                r#"(call function: (identifier) @fn (#match? @fn "^(eval|exec)$"))"#,
+                "dynamic code execution (eval/exec) — can run attacker-controlled strings as code",
+            ),
+            (
+                "shell-invoking-subprocess",
+                r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  arguments: (argument_list
+    (keyword_argument
+      name: (identifier) @kw
+      value: (true)))
+  (#eq? @obj "subprocess")
+  (#match? @method "^(run|call|Popen|check_call|check_output)$")
+  (#eq? @kw "shell"))"#,
+                shell_invoking_reason,
+            ),
+            (
+                "shell-invoking-subprocess",
+                r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  (#eq? @obj "os")
+  (#match? @method "^(system|popen)$"))"#,
+                "shell-invoking call — os.system()/os.popen() always run through a shell; if any part of the command is not a fixed literal, this is a command-injection surface",
+            ),
+        ],
+        Lang::Rust => vec![(
+            "shell-invoking-subprocess",
+            r#"(call_expression
+  function: (field_expression
+    value: (call_expression
+      function: (scoped_identifier
+        path: (identifier) @cmd_path
+        name: (identifier) @cmd_new)
+      arguments: (arguments (string_literal (string_content) @shell_bin)))
+    field: (field_identifier) @arg_method)
+  arguments: (arguments (string_literal (string_content) @flag))
+  (#eq? @cmd_path "Command")
+  (#eq? @cmd_new "new")
+  (#eq? @arg_method "arg")
+  (#match? @shell_bin "^(sh|bash|/bin/sh|/bin/bash)$")
+  (#eq? @flag "-c"))"#,
+            shell_invoking_reason,
         )],
-        Lang::Python => vec![(
-            "dynamic-eval",
-            r#"(call function: (identifier) @fn (#match? @fn "^(eval|exec)$"))"#,
-            "dynamic code execution (eval/exec) — can run attacker-controlled strings as code",
-        )],
-        Lang::Rust => vec![],
     }
 }
 
@@ -169,8 +242,10 @@ mod tests {
     }
 
     #[test]
-    fn rust_has_no_rules_yet() {
-        // Rust has no dynamic-eval equivalent rule yet — must never flag.
+    fn rust_has_no_dynamic_eval_equivalent_rule() {
+        // Rust has no dynamic-eval equivalent rule (no eval()/exec() built
+        // in to flag) — but it does have shell-invoking-subprocess (see
+        // below). A bare eval() call must never flag under either rule.
         let findings = scan("fn main() { eval(); }", Lang::Rust);
         assert!(findings.is_empty());
     }
@@ -196,5 +271,240 @@ mod tests {
                 "{path} language detection"
             );
         }
+    }
+
+    // ── issue #253: shell-invoking-subprocess ────────────────────────────────
+    // Command-injection surface: handing a string to a shell interpreter
+    // instead of exec'ing a program directly.
+
+    fn has_shell_invoking_finding(findings: &[Finding]) -> bool {
+        findings
+            .iter()
+            .any(|f| f.rule == "shell-invoking-subprocess")
+    }
+
+    // Python: subprocess.*(shell=True)
+
+    #[test]
+    fn python_flags_subprocess_run_shell_true() {
+        let findings = scan("subprocess.run(cmd, shell=True)", Lang::Python);
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_subprocess_shell_true_regardless_of_position() {
+        // shell=True can appear first or last — the query must not care.
+        let findings = scan("subprocess.run(shell=True, args=cmd)", Lang::Python);
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_all_shell_invoking_subprocess_methods() {
+        for method in ["run", "call", "Popen", "check_call", "check_output"] {
+            let code = format!("subprocess.{method}(cmd, shell=True)");
+            let findings = scan(&code, Lang::Python);
+            assert!(
+                has_shell_invoking_finding(&findings),
+                "subprocess.{method}(..., shell=True) must be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn python_ignores_subprocess_without_shell_true() {
+        // Required false-positive test from issue #253.
+        let findings = scan(r#"subprocess.run(["ls", "-la"])"#, Lang::Python);
+        assert!(
+            !has_shell_invoking_finding(&findings),
+            "subprocess.run with an argv list and no shell=True must not be flagged"
+        );
+    }
+
+    #[test]
+    fn python_ignores_subprocess_shell_false() {
+        let findings = scan("subprocess.run(cmd, shell=False)", Lang::Python);
+        assert!(!has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_bare_os_system() {
+        let findings = scan("os.system(cmd)", Lang::Python);
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_bare_os_popen() {
+        let findings = scan("os.popen(cmd)", Lang::Python);
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_unrelated_os_calls() {
+        let findings = scan("os.path.join(a, b)", Lang::Python);
+        assert!(!has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_shell_invoking_mention_in_comment() {
+        // Required false-positive test from issue #253.
+        let findings = scan(
+            "# subprocess.run(cmd, shell=True) would be dangerous\nprint(1)",
+            Lang::Python,
+        );
+        assert!(
+            !has_shell_invoking_finding(&findings),
+            "a comment mentioning subprocess.run(..., shell=True) must not be flagged"
+        );
+    }
+
+    #[test]
+    fn python_ignores_shell_invoking_mention_in_string_literal() {
+        // Required false-positive test from issue #253.
+        let findings = scan(r#"s = "os.system(cmd)""#, Lang::Python);
+        assert!(
+            !has_shell_invoking_finding(&findings),
+            "a string literal containing \"os.system(...)\" must not be flagged"
+        );
+    }
+
+    // JavaScript/TypeScript: child_process.exec / execSync
+
+    #[test]
+    fn js_flags_child_process_exec() {
+        let findings = scan("child_process.exec(cmd);", Lang::JavaScript);
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_child_process_exec_sync() {
+        let findings = scan("child_process.execSync(cmd);", Lang::JavaScript);
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_exec_on_any_receiver() {
+        // We can't statically know which variable holds the child_process
+        // module without data-flow analysis, so this matches any `.exec(`/
+        // `.execSync(` member call, not just one literally named
+        // `child_process`. Matches clawband's own existing Bash-side
+        // detection of `require('child_process').exec(...)`.
+        let findings = scan("cp.exec(cmd);", Lang::JavaScript);
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_exec_file() {
+        // Required false-positive test from issue #253.
+        let findings = scan(
+            "child_process.execFile(\"ls\", [\"-la\"]);",
+            Lang::JavaScript,
+        );
+        assert!(
+            !has_shell_invoking_finding(&findings),
+            "execFile must not be flagged: it takes an argv array and doesn't invoke a shell"
+        );
+    }
+
+    #[test]
+    fn js_ignores_exec_file_sync() {
+        let findings = scan(
+            "child_process.execFileSync(\"ls\", [\"-la\"]);",
+            Lang::JavaScript,
+        );
+        assert!(!has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_spawn_and_spawn_sync() {
+        let findings = scan("child_process.spawn(\"ls\", [\"-la\"]);", Lang::JavaScript);
+        assert!(!has_shell_invoking_finding(&findings));
+        let findings = scan(
+            "child_process.spawnSync(\"ls\", [\"-la\"]);",
+            Lang::JavaScript,
+        );
+        assert!(!has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_child_process_exec() {
+        let findings = scan("child_process.exec(cmd);", Lang::TypeScript);
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn ts_ignores_exec_file() {
+        let findings = scan(
+            "child_process.execFile(\"ls\", [\"-la\"]);",
+            Lang::TypeScript,
+        );
+        assert!(!has_shell_invoking_finding(&findings));
+    }
+
+    // Rust: Command::new("sh"/"bash"/...).arg("-c")
+
+    #[test]
+    fn rust_flags_command_sh_dash_c() {
+        let findings = scan(
+            r#"fn main() { Command::new("sh").arg("-c").arg(cmd); }"#,
+            Lang::Rust,
+        );
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn rust_flags_command_bash_dash_c() {
+        let findings = scan(
+            r#"fn main() { Command::new("bash").arg("-c").arg(cmd); }"#,
+            Lang::Rust,
+        );
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn rust_flags_command_absolute_shell_path_dash_c() {
+        let findings = scan(
+            r#"fn main() { Command::new("/bin/sh").arg("-c").arg(cmd); }"#,
+            Lang::Rust,
+        );
+        assert!(has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn rust_ignores_non_shell_command() {
+        let findings = scan(
+            r#"fn main() { Command::new("ls").arg("-la"); }"#,
+            Lang::Rust,
+        );
+        assert!(
+            !has_shell_invoking_finding(&findings),
+            "Command::new for a non-shell program must not be flagged"
+        );
+    }
+
+    #[test]
+    fn rust_ignores_shell_command_without_dash_c() {
+        let findings = scan(r#"fn main() { Command::new("sh").arg("-x"); }"#, Lang::Rust);
+        assert!(
+            !has_shell_invoking_finding(&findings),
+            "Command::new(\"sh\") without .arg(\"-c\") must not be flagged"
+        );
+    }
+
+    #[test]
+    fn rust_ignores_shell_invoking_mention_in_comment() {
+        let findings = scan(
+            "// Command::new(\"sh\").arg(\"-c\") is dangerous\nfn main() {}",
+            Lang::Rust,
+        );
+        assert!(!has_shell_invoking_finding(&findings));
+    }
+
+    #[test]
+    fn rust_ignores_shell_invoking_mention_in_string_literal() {
+        let findings = scan(
+            r#"fn main() { let s = "Command::new(sh).arg(-c)"; }"#,
+            Lang::Rust,
+        );
+        assert!(!has_shell_invoking_finding(&findings));
     }
 }
