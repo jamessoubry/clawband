@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="clawband" width="420">
+</p>
+
 # clawband
 
 A `PreToolUse` hook for [Claude Code](https://claude.ai/code) that hard-blocks known destructive shell commands before they execute — like a rubber band around a lobster claw.
