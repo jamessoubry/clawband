@@ -31,9 +31,13 @@ pub struct Finding {
 
 /// A language `ast_guard` can parse and run rules against.
 pub enum Lang {
+    /// `.rs` — no rules yet (see `rules_for`).
     Rust,
+    /// `.py` / `.pyi` — `dynamic-eval` (`eval`/`exec`).
     Python,
+    /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`).
     JavaScript,
+    /// `.ts` / `.tsx` — `dynamic-eval` (`eval`/`Function`).
     TypeScript,
 }
 
