@@ -296,6 +296,77 @@ fn e2e_ast_guard_path_deny_takes_priority_over_ast_ask() {
     );
 }
 
+// ── issue #253: shell-invoking-subprocess ────────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_python_subprocess_shell_true() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"subprocess.run(cmd, shell=True)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("shell-invoking-subprocess"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_subprocess_argv_list() {
+    // Required false-positive test from issue #253.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"subprocess.run([\"ls\", \"-la\"])"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "subprocess.run with an argv list and no shell=True must not ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_os_system() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"os.system(cmd)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_os_system_mention_in_string_literal() {
+    // Required false-positive test from issue #253.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"s = \"os.system(cmd)\""}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_child_process_exec() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"child_process.exec(cmd);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_js_exec_file() {
+    // Required false-positive test from issue #253.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"child_process.execFile(\"ls\", [\"-la\"]);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "execFile must not ask: it takes an argv array and doesn't invoke a shell: {out}"
+    );
+}
+
+#[test]
+fn e2e_ast_guard_flags_rust_command_sh_dash_c() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"fn main() { Command::new(\"sh\").arg(\"-c\").arg(cmd); }"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_rust_command_non_shell() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"fn main() { Command::new(\"ls\").arg(\"-la\"); }"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 #[test]
 fn e2e_write_tool_cargo_bin_clawband_denied() {
     // Write to ~/.cargo/bin/clawband must be hard-denied (self-protection).
