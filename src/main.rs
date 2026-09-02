@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod ast_guard;
+
 // ─── Multi-agent mode ─────────────────────────────────────────────────────────
 
 /// Which agent the hook is serving.  Affects only output rendering and install
@@ -6170,6 +6172,38 @@ fn main() {
             }
             output("ask", &reason);
             return;
+        }
+
+        // 4. AST content guard: parses the actual content being written and
+        // matches structure, not text, so a real eval()/exec() call is
+        // distinguished from the same characters in a comment or string
+        // literal — something the path-based and regex checks above cannot
+        // do. Only reached if nothing above already denied/asked, so
+        // severity ordering (deny > ask > allow) falls out of the existing
+        // early-return control flow: this can only ever add an `ask`, never
+        // override a `deny` that already fired.
+        let content = v["tool_input"]["content"]
+            .as_str()
+            .or_else(|| v["tool_input"]["new_string"].as_str());
+        if let Some(content) = content {
+            if let Some(lang) = ast_guard::detect_language(raw_path) {
+                let findings = ast_guard::scan(content, lang);
+                if !findings.is_empty() {
+                    let reasons: Vec<String> = findings
+                        .iter()
+                        .map(|f| format!("[{}] {}", f.rule, f.reason))
+                        .collect();
+                    let reason = format!(
+                        "clawband: structural check flagged this write:\n{}",
+                        reasons.join("\n")
+                    );
+                    if log_enabled {
+                        log_action("ast-ask", &reason, &abs_path);
+                    }
+                    output("ask", &reason);
+                    return;
+                }
+            }
         }
         return;
     }
