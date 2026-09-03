@@ -367,6 +367,89 @@ fn e2e_ast_guard_ignores_rust_command_non_shell() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// ── issue #254: insecure-deserialize ──────────────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_python_pickle_loads() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"pickle.loads(data)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_pickle_mention_in_comment() {
+    // Required false-positive test from issue #254.
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"# pickle.loads(data) is bad\nprint(1)"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_marshal_loads() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"marshal.loads(data)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_yaml_load_without_loader() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"yaml.load(data)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_yaml_load_with_safe_loader() {
+    // Required false-positive test from issue #254.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"yaml.load(data, Loader=yaml.SafeLoader)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_yaml_safe_load() {
+    // Required false-positive test from issue #254.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"yaml.safe_load(data)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_yaml_load_mention_in_string_literal() {
+    // Required false-positive test from issue #254.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"s = \"yaml.load(x)\""}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_json_loads_sanity_check() {
+    // Required sanity-check test from issue #254.
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"json.loads(data)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_vm_run_in_new_context() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"vm.runInNewContext(code, sandbox);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_vm_mention_in_comment() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"// vm.runInNewContext(code) is dangerous\nfunction f(){return 1;}"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 #[test]
 fn e2e_write_tool_cargo_bin_clawband_denied() {
     // Write to ~/.cargo/bin/clawband must be hard-denied (self-protection).
