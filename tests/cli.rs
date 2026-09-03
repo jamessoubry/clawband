@@ -534,6 +534,59 @@ fn e2e_ast_guard_ignores_rust_danger_accept_invalid_certs_false() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// ── issue #256: dynamic-module-load ───────────────────────────────────────
+
+#[test]
+fn e2e_ast_guard_ignores_require_string_literal() {
+    // Required false-positive test from issue #256.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"require(\"./config\")"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_dynamic_import_string_literal() {
+    // Required false-positive test from issue #256.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"import(\"./lazy-module\")"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_require_identifier_argument() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"require(userInput)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("dynamic-module-load"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_require_template_literal_with_interpolation() {
+    // Required by issue #256: this is exactly the risky i18n-loader case.
+    let json =
+        "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"a.js\",\"content\":\"require(`./locales/${lang}`)\"}}";
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("dynamic-module-load"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_require_mention_in_comment() {
+    // Required false-positive test from issue #256.
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"// require(userInput) is bad\nfunction f(){return 1;}"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_require_mention_in_string_literal() {
+    // Required false-positive test from issue #256.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const s = \"require(x)\";"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 #[test]
 fn e2e_write_tool_cargo_bin_clawband_denied() {
     // Write to ~/.cargo/bin/clawband must be hard-denied (self-protection).
