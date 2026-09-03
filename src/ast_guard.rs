@@ -31,20 +31,24 @@ pub struct Finding {
 
 /// A language `ast_guard` can parse and run rules against.
 pub enum Lang {
-    /// `.rs` — `shell-invoking-subprocess` (`Command::new("sh"/"bash"/...).arg("-c")`).
+    /// `.rs` — `shell-invoking-subprocess` (`Command::new("sh"/"bash"/...).arg("-c")`),
+    /// `tls-verify-disabled` (`.danger_accept_invalid_certs(true)`).
     Rust,
     /// `.py` / `.pyi` — `dynamic-eval` (`eval`/`exec`), `shell-invoking-subprocess`
     /// (`subprocess.*(shell=True)`, `os.system`/`os.popen`), `insecure-deserialize`
     /// (`pickle.load`/`pickle.loads`, `marshal.loads`, `yaml.load` without a safe
-    /// `Loader=`).
+    /// `Loader=`), `tls-verify-disabled` (any call with keyword argument
+    /// `verify=False`).
     Python,
     /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`),
     /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
-    /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`).
+    /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
+    /// (object literal property `rejectUnauthorized: false`).
     JavaScript,
     /// `.ts` / `.tsx` — `dynamic-eval` (`eval`/`Function`),
     /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
-    /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`).
+    /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
+    /// (object literal property `rejectUnauthorized: false`).
     TypeScript,
 }
 
@@ -72,8 +76,9 @@ fn ts_language(lang: &Lang) -> TsLanguage {
 }
 
 /// Rule set. `dynamic-eval` was ported as-is from treeband;
-/// `shell-invoking-subprocess` (issue #253) and `insecure-deserialize`
-/// (issue #254) were added directly in clawband.
+/// `shell-invoking-subprocess` (issue #253), `insecure-deserialize`
+/// (issue #254), and `tls-verify-disabled` (issue #255) were added directly
+/// in clawband.
 /// Each rule is a tree-sitter query, not a regex — it matches AST structure,
 /// so `// eval(x)` in a comment or `"eval(x)"` in a string literal never
 /// matches, unlike a naive text search.
@@ -102,6 +107,7 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     // matrix rather than re-deriving it from scratch when adding a new rule.
     let shell_invoking_reason = "shell-invoking call — if any part of the command/argument is not a fixed literal, this is a command-injection surface; prefer exec'ing the program directly with an argv array";
     let insecure_deserialize_reason = "insecure deserialization — this API can execute arbitrary code embedded in its input; if the input isn't fully trusted, use a data-only parser instead";
+    let tls_verify_disabled_reason = "TLS certificate verification disabled — this accepts connections to servers with invalid/self-signed/expired certificates, defeating TLS's protection against MITM; should not ship to production";
     match lang {
         Lang::JavaScript | Lang::TypeScript => vec![
             (
@@ -126,6 +132,14 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @obj "vm")
   (#match? @method "^(runInNewContext|runInThisContext|runInContext)$"))"#,
                 insecure_deserialize_reason,
+            ),
+            (
+                "tls-verify-disabled",
+                r#"(pair
+  key: (property_identifier) @key
+  value: (false)
+  (#eq? @key "rejectUnauthorized"))"#,
+                tls_verify_disabled_reason,
             ),
         ],
         Lang::Python => vec![
@@ -179,10 +193,21 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @method "loads"))"#,
                 insecure_deserialize_reason,
             ),
+            (
+                "tls-verify-disabled",
+                r#"(call
+  arguments: (argument_list
+    (keyword_argument
+      name: (identifier) @kw
+      value: (false)))
+  (#eq? @kw "verify"))"#,
+                tls_verify_disabled_reason,
+            ),
         ],
-        Lang::Rust => vec![(
-            "shell-invoking-subprocess",
-            r#"(call_expression
+        Lang::Rust => vec![
+            (
+                "shell-invoking-subprocess",
+                r#"(call_expression
   function: (field_expression
     value: (call_expression
       function: (scoped_identifier
@@ -196,8 +221,19 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @arg_method "arg")
   (#match? @shell_bin "^(sh|bash|/bin/sh|/bin/bash)$")
   (#eq? @flag "-c"))"#,
-            shell_invoking_reason,
-        )],
+                shell_invoking_reason,
+            ),
+            (
+                "tls-verify-disabled",
+                r#"(call_expression
+  function: (field_expression
+    field: (field_identifier) @method)
+  arguments: (arguments (boolean_literal) @val)
+  (#eq? @method "danger_accept_invalid_certs")
+  (#eq? @val "true"))"#,
+                tls_verify_disabled_reason,
+            ),
+        ],
     }
 }
 
@@ -762,5 +798,137 @@ mod tests {
     fn rust_has_no_insecure_deserialize_rule() {
         let findings = scan(r#"fn main() { let x = 1; }"#, Lang::Rust);
         assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    // ── tls-verify-disabled (issue #255) ──
+
+    fn has_tls_verify_disabled_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "tls-verify-disabled")
+    }
+
+    #[test]
+    fn python_flags_verify_false() {
+        let findings = scan("requests.get(url, verify=False)", Lang::Python);
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_verify_true() {
+        let findings = scan("requests.get(url, verify=True)", Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_verify_variable() {
+        // Required by issue #255: verify=some_variable is a legitimate
+        // conditional-TLS pattern (e.g. verify=IS_PRODUCTION) and must not
+        // be flagged — only the literal-False case is in scope for v1.
+        let findings = scan("requests.get(url, verify=IS_PRODUCTION)", Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_verify_false_mention_in_comment() {
+        let findings = scan("# verify=False is bad\nprint(1)", Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_verify_false_mention_in_string_literal() {
+        let findings = scan(r#"s = "verify=False""#, Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_reject_unauthorized_false() {
+        let findings = scan(
+            "https.request(url, { rejectUnauthorized: false });",
+            Lang::JavaScript,
+        );
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_reject_unauthorized_true() {
+        let findings = scan(
+            "https.request(url, { rejectUnauthorized: true });",
+            Lang::JavaScript,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_reject_unauthorized_as_variable_name() {
+        // Required by issue #255: a variable named rejectUnauthorized used
+        // elsewhere (not as an object property with literal false) must not
+        // be flagged.
+        let findings = scan(
+            "let rejectUnauthorized = false; foo(rejectUnauthorized);",
+            Lang::JavaScript,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_reject_unauthorized_mention_in_comment() {
+        let findings = scan(
+            "// rejectUnauthorized: false is bad\nfunction f(){}",
+            Lang::JavaScript,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_reject_unauthorized_mention_in_string_literal() {
+        let findings = scan(
+            r#"const s = "rejectUnauthorized: false";"#,
+            Lang::JavaScript,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_reject_unauthorized_false() {
+        let findings = scan(
+            "https.request(url, { rejectUnauthorized: false });",
+            Lang::TypeScript,
+        );
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn rust_flags_danger_accept_invalid_certs_true() {
+        let findings = scan(
+            "fn main() { ClientBuilder::new().danger_accept_invalid_certs(true).build(); }",
+            Lang::Rust,
+        );
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn rust_ignores_danger_accept_invalid_certs_false() {
+        let findings = scan(
+            "fn main() { ClientBuilder::new().danger_accept_invalid_certs(false).build(); }",
+            Lang::Rust,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn rust_ignores_danger_accept_invalid_certs_mention_in_comment() {
+        let findings = scan(
+            "// danger_accept_invalid_certs(true) is bad\nfn main() {}",
+            Lang::Rust,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn rust_ignores_danger_accept_invalid_certs_mention_in_string_literal() {
+        let findings = scan(
+            r#"fn main() { let s = "danger_accept_invalid_certs(true)"; }"#,
+            Lang::Rust,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
     }
 }
