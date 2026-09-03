@@ -450,6 +450,90 @@ fn e2e_ast_guard_ignores_vm_mention_in_comment() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// ── issue #255: tls-verify-disabled ───────────────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_python_verify_false() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"requests.get(url, verify=False)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("tls-verify-disabled"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_verify_true() {
+    // Required false-positive test from issue #255.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"requests.get(url, verify=True)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_verify_variable() {
+    // Required false-positive test from issue #255: verify=some_variable
+    // (a legitimate conditional-TLS pattern) must not be flagged.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"requests.get(url, verify=IS_PRODUCTION)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_verify_false_mention_in_comment() {
+    // Required false-positive test from issue #255.
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"# verify=False is bad\nprint(1)"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_reject_unauthorized_false() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"https.request(url, { rejectUnauthorized: false });"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("tls-verify-disabled"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_js_reject_unauthorized_true() {
+    // Required false-positive test from issue #255.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"https.request(url, { rejectUnauthorized: true });"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_js_reject_unauthorized_string_literal_mention() {
+    // Required false-positive test from issue #255.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const s = \"rejectUnauthorized: false\";"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_js_reject_unauthorized_as_variable_name() {
+    // Required false-positive test from issue #255: a variable named
+    // rejectUnauthorized used elsewhere (not as an object property with
+    // literal false) must not be flagged.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"let rejectUnauthorized = false; foo(rejectUnauthorized);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_rust_danger_accept_invalid_certs() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"fn main() { ClientBuilder::new().danger_accept_invalid_certs(true).build(); }"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("tls-verify-disabled"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_rust_danger_accept_invalid_certs_false() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"fn main() { ClientBuilder::new().danger_accept_invalid_certs(false).build(); }"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 #[test]
 fn e2e_write_tool_cargo_bin_clawband_denied() {
     // Write to ~/.cargo/bin/clawband must be hard-denied (self-protection).
