@@ -34,13 +34,17 @@ pub enum Lang {
     /// `.rs` — `shell-invoking-subprocess` (`Command::new("sh"/"bash"/...).arg("-c")`).
     Rust,
     /// `.py` / `.pyi` — `dynamic-eval` (`eval`/`exec`), `shell-invoking-subprocess`
-    /// (`subprocess.*(shell=True)`, `os.system`/`os.popen`).
+    /// (`subprocess.*(shell=True)`, `os.system`/`os.popen`), `insecure-deserialize`
+    /// (`pickle.load`/`pickle.loads`, `marshal.loads`, `yaml.load` without a safe
+    /// `Loader=`).
     Python,
     /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`),
-    /// `shell-invoking-subprocess` (`.exec`/`.execSync`).
+    /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
+    /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`).
     JavaScript,
     /// `.ts` / `.tsx` — `dynamic-eval` (`eval`/`Function`),
-    /// `shell-invoking-subprocess` (`.exec`/`.execSync`).
+    /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
+    /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`).
     TypeScript,
 }
 
@@ -68,10 +72,18 @@ fn ts_language(lang: &Lang) -> TsLanguage {
 }
 
 /// Rule set. `dynamic-eval` was ported as-is from treeband;
-/// `shell-invoking-subprocess` (issue #253) was added directly in clawband.
+/// `shell-invoking-subprocess` (issue #253) and `insecure-deserialize`
+/// (issue #254) were added directly in clawband.
 /// Each rule is a tree-sitter query, not a regex — it matches AST structure,
 /// so `// eval(x)` in a comment or `"eval(x)"` in a string literal never
 /// matches, unlike a naive text search.
+///
+/// `insecure-deserialize`'s Python `yaml.load` case is NOT included here —
+/// "flag `yaml.load(...)` unless it has a safe `Loader=` kwarg" needs a
+/// negative condition tree-sitter queries can't express (a query can match
+/// the presence of a node, not the absence of one elsewhere in the same
+/// call). That case is handled by a dedicated post-match walk,
+/// `python_yaml_load_findings`, called directly from `scan()`.
 fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     // (rule_name, query, reason)
     //
@@ -89,6 +101,7 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     // before being committed — see the PR description for the verification
     // matrix rather than re-deriving it from scratch when adding a new rule.
     let shell_invoking_reason = "shell-invoking call — if any part of the command/argument is not a fixed literal, this is a command-injection surface; prefer exec'ing the program directly with an argv array";
+    let insecure_deserialize_reason = "insecure deserialization — this API can execute arbitrary code embedded in its input; if the input isn't fully trusted, use a data-only parser instead";
     match lang {
         Lang::JavaScript | Lang::TypeScript => vec![
             (
@@ -103,6 +116,16 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     property: (property_identifier) @method)
   (#match? @method "^(exec|execSync)$"))"#,
                 shell_invoking_reason,
+            ),
+            (
+                "insecure-deserialize",
+                r#"(call_expression
+  function: (member_expression
+    object: (identifier) @obj
+    property: (property_identifier) @method)
+  (#eq? @obj "vm")
+  (#match? @method "^(runInNewContext|runInThisContext|runInContext)$"))"#,
+                insecure_deserialize_reason,
             ),
         ],
         Lang::Python => vec![
@@ -136,6 +159,26 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#match? @method "^(system|popen)$"))"#,
                 "shell-invoking call — os.system()/os.popen() always run through a shell; if any part of the command is not a fixed literal, this is a command-injection surface",
             ),
+            (
+                "insecure-deserialize",
+                r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  (#eq? @obj "pickle")
+  (#match? @method "^(load|loads)$"))"#,
+                insecure_deserialize_reason,
+            ),
+            (
+                "insecure-deserialize",
+                r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  (#eq? @obj "marshal")
+  (#eq? @method "loads"))"#,
+                insecure_deserialize_reason,
+            ),
         ],
         Lang::Rust => vec![(
             "shell-invoking-subprocess",
@@ -156,6 +199,70 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
             shell_invoking_reason,
         )],
     }
+}
+
+/// Finds `yaml.load(...)` calls (specifically `load`, never `safe_load` —
+/// the query constrains the attribute name so it can't match that) that lack
+/// a `Loader=` keyword argument naming a safe loader. Tree-sitter queries
+/// can't express "matches X but not if Y is also present" directly, so this
+/// matches the call generically and then walks its argument list in Rust
+/// code looking for a `Loader=` kwarg whose value mentions "Safe" (covers
+/// both `Loader=yaml.SafeLoader` and a bare `Loader=SafeLoader` import).
+fn python_yaml_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
+    let ts_lang: TsLanguage = tree_sitter_python::LANGUAGE.into();
+    let query_src = r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @obj "yaml")
+  (#eq? @method "load"))"#;
+    let query = match Query::new(&ts_lang, query_src) {
+        Ok(q) => q,
+        Err(_) => return vec![],
+    };
+    let args_index = query
+        .capture_names()
+        .iter()
+        .position(|n| *n == "args")
+        .expect("query defines an @args capture");
+
+    let mut findings = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index as usize != args_index {
+                continue;
+            }
+            let mut has_safe_loader = false;
+            let mut c = cap.node.walk();
+            for child in cap.node.named_children(&mut c) {
+                if child.kind() != "keyword_argument" {
+                    continue;
+                }
+                let name_ok = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                    == Some("Loader");
+                let value_safe = child
+                    .child_by_field_name("value")
+                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                    .is_some_and(|v| v.contains("Safe"));
+                if name_ok && value_safe {
+                    has_safe_loader = true;
+                    break;
+                }
+            }
+            if !has_safe_loader {
+                findings.push(Finding {
+                    rule: "insecure-deserialize",
+                    reason: "insecure deserialization — yaml.load() without a safe Loader can execute arbitrary code embedded in its input; use yaml.safe_load() or pass Loader=yaml.SafeLoader",
+                });
+            }
+        }
+    }
+    findings
 }
 
 /// Parses `content` as `lang` and runs the rule set against the AST.
@@ -184,6 +291,9 @@ pub fn scan(content: &str, lang: Lang) -> Vec<Finding> {
         if matches.next().is_some() {
             findings.push(Finding { rule, reason });
         }
+    }
+    if matches!(lang, Lang::Python) {
+        findings.extend(python_yaml_load_findings(&tree, content));
     }
     findings
 }
@@ -506,5 +616,151 @@ mod tests {
             Lang::Rust,
         );
         assert!(!has_shell_invoking_finding(&findings));
+    }
+
+    // ── insecure-deserialize (issue #254) ──
+
+    fn has_insecure_deserialize_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "insecure-deserialize")
+    }
+
+    // Python: pickle.load / pickle.loads
+
+    #[test]
+    fn python_flags_pickle_load() {
+        let findings = scan("pickle.load(f)", Lang::Python);
+        assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_pickle_loads() {
+        let findings = scan("pickle.loads(data)", Lang::Python);
+        assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_pickle_mention_in_comment() {
+        let findings = scan("# pickle.loads(data) is bad\nprint(1)", Lang::Python);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_pickle_mention_in_string_literal() {
+        let findings = scan(r#"s = "pickle.loads(data)""#, Lang::Python);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    // Python: marshal.loads
+
+    #[test]
+    fn python_flags_marshal_loads() {
+        let findings = scan("marshal.loads(data)", Lang::Python);
+        assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_marshal_dumps() {
+        let findings = scan("marshal.dumps(obj)", Lang::Python);
+        assert!(
+            !has_insecure_deserialize_finding(&findings),
+            "marshal.dumps (serializing, not deserializing) must not be flagged"
+        );
+    }
+
+    // Python: yaml.load without a safe Loader
+
+    #[test]
+    fn python_flags_yaml_load_without_loader() {
+        let findings = scan("yaml.load(data)", Lang::Python);
+        assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_yaml_load_with_dotted_safe_loader() {
+        let findings = scan("yaml.load(data, Loader=yaml.SafeLoader)", Lang::Python);
+        assert!(
+            !has_insecure_deserialize_finding(&findings),
+            "yaml.load with Loader=yaml.SafeLoader must not be flagged"
+        );
+    }
+
+    #[test]
+    fn python_ignores_yaml_load_with_bare_safe_loader() {
+        let findings = scan("yaml.load(data, Loader=SafeLoader)", Lang::Python);
+        assert!(
+            !has_insecure_deserialize_finding(&findings),
+            "yaml.load with a bare (imported) Loader=SafeLoader must not be flagged"
+        );
+    }
+
+    #[test]
+    fn python_ignores_yaml_safe_load() {
+        let findings = scan("yaml.safe_load(data)", Lang::Python);
+        assert!(
+            !has_insecure_deserialize_finding(&findings),
+            "yaml.safe_load must never be flagged, only yaml.load"
+        );
+    }
+
+    #[test]
+    fn python_ignores_yaml_load_mention_in_comment() {
+        let findings = scan("# yaml.load(data) is bad\nprint(1)", Lang::Python);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_yaml_load_mention_in_string_literal() {
+        let findings = scan(r#"s = "yaml.load(x)""#, Lang::Python);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_json_loads_sanity_check() {
+        let findings = scan("json.loads(data)", Lang::Python);
+        assert!(
+            !has_insecure_deserialize_finding(&findings),
+            "json.loads is a data-only parser and must never be flagged"
+        );
+    }
+
+    // JS/TS: vm.runInNewContext / runInThisContext / runInContext
+
+    #[test]
+    fn js_flags_vm_run_in_new_context() {
+        let findings = scan("vm.runInNewContext(code, sandbox);", Lang::JavaScript);
+        assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_vm_run_in_this_context() {
+        let findings = scan("vm.runInThisContext(code);", Lang::JavaScript);
+        assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_vm_run_in_context() {
+        let findings = scan("vm.runInContext(code, ctx);", Lang::TypeScript);
+        assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_vm_mention_in_comment() {
+        let findings = scan(
+            "// vm.runInNewContext(code) is dangerous\nfunction f(){return 1;}",
+            Lang::JavaScript,
+        );
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_vm_mention_in_string_literal() {
+        let findings = scan(r#"const s = "vm.runInNewContext(code)";"#, Lang::JavaScript);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn rust_has_no_insecure_deserialize_rule() {
+        let findings = scan(r#"fn main() { let x = 1; }"#, Lang::Rust);
+        assert!(!has_insecure_deserialize_finding(&findings));
     }
 }

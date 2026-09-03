@@ -299,10 +299,11 @@ const msg = "eval(x) is dangerous"; // clawband: ignored — this is a string li
 result = eval(userInput); // clawband: flagged — this is a real call expression
 ```
 
-**Status**: two rules across all 4 supported languages (Rust, Python, JavaScript, TypeScript) — a growing set, not yet a complete one:
+**Status**: three rules across all 4 supported languages (Rust, Python, JavaScript, TypeScript) — a growing set, not yet a complete one:
 
 - `dynamic-eval`: `eval()`/`Function()` in JS/TS, `eval()`/`exec()` in Python (no Rust equivalent — there's no direct analog to construct-code-from-a-string in safe Rust)
 - `shell-invoking-subprocess`: handing a string to a shell interpreter instead of exec'ing a program directly — `subprocess.run/call/Popen/check_call/check_output(..., shell=True)` and bare `os.system`/`os.popen` in Python; `.exec`/`.execSync` in JS/TS (`.execFile`/`.spawn` and their `*Sync` variants are deliberately not flagged — they take an argv array and never invoke a shell); `Command::new("sh"/"bash"/"/bin/sh"/"/bin/bash").arg("-c")` in Rust
+- `insecure-deserialize`: APIs that can execute arbitrary code embedded in their input, not just parse data — `pickle.load`/`pickle.loads`, `marshal.loads`, and `yaml.load(...)` without a safe `Loader=` kwarg in Python (`yaml.safe_load` and `yaml.load(data, Loader=yaml.SafeLoader)`/`Loader=SafeLoader` are never flagged — the `Loader=` case needed a Rust-side post-match walk of the call's keyword arguments, since a tree-sitter query can only match a node's presence, not another node's absence); `vm.runInNewContext`/`runInThisContext`/`runInContext` in JS/TS (no Rust equivalent for v1)
 
 Unsupported languages fail open: the path-based checks above still apply, this only ever adds coverage, it never removes it. Runs in the same `PreToolUse` handler as the path checks — deny (self-protection, protect.paths) always takes priority over an AST-guard `ask`, since the handler returns as soon as an earlier, higher-severity check fires.
 
@@ -531,7 +532,7 @@ Removing the entry from that list lets clawband's ask/deny patterns take over as
 - **Force-push gaps** — `git push :<branch>` (colon-prefix deletion) and `git push origin +main` (plus-refspec force) are not blocked by the force-push pattern; use `--delete` / `--force-with-lease` instead.
 - **Commit messages containing blocked patterns** — if a commit message itself contains a pattern like `rm -rf /` (e.g. documenting a fix), clawband will block the `git commit` command. Workaround: write the message to a temp file and use `git commit -F /tmp/msg.txt`, or rephrase to avoid the literal pattern.
 - **Fail-closed on parse error** — if clawband cannot read or parse the hook input (stdin read failure, malformed JSON), it emits `deny` and blocks the command. It does **not** fail-open.
-- **AST content guard covers two rules so far** — `dynamic-eval` (`eval`/`Function`/`exec`) and `shell-invoking-subprocess` (see [AST content guard](#ast-content-guard) above); any language outside Rust/Python/JS/TS falls open. This augments, not replaces, path-based Write/Edit protection.
+- **AST content guard covers three rules so far** — `dynamic-eval` (`eval`/`Function`/`exec`), `shell-invoking-subprocess`, and `insecure-deserialize` (see [AST content guard](#ast-content-guard) above); any language outside Rust/Python/JS/TS falls open. This augments, not replaces, path-based Write/Edit protection.
 
 ### Known shell obfuscation bypasses (issue #129)
 
