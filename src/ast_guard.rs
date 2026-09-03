@@ -43,12 +43,14 @@ pub enum Lang {
     /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`),
     /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
     /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
-    /// (object literal property `rejectUnauthorized: false`).
+    /// (object literal property `rejectUnauthorized: false`), `dynamic-module-load`
+    /// (`require`/`import()` with a non-string-literal argument).
     JavaScript,
     /// `.ts` / `.tsx` — `dynamic-eval` (`eval`/`Function`),
     /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
     /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
-    /// (object literal property `rejectUnauthorized: false`).
+    /// (object literal property `rejectUnauthorized: false`), `dynamic-module-load`
+    /// (`require`/`import()` with a non-string-literal argument).
     TypeScript,
 }
 
@@ -77,18 +79,20 @@ fn ts_language(lang: &Lang) -> TsLanguage {
 
 /// Rule set. `dynamic-eval` was ported as-is from treeband;
 /// `shell-invoking-subprocess` (issue #253), `insecure-deserialize`
-/// (issue #254), and `tls-verify-disabled` (issue #255) were added directly
-/// in clawband.
+/// (issue #254), `tls-verify-disabled` (issue #255), and
+/// `dynamic-module-load` (issue #256) were added directly in clawband.
 /// Each rule is a tree-sitter query, not a regex — it matches AST structure,
 /// so `// eval(x)` in a comment or `"eval(x)"` in a string literal never
 /// matches, unlike a naive text search.
 ///
-/// `insecure-deserialize`'s Python `yaml.load` case is NOT included here —
-/// "flag `yaml.load(...)` unless it has a safe `Loader=` kwarg" needs a
-/// negative condition tree-sitter queries can't express (a query can match
-/// the presence of a node, not the absence of one elsewhere in the same
-/// call). That case is handled by a dedicated post-match walk,
-/// `python_yaml_load_findings`, called directly from `scan()`.
+/// `insecure-deserialize`'s Python `yaml.load` case and `dynamic-module-load`
+/// (issue #256) are NOT included here — both need a negative condition
+/// tree-sitter queries can't express (a query can match the presence of a
+/// node, not the absence/kind of one elsewhere in the same call): "flag
+/// `yaml.load(...)` unless it has a safe `Loader=` kwarg", and "flag
+/// `require`/`import()` unless the argument is a string literal". Both are
+/// handled by dedicated post-match walks — `python_yaml_load_findings` and
+/// `js_dynamic_module_load_findings` — called directly from `scan()`.
 fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     // (rule_name, query, reason)
     //
@@ -301,6 +305,69 @@ fn python_yaml_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Fin
     findings
 }
 
+/// Finds `require(...)`/dynamic `import(...)` calls in JS/TS whose argument
+/// is not a string literal (issue #256). "Flag everything except a specific
+/// node kind" is a shape a tree-sitter query can't express directly — a
+/// query matches a node's presence, not its kind's absence — so this matches
+/// the call generically (capturing its sole argument) and inspects the
+/// argument node's kind in Rust code. A plain template literal with no
+/// `${...}` interpolation (e.g. `` require(`./locales/en`) ``) is treated as
+/// literal-equivalent and not flagged; a template literal WITH interpolation
+/// (e.g. `` require(`./locales/${lang}`) ``) is exactly the risky
+/// runtime-computed-path case and must flag.
+fn js_dynamic_module_load_findings(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    ts_lang: &TsLanguage,
+) -> Vec<Finding> {
+    let query_src = r#"[
+  (call_expression
+    function: (identifier) @fn
+    arguments: (arguments . (_) @arg)
+    (#eq? @fn "require"))
+  (call_expression
+    function: (import)
+    arguments: (arguments . (_) @arg))
+]"#;
+    let query = match Query::new(ts_lang, query_src) {
+        Ok(q) => q,
+        Err(_) => return vec![],
+    };
+    let arg_index = match query.capture_names().iter().position(|n| *n == "arg") {
+        Some(i) => i,
+        None => return vec![],
+    };
+
+    let mut findings = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index as usize != arg_index {
+                continue;
+            }
+            let node = cap.node;
+            if node.kind() == "string" {
+                continue;
+            }
+            if node.kind() == "template_string" {
+                let mut c = node.walk();
+                let has_interpolation = node
+                    .named_children(&mut c)
+                    .any(|child| child.kind() == "template_substitution");
+                if !has_interpolation {
+                    continue;
+                }
+            }
+            findings.push(Finding {
+                rule: "dynamic-module-load",
+                reason: "dynamic module load — the module path isn't a fixed string literal; if any part of it is influenced by external input, this can load and execute an arbitrary file as code",
+            });
+        }
+    }
+    findings
+}
+
 /// Parses `content` as `lang` and runs the rule set against the AST.
 /// Returns an empty vec (never fails closed) if the content fails to parse —
 /// scanning augments clawband's existing checks, it doesn't gate on its own
@@ -330,6 +397,9 @@ pub fn scan(content: &str, lang: Lang) -> Vec<Finding> {
     }
     if matches!(lang, Lang::Python) {
         findings.extend(python_yaml_load_findings(&tree, content));
+    }
+    if matches!(lang, Lang::JavaScript | Lang::TypeScript) {
+        findings.extend(js_dynamic_module_load_findings(&tree, content, &ts_lang));
     }
     findings
 }
@@ -930,5 +1000,97 @@ mod tests {
             Lang::Rust,
         );
         assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    // ── dynamic-module-load (issue #256) ──
+
+    fn has_dynamic_module_load_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "dynamic-module-load")
+    }
+
+    #[test]
+    fn js_ignores_require_string_literal() {
+        let findings = scan(r#"require("./config")"#, Lang::JavaScript);
+        assert!(!has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_dynamic_import_string_literal() {
+        let findings = scan(r#"import("./lazy-module")"#, Lang::JavaScript);
+        assert!(!has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_require_identifier_argument() {
+        let findings = scan("require(userInput)", Lang::JavaScript);
+        assert!(has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_require_template_literal_with_interpolation() {
+        // Required by issue #256: this is exactly the risky i18n-loader
+        // case — a module path built from a request param.
+        let findings = scan("require(`./locales/${lang}`)", Lang::JavaScript);
+        assert!(has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_require_template_literal_without_interpolation() {
+        // A plain template literal with no ${...} is literal-equivalent.
+        let findings = scan("require(`./locales/en`)", Lang::JavaScript);
+        assert!(!has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_require_binary_expression() {
+        let findings = scan("require(a + b)", Lang::JavaScript);
+        assert!(has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_require_call_expression_argument() {
+        let findings = scan("require(getPath())", Lang::JavaScript);
+        assert!(has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_require_mention_in_comment() {
+        let findings = scan(
+            "// require(userInput) is bad\nfunction f(){return 1;}",
+            Lang::JavaScript,
+        );
+        assert!(!has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_require_mention_in_string_literal() {
+        let findings = scan(r#"const s = "require(x)";"#, Lang::JavaScript);
+        assert!(!has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_require_identifier_argument() {
+        let findings = scan("require(userInput);", Lang::TypeScript);
+        assert!(has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn ts_ignores_dynamic_import_string_literal() {
+        let findings = scan(r#"import("./lazy-module");"#, Lang::TypeScript);
+        assert!(!has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn python_has_no_dynamic_module_load_rule() {
+        // v1 is JS/TS only per issue #256 — importlib.import_module is a
+        // deliberate v2 follow-up, not in scope here.
+        let findings = scan("importlib.import_module(name)", Lang::Python);
+        assert!(!has_dynamic_module_load_finding(&findings));
+    }
+
+    #[test]
+    fn rust_has_no_dynamic_module_load_rule() {
+        let findings = scan(r#"fn main() { let x = 1; }"#, Lang::Rust);
+        assert!(!has_dynamic_module_load_finding(&findings));
     }
 }
