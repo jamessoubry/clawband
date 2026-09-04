@@ -587,6 +587,66 @@ fn e2e_ast_guard_ignores_require_mention_in_string_literal() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// ── issue #257: sql-string-interpolation ──────────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_python_execute_fstring_interpolation() {
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"cursor.execute(f\"SELECT * FROM {table}\")"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("sql-string-interpolation"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_execute_fstring_no_interpolation() {
+    // Required by issue #257: an f-string with no actual interpolation has
+    // no injection surface and must not flag.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"cursor.execute(f\"SELECT * FROM users\")"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_parameterized_execute() {
+    // Required false-positive test from issue #257.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"cursor.execute(\"SELECT * FROM users WHERE id = ?\", (user_id,))"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_execute_mention_in_comment() {
+    // Required false-positive test from issue #257.
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"# cursor.execute(f\"SELECT * FROM {table}\") is bad\nprint(1)"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_execute_mention_in_string_literal() {
+    // Required false-positive test from issue #257.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"s = \"cursor.execute(x)\""}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_query_template_literal_interpolation() {
+    // Required by issue #257.
+    let json =
+        "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"a.js\",\"content\":\"db.query(`SELECT * FROM users WHERE id = ${id}`)\"}}";
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("sql-string-interpolation"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_js_query_template_literal_no_interpolation() {
+    let json = "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"a.js\",\"content\":\"db.query(`SELECT * FROM users`)\"}}";
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 #[test]
 fn e2e_write_tool_cargo_bin_clawband_denied() {
     // Write to ~/.cargo/bin/clawband must be hard-denied (self-protection).
