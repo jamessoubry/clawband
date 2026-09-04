@@ -2592,6 +2592,37 @@ fn e2e_rm_subshell_nested_asks_214() {
     );
 }
 
+// ── issue #273: arithmetic expansion is not nested-subshell risk ────────────
+
+#[test]
+fn e2e_arithmetic_expansion_with_embedded_dollar_paren_passes() {
+    // $(( $(cmd) - N )) is a safe timestamp-math idiom, not genuine nesting.
+    let out = run(&bash("START=$(( $(date -u +%s) - 300 ))000"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "arithmetic expansion with embedded $(cmd) must not ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_arithmetic_expansion_multiplication_passes() {
+    let out = run(&bash("COUNT=$(( $(date +%s) * 1000 - 3600000 ))"), &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_genuine_nested_command_substitution_still_asks_273() {
+    // Must not regress: real two-level command substitution outside an
+    // arithmetic context still asks.
+    let out = run(&bash(r#"repo=$(basename $(dirname "$gitdir"))"#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "genuine nested command substitution must still ask: {out}"
+    );
+}
+
 #[test]
 fn e2e_subshell_git_log_head_passes() {
     let out = run(&bash("VAR=$(git log --format=%H | head -1)"), &[]);
