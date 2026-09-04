@@ -32,7 +32,9 @@ pub struct Finding {
 /// A language `ast_guard` can parse and run rules against.
 pub enum Lang {
     /// `.rs` — `shell-invoking-subprocess` (`Command::new("sh"/"bash"/...).arg("-c")`),
-    /// `tls-verify-disabled` (`.danger_accept_invalid_certs(true)`).
+    /// `tls-verify-disabled` (`.danger_accept_invalid_certs(true)`),
+    /// `rust-unsafe-block` (`unsafe { ... }` — visibility, not necessarily wrong;
+    /// a bare `unsafe fn` signature with no block is out of scope for v1).
     Rust,
     /// `.py` / `.pyi` — `dynamic-eval` (`eval`/`exec`), `shell-invoking-subprocess`
     /// (`subprocess.*(shell=True)`, `os.system`/`os.popen`), `insecure-deserialize`
@@ -85,10 +87,11 @@ fn ts_language(lang: &Lang) -> TsLanguage {
 /// Rule set. `dynamic-eval` was ported as-is from treeband;
 /// `shell-invoking-subprocess` (issue #253), `insecure-deserialize`
 /// (issue #254), `tls-verify-disabled` (issue #255), `dynamic-module-load`
-/// (issue #256), and `sql-string-interpolation` (issue #257) were added
-/// directly in clawband. Each rule is a tree-sitter query, not a regex — it
-/// matches AST structure, so `// eval(x)` in a comment or `"eval(x)"` in a
-/// string literal never matches, unlike a naive text search.
+/// (issue #256), `sql-string-interpolation` (issue #257), and
+/// `rust-unsafe-block` (issue #258) were added directly in clawband. Each
+/// rule is a tree-sitter query, not a regex — it matches AST structure, so
+/// `// eval(x)` in a comment or `"eval(x)"` in a string literal never
+/// matches, unlike a naive text search.
 ///
 /// `insecure-deserialize`'s Python `yaml.load` case, `dynamic-module-load`,
 /// and `sql-string-interpolation` are NOT included here — all three need a
@@ -244,6 +247,11 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @method "danger_accept_invalid_certs")
   (#eq? @val "true"))"#,
                 tls_verify_disabled_reason,
+            ),
+            (
+                "rust-unsafe-block",
+                r#"(unsafe_block)"#,
+                "unsafe block — not necessarily wrong, but worth a human review pass; unsafe code bypasses Rust's memory-safety guarantees",
             ),
         ],
     }
@@ -1366,5 +1374,47 @@ mod tests {
     fn rust_has_no_sql_string_interpolation_rule() {
         let findings = scan(r#"fn main() { let x = 1; }"#, Lang::Rust);
         assert!(!has_sql_string_interpolation_finding(&findings));
+    }
+
+    // ── rust-unsafe-block (issue #258) ──
+
+    fn has_rust_unsafe_block_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "rust-unsafe-block")
+    }
+
+    #[test]
+    fn rust_flags_unsafe_block() {
+        let findings = scan(r#"fn main() { unsafe { std::ptr::read(x) }; }"#, Lang::Rust);
+        assert!(has_rust_unsafe_block_finding(&findings));
+    }
+
+    #[test]
+    fn rust_ignores_unsafe_fn_signature_without_block() {
+        // Documented as out of scope for v1 per issue #258: `unsafe fn`
+        // produces a distinct `function_modifiers` node with no
+        // `unsafe_block` child, so a bare unsafe fn signature never matches.
+        let findings = scan(r#"unsafe fn foo() {}"#, Lang::Rust);
+        assert!(!has_rust_unsafe_block_finding(&findings));
+    }
+
+    #[test]
+    fn rust_ignores_unsafe_block_mention_in_comment() {
+        let findings = scan("// unsafe { ... } is dangerous\nfn f(){}", Lang::Rust);
+        assert!(!has_rust_unsafe_block_finding(&findings));
+    }
+
+    #[test]
+    fn rust_ignores_unsafe_block_mention_in_string_literal() {
+        let findings = scan(
+            r#"fn main() { let s = "unsafe { ptr::read(x) }"; }"#,
+            Lang::Rust,
+        );
+        assert!(!has_rust_unsafe_block_finding(&findings));
+    }
+
+    #[test]
+    fn python_has_no_rust_unsafe_block_rule() {
+        let findings = scan("eval(x)", Lang::Python);
+        assert!(!has_rust_unsafe_block_finding(&findings));
     }
 }

@@ -647,6 +647,41 @@ fn e2e_ast_guard_ignores_js_query_template_literal_no_interpolation() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// ── issue #258: rust-unsafe-block ─────────────────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_rust_unsafe_block() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"fn main() { unsafe { std::ptr::read(x) }; }"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("rust-unsafe-block"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_unsafe_fn_signature_without_block() {
+    // Documented as out of scope for v1 per issue #258.
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"unsafe fn foo() {}"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_unsafe_block_mention_in_comment() {
+    // Required false-positive test from issue #258.
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"// unsafe { ... } is dangerous\nfn f(){}"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_unsafe_block_mention_in_string_literal() {
+    // Required false-positive test from issue #258.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"fn main() { let s = \"unsafe { ptr::read(x) }\"; }"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 #[test]
 fn e2e_write_tool_cargo_bin_clawband_denied() {
     // Write to ~/.cargo/bin/clawband must be hard-denied (self-protection).
