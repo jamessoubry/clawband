@@ -38,19 +38,24 @@ pub enum Lang {
     /// (`subprocess.*(shell=True)`, `os.system`/`os.popen`), `insecure-deserialize`
     /// (`pickle.load`/`pickle.loads`, `marshal.loads`, `yaml.load` without a safe
     /// `Loader=`), `tls-verify-disabled` (any call with keyword argument
-    /// `verify=False`).
+    /// `verify=False`), `sql-string-interpolation` (`.execute`/`.executemany`
+    /// with an f-string/`%`-format/`.format()`/`+`-concatenated argument).
     Python,
     /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`),
     /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
     /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
     /// (object literal property `rejectUnauthorized: false`), `dynamic-module-load`
-    /// (`require`/`import()` with a non-string-literal argument).
+    /// (`require`/`import()` with a non-string-literal argument),
+    /// `sql-string-interpolation` (`.query`/`.execute` with a template-literal
+    /// argument containing `${...}` interpolation).
     JavaScript,
     /// `.ts` / `.tsx` — `dynamic-eval` (`eval`/`Function`),
     /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
     /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
     /// (object literal property `rejectUnauthorized: false`), `dynamic-module-load`
-    /// (`require`/`import()` with a non-string-literal argument).
+    /// (`require`/`import()` with a non-string-literal argument),
+    /// `sql-string-interpolation` (`.query`/`.execute` with a template-literal
+    /// argument containing `${...}` interpolation).
     TypeScript,
 }
 
@@ -79,20 +84,23 @@ fn ts_language(lang: &Lang) -> TsLanguage {
 
 /// Rule set. `dynamic-eval` was ported as-is from treeband;
 /// `shell-invoking-subprocess` (issue #253), `insecure-deserialize`
-/// (issue #254), `tls-verify-disabled` (issue #255), and
-/// `dynamic-module-load` (issue #256) were added directly in clawband.
-/// Each rule is a tree-sitter query, not a regex — it matches AST structure,
-/// so `// eval(x)` in a comment or `"eval(x)"` in a string literal never
-/// matches, unlike a naive text search.
+/// (issue #254), `tls-verify-disabled` (issue #255), `dynamic-module-load`
+/// (issue #256), and `sql-string-interpolation` (issue #257) were added
+/// directly in clawband. Each rule is a tree-sitter query, not a regex — it
+/// matches AST structure, so `// eval(x)` in a comment or `"eval(x)"` in a
+/// string literal never matches, unlike a naive text search.
 ///
-/// `insecure-deserialize`'s Python `yaml.load` case and `dynamic-module-load`
-/// (issue #256) are NOT included here — both need a negative condition
-/// tree-sitter queries can't express (a query can match the presence of a
-/// node, not the absence/kind of one elsewhere in the same call): "flag
-/// `yaml.load(...)` unless it has a safe `Loader=` kwarg", and "flag
-/// `require`/`import()` unless the argument is a string literal". Both are
-/// handled by dedicated post-match walks — `python_yaml_load_findings` and
-/// `js_dynamic_module_load_findings` — called directly from `scan()`.
+/// `insecure-deserialize`'s Python `yaml.load` case, `dynamic-module-load`,
+/// and `sql-string-interpolation` are NOT included here — all three need a
+/// condition tree-sitter queries can't express (a query can match the
+/// presence of a node, not the absence/kind of one elsewhere in the same
+/// call): "flag `yaml.load(...)` unless it has a safe `Loader=` kwarg", "flag
+/// `require`/`import()` unless the argument is a string literal", and "flag
+/// `.execute(...)` only when its argument is specifically an interpolated/
+/// concatenated/formatted string, not any string." All three are handled by
+/// dedicated post-match walks — `python_yaml_load_findings`,
+/// `js_dynamic_module_load_findings`, `python_sql_string_interpolation_findings`,
+/// and `js_sql_string_interpolation_findings` — called directly from `scan()`.
 fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     // (rule_name, query, reason)
     //
@@ -368,6 +376,137 @@ fn js_dynamic_module_load_findings(
     findings
 }
 
+/// Finds `.execute(...)`/`.executemany(...)` calls (issue #257) in Python
+/// whose argument is built via string interpolation/concatenation/formatting
+/// rather than passed as a separate parameter — the structural shape of SQL
+/// injection, independent of whether the interpolated value is actually
+/// attacker-controlled. Matches by method-name suffix only (not object name),
+/// covering `sqlite3`, `psycopg2`, `pymysql`, and SQLAlchemy's raw-connection
+/// `.execute` alike. An f-string (`string` node with an `interpolation`
+/// child) flags; a plain string or an f-string with zero interpolations
+/// (same `string` node kind, no `interpolation` child) does not — tree-sitter
+/// can't express "this node kind but only sometimes" in the query itself, so
+/// the interpolation check is a Rust-side inspection of the argument node's
+/// children, same shape as the `yaml.load`/`dynamic-module-load` checks
+/// above. `%`-formatting and `+`-concatenation share one grammar node
+/// (`binary_operator`) and are told apart by its `operator` field's text.
+fn python_sql_string_interpolation_findings(
+    tree: &tree_sitter::Tree,
+    content: &str,
+) -> Vec<Finding> {
+    let ts_lang: TsLanguage = tree_sitter_python::LANGUAGE.into();
+    let query_src = r#"(call
+  function: (attribute
+    object: (_)
+    attribute: (identifier) @method)
+  arguments: (argument_list . (_) @arg)
+  (#match? @method "^(execute|executemany)$"))"#;
+    let query = match Query::new(&ts_lang, query_src) {
+        Ok(q) => q,
+        Err(_) => return vec![],
+    };
+    let arg_index = match query.capture_names().iter().position(|n| *n == "arg") {
+        Some(i) => i,
+        None => return vec![],
+    };
+
+    let reason = "SQL query built via string interpolation instead of parameterized query — if any interpolated value originates from external input, this is SQL-injectable; use parameterized queries (?, %s, or named placeholders) instead";
+    let mut findings = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index as usize != arg_index {
+                continue;
+            }
+            let node = cap.node;
+            let flagged = match node.kind() {
+                "string" => {
+                    let mut c = node.walk();
+                    let mut has_interpolation = false;
+                    for child in node.named_children(&mut c) {
+                        if child.kind() == "interpolation" {
+                            has_interpolation = true;
+                            break;
+                        }
+                    }
+                    has_interpolation
+                }
+                "binary_operator" => node
+                    .child_by_field_name("operator")
+                    .and_then(|op| op.utf8_text(content.as_bytes()).ok())
+                    .is_some_and(|op| op == "%" || op == "+"),
+                "call" => {
+                    node.child_by_field_name("function")
+                        .filter(|f| f.kind() == "attribute")
+                        .and_then(|f| f.child_by_field_name("attribute"))
+                        .and_then(|a| a.utf8_text(content.as_bytes()).ok())
+                        == Some("format")
+                }
+                _ => false,
+            };
+            if flagged {
+                findings.push(Finding {
+                    rule: "sql-string-interpolation",
+                    reason,
+                });
+            }
+        }
+    }
+    findings
+}
+
+/// JS/TS counterpart of `python_sql_string_interpolation_findings` (issue
+/// #257): `.query(...)`/`.execute(...)` calls (covers `mysql`, `pg`, and
+/// common query-builder raw-query methods) whose argument is a template
+/// literal containing `${...}` interpolation.
+fn js_sql_string_interpolation_findings(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    ts_lang: &TsLanguage,
+) -> Vec<Finding> {
+    let query_src = r#"(call_expression
+  function: (member_expression
+    object: (_)
+    property: (property_identifier) @method)
+  arguments: (arguments . (_) @arg)
+  (#match? @method "^(query|execute)$"))"#;
+    let query = match Query::new(ts_lang, query_src) {
+        Ok(q) => q,
+        Err(_) => return vec![],
+    };
+    let arg_index = match query.capture_names().iter().position(|n| *n == "arg") {
+        Some(i) => i,
+        None => return vec![],
+    };
+
+    let mut findings = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index as usize != arg_index {
+                continue;
+            }
+            let node = cap.node;
+            if node.kind() != "template_string" {
+                continue;
+            }
+            let mut c = node.walk();
+            let has_interpolation = node
+                .named_children(&mut c)
+                .any(|child| child.kind() == "template_substitution");
+            if has_interpolation {
+                findings.push(Finding {
+                    rule: "sql-string-interpolation",
+                    reason: "SQL query built via string interpolation instead of parameterized query — if any interpolated value originates from external input, this is SQL-injectable; use parameterized queries (?, %s, or named placeholders) instead",
+                });
+            }
+        }
+    }
+    findings
+}
+
 /// Parses `content` as `lang` and runs the rule set against the AST.
 /// Returns an empty vec (never fails closed) if the content fails to parse —
 /// scanning augments clawband's existing checks, it doesn't gate on its own
@@ -397,9 +536,13 @@ pub fn scan(content: &str, lang: Lang) -> Vec<Finding> {
     }
     if matches!(lang, Lang::Python) {
         findings.extend(python_yaml_load_findings(&tree, content));
+        findings.extend(python_sql_string_interpolation_findings(&tree, content));
     }
     if matches!(lang, Lang::JavaScript | Lang::TypeScript) {
         findings.extend(js_dynamic_module_load_findings(&tree, content, &ts_lang));
+        findings.extend(js_sql_string_interpolation_findings(
+            &tree, content, &ts_lang,
+        ));
     }
     findings
 }
@@ -1092,5 +1235,136 @@ mod tests {
     fn rust_has_no_dynamic_module_load_rule() {
         let findings = scan(r#"fn main() { let x = 1; }"#, Lang::Rust);
         assert!(!has_dynamic_module_load_finding(&findings));
+    }
+
+    // ── sql-string-interpolation (issue #257) ──
+
+    fn has_sql_string_interpolation_finding(findings: &[Finding]) -> bool {
+        findings
+            .iter()
+            .any(|f| f.rule == "sql-string-interpolation")
+    }
+
+    #[test]
+    fn python_flags_execute_fstring_with_interpolation() {
+        let findings = scan(r#"cursor.execute(f"SELECT * FROM {table}")"#, Lang::Python);
+        assert!(has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_execute_fstring_without_interpolation() {
+        // Required by issue #257: an f-string with no actual interpolation
+        // has no injection surface and must not flag.
+        let findings = scan(r#"cursor.execute(f"SELECT * FROM users")"#, Lang::Python);
+        assert!(!has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_parameterized_execute() {
+        // Required false-positive test from issue #257.
+        let findings = scan(
+            r#"cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))"#,
+            Lang::Python,
+        );
+        assert!(!has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_execute_percent_format() {
+        let findings = scan(
+            r#"cursor.execute("SELECT * FROM %s" % table)"#,
+            Lang::Python,
+        );
+        assert!(has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_execute_dot_format() {
+        let findings = scan(
+            r#"cursor.execute("SELECT * FROM {}".format(table))"#,
+            Lang::Python,
+        );
+        assert!(has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_execute_string_concat() {
+        let findings = scan(r#"cursor.execute("SELECT * FROM " + table)"#, Lang::Python);
+        assert!(has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_executemany_fstring() {
+        let findings = scan(
+            r#"cursor.executemany(f"INSERT INTO {table} VALUES (?)", rows)"#,
+            Lang::Python,
+        );
+        assert!(has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_execute_mention_in_comment() {
+        // Required false-positive test from issue #257.
+        let findings = scan(
+            "# cursor.execute(f\"SELECT * FROM {table}\") is bad\nprint(1)",
+            Lang::Python,
+        );
+        assert!(!has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_execute_mention_in_string_literal() {
+        // Required false-positive test from issue #257.
+        let findings = scan(r#"s = "cursor.execute(x)""#, Lang::Python);
+        assert!(!has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_query_template_literal_with_interpolation() {
+        // Required by issue #257.
+        let findings = scan(
+            "db.query(`SELECT * FROM users WHERE id = ${id}`)",
+            Lang::JavaScript,
+        );
+        assert!(has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_query_template_literal_without_interpolation() {
+        let findings = scan("db.query(`SELECT * FROM users`)", Lang::JavaScript);
+        assert!(!has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_parameterized_query() {
+        let findings = scan(
+            r#"db.query("SELECT * FROM users WHERE id = $1", [id])"#,
+            Lang::JavaScript,
+        );
+        assert!(!has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_execute_template_literal_with_interpolation() {
+        let findings = scan(
+            "connection.execute(`DELETE FROM users WHERE id = ${id}`)",
+            Lang::JavaScript,
+        );
+        assert!(has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_query_template_literal_with_interpolation() {
+        let findings = scan(
+            "db.query(`SELECT * FROM users WHERE id = ${id}`);",
+            Lang::TypeScript,
+        );
+        assert!(has_sql_string_interpolation_finding(&findings));
+    }
+
+    #[test]
+    fn rust_has_no_sql_string_interpolation_rule() {
+        let findings = scan(r#"fn main() { let x = 1; }"#, Lang::Rust);
+        assert!(!has_sql_string_interpolation_finding(&findings));
     }
 }
