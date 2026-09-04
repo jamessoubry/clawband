@@ -5133,14 +5133,55 @@ fn check_assign_then_exec(segments: &[String]) -> bool {
 /// Unlike a regex approach, this correctly handles inner parens such as Python
 /// function calls (e.g. `json.loads(x)`, `sys.stdin.read()`) without stopping
 /// at the first `(` or `)` inside the subshell.
-fn extract_dollar_parens(s: &str) -> (Vec<String>, String) {
+/// Extracts first-level `$(...)` command substitutions and `$((...))`
+/// arithmetic expansions from `s`, returning them in two separate lists
+/// (issue #273) plus the remaining text with both stripped out.
+///
+/// Arithmetic expansion `$((...))` is syntactically two nested parens
+/// (`$(` immediately followed by another `(`), which a naive `$(`-based
+/// balanced-paren extractor conflates with a command substitution that
+/// merely starts with a literal `(`. A single `$(cmd)` embedded inside
+/// `$((...))` for its numeric output (e.g. `$(( $(date +%s) - 300 ))`) is
+/// completely safe — an arithmetic context can't chain or execute further
+/// commands — so it must not be treated the same as genuine nested command
+/// substitution like `$(basename $(dirname "$x"))`. Keeping the two kinds in
+/// separate lists lets the caller still scan arithmetic bodies for embedded
+/// dangerous commands (via `check_command`) without flagging them as
+/// "nested subshell, can't fully evaluate."
+fn extract_dollar_parens(s: &str) -> (Vec<String>, Vec<String>, String) {
     let mut inner_cmds: Vec<String> = Vec::new();
+    let mut arithmetic_bodies: Vec<String> = Vec::new();
     let mut stripped = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     while i < len {
-        if i + 1 < len && bytes[i] == b'$' && bytes[i + 1] == b'(' {
+        if i + 2 < len && bytes[i] == b'$' && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+            // Arithmetic expansion $((...)) — depth starts at 2 to account
+            // for both opening parens already consumed structurally.
+            let mut depth = 2usize;
+            let mut j = i + 3;
+            while j < len && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                if depth > 0 {
+                    j += 1;
+                }
+            }
+            if depth == 0 {
+                // s[i+3..j] is the arithmetic body; s[j] == the final ')'.
+                let inner = s[i + 3..j].trim().to_string();
+                arithmetic_bodies.push(inner);
+                i = j + 1;
+            } else {
+                // Unmatched $(( — include in stripped and advance past it
+                stripped.push_str("$((");
+                i += 3;
+            }
+        } else if i + 1 < len && bytes[i] == b'$' && bytes[i + 1] == b'(' {
             let mut depth = 1usize;
             let mut j = i + 2;
             while j < len && depth > 0 {
@@ -5171,7 +5212,7 @@ fn extract_dollar_parens(s: &str) -> (Vec<String>, String) {
             i += ch.len_utf8();
         }
     }
-    (inner_cmds, stripped)
+    (inner_cmds, arithmetic_bodies, stripped)
 }
 
 fn check_subshells(
@@ -5196,13 +5237,15 @@ fn check_subshells(
         ));
     }
 
-    // Extract first-level $(...) using balanced-paren parser; backtick extractor unchanged.
-    let (dp_inner_cmds, dp_stripped) = extract_dollar_parens(command);
+    // Extract first-level $(...) and $((...)) using balanced-paren parser;
+    // backtick extractor unchanged.
+    let (dp_inner_cmds, dp_arith_bodies, dp_stripped) = extract_dollar_parens(command);
     let bt_re = Regex::new(r"`([^`]*)`").unwrap();
 
     let inner_cmds: Vec<String> = dp_inner_cmds
         .iter()
         .cloned()
+        .chain(dp_arith_bodies.iter().cloned())
         .chain(
             bt_re
                 .captures_iter(command)
@@ -5212,7 +5255,11 @@ fn check_subshells(
         .collect();
 
     // Detect genuine nesting: a $() whose inner content itself contains $(),
-    // leftover unmatched $( after extraction, or nested backticks.
+    // leftover unmatched $( after extraction, or nested backticks. Arithmetic
+    // bodies are deliberately excluded here (issue #273) — a single $(cmd)
+    // embedded in $((...)) for its numeric output is not risky nesting, since
+    // an arithmetic context can't chain or execute further commands; the
+    // embedded command is still scanned for danger via `inner_cmds` above.
     let nested_dp = dp_inner_cmds.iter().find(|s| s.contains("$(")).cloned();
     let bt_stripped = bt_re.replace_all(&dp_stripped, "");
     let has_residual = nested_dp.is_some()
@@ -7440,6 +7487,40 @@ mod tests {
     fn nested_subshell_asks() {
         // Nested $() can't be fully extracted — fall back to ask
         assert_eq!(full_decision("echo $(echo $(date))"), Some("ask".into()));
+    }
+
+    // ── issue #273: arithmetic expansion is not nested-subshell risk ─────────
+
+    #[test]
+    fn arithmetic_expansion_with_embedded_dollar_paren_passes() {
+        // $(( $(cmd) - N )) is a completely safe timestamp-math idiom — a
+        // single command substitution embedded for its numeric output, not
+        // genuine subshell chaining. Must NOT ask.
+        assert_eq!(full_decision("START=$(( $(date -u +%s) - 300 ))000"), None);
+    }
+
+    #[test]
+    fn arithmetic_expansion_multiplication_passes() {
+        assert_eq!(
+            full_decision("COUNT=$(( $(date +%s) * 1000 - 3600000 ))"),
+            None
+        );
+    }
+
+    #[test]
+    fn arithmetic_expansion_no_embedded_command_passes() {
+        assert_eq!(full_decision("N=$(( 1 + 2 ))"), None);
+    }
+
+    #[test]
+    fn genuine_nested_command_substitution_still_asks_273() {
+        // basename $(dirname "$x") — a real two-level command substitution,
+        // not arithmetic — must still ask; this is the case #273 must not
+        // regress.
+        assert_eq!(
+            full_decision(r#"repo=$(basename $(dirname "$gitdir"))"#),
+            Some("ask".into())
+        );
     }
 
     #[test]
