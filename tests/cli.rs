@@ -2623,6 +2623,38 @@ fn e2e_genuine_nested_command_substitution_still_asks_273() {
     );
 }
 
+// ── issue #274: escaped backtick in a data-command pattern is not a subshell ──
+
+#[test]
+fn e2e_escaped_backtick_in_grep_pattern_passes_274() {
+    let cmd = r#"grep -n "^\[.*\]\|^- \`\[" scratchbook/property-catalog.md | head -30"#;
+    let out = run(&bash(cmd), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "escaped backtick in a grep search pattern must not ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_escaped_backtick_in_grep_alternation_pattern_passes_274() {
+    let cmd = r#"grep -n "three rules\|dynamic-eval\`:\|shell-invoking-subprocess\`:\|insecure-deserialize\`:\|covers three rules" README.md"#;
+    let out = run(&bash(cmd), &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_genuine_backtick_command_substitution_still_denies_274() {
+    // Unescaped backticks are still real command substitution and must
+    // still be caught — this fix must not regress that detection.
+    let out = run(&bash(r#"echo "`rm -rf /`""#), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "genuine backtick command substitution of a dangerous command must still deny: {out}"
+    );
+}
+
 #[test]
 fn e2e_subshell_git_log_head_passes() {
     let out = run(&bash("VAR=$(git log --format=%H | head -1)"), &[]);

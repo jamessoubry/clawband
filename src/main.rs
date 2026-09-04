@@ -5221,13 +5221,24 @@ fn check_subshells(
     ask_pats: &[Pattern],
     allow_pats: &[Pattern],
 ) -> Option<(&'static str, String)> {
-    if !command.contains("$(") && !command.contains('`') {
+    // Escaped backticks (`\``) are never command-substitution syntax — bash
+    // treats a backslash-escaped backtick as a literal character regardless
+    // of quoting context (issue #274: a grep pattern searching for markdown
+    // code-fence syntax like `` `foo`: `` was misread as backtick command
+    // substitution, since a raw backtick-matching regex can't tell an escaped
+    // literal backtick apart from a real command-substitution delimiter).
+    // Neutralize them before any backtick-based detection below so they can
+    // never be mistaken for real subshell delimiters — this only affects
+    // detection/extraction, the original `command` is untouched.
+    let bt_safe = command.replace("\\`", "\u{0}");
+
+    if !bt_safe.contains("$(") && !bt_safe.contains('`') {
         return None;
     }
 
     // If the command itself IS a subshell ($(...) or `...` as the command, not an
     // argument), the output becomes the next command — we can't know what it'll be.
-    let trimmed = command.trim();
+    let trimmed = bt_safe.trim();
     if trimmed.starts_with("$(") || trimmed.starts_with('`') {
         return Some((
             "ask",
@@ -5238,8 +5249,10 @@ fn check_subshells(
     }
 
     // Extract first-level $(...) and $((...)) using balanced-paren parser;
-    // backtick extractor unchanged.
-    let (dp_inner_cmds, dp_arith_bodies, dp_stripped) = extract_dollar_parens(command);
+    // backtick extractor unchanged. Both operate on `bt_safe` so escaped
+    // backticks stay neutralized throughout (including in the residual-
+    // detection stripped text below).
+    let (dp_inner_cmds, dp_arith_bodies, dp_stripped) = extract_dollar_parens(&bt_safe);
     let bt_re = Regex::new(r"`([^`]*)`").unwrap();
 
     let inner_cmds: Vec<String> = dp_inner_cmds
@@ -5248,7 +5261,7 @@ fn check_subshells(
         .chain(dp_arith_bodies.iter().cloned())
         .chain(
             bt_re
-                .captures_iter(command)
+                .captures_iter(&bt_safe)
                 .map(|c| c[1].trim().to_string()),
         )
         .filter(|s| !s.is_empty())
@@ -7521,6 +7534,38 @@ mod tests {
             full_decision(r#"repo=$(basename $(dirname "$gitdir"))"#),
             Some("ask".into())
         );
+    }
+
+    // ── issue #274: escaped backtick in a data-command pattern is not a subshell ──
+
+    #[test]
+    fn escaped_backtick_in_grep_pattern_passes_274() {
+        // A grep pattern searching for markdown code-fence syntax with an
+        // escaped backtick must not be mistaken for command substitution.
+        assert_eq!(
+            full_decision(
+                r#"grep -n "^\[.*\]\|^- \`\[" scratchbook/property-catalog.md | head -30"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn escaped_backtick_in_grep_alternation_pattern_passes_274() {
+        assert_eq!(
+            full_decision(
+                r#"grep -n "three rules\|dynamic-eval\`:\|shell-invoking-subprocess\`:\|insecure-deserialize\`:\|covers three rules" README.md"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn genuine_backtick_command_substitution_still_asks_274() {
+        // Unescaped backticks are still real command substitution and must
+        // still be caught — this fix must not regress that detection.
+        assert_eq!(full_decision("echo `date`"), None);
+        assert_eq!(full_decision(r#"echo "`rm -rf /`""#), Some("deny".into()));
     }
 
     #[test]
