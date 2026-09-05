@@ -4525,3 +4525,84 @@ fn e2e_exec_real_call_in_script_file_still_asks() {
         "genuine exec() call in a script file must still ask (issue #247): {out}"
     );
 }
+
+// ── issue #278: stale breadcrumb cleanup / detection ───────────────────────
+
+/// Run `clawband verify` with HOME pointed at `home` and return stdout.
+fn run_verify(home: &std::path::Path) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_clawband"));
+    cmd.arg("verify")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("HOME", home);
+    let out = cmd.output().expect("run clawband verify");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Set a file's mtime to `age_secs` in the past, creating it if needed.
+fn touch_with_age(path: &std::path::Path, age_secs: u64) {
+    std::fs::write(path, b"x").unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+    let times = std::fs::FileTimes::new().set_modified(old);
+    f.set_times(times).unwrap();
+}
+
+#[test]
+fn e2e_verify_warns_on_stale_breadcrumbs() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg = home.path().join(".clawband");
+    std::fs::create_dir_all(&cfg).unwrap();
+    touch_with_age(&cfg.join(".ask-toolu_stale1"), 4000);
+    touch_with_age(&cfg.join(".ask-toolu_stale2"), 9000);
+
+    let out = run_verify(home.path());
+    assert!(
+        out.contains("stale breadcrumb file(s) found"),
+        "verify should warn about stale breadcrumbs: {out}"
+    );
+    assert!(
+        out.contains("PostToolUse"),
+        "warning should point at the PostToolUse hook registration: {out}"
+    );
+}
+
+#[test]
+fn e2e_verify_no_warning_when_no_stale_breadcrumbs() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg = home.path().join(".clawband");
+    std::fs::create_dir_all(&cfg).unwrap();
+    touch_with_age(&cfg.join(".ask-toolu_fresh"), 10);
+
+    let out = run_verify(home.path());
+    assert!(
+        out.contains("no stale breadcrumb files"),
+        "verify should not warn when breadcrumbs are fresh: {out}"
+    );
+    assert!(!out.contains("stale breadcrumb file(s) found"), "{out}");
+}
+
+#[test]
+fn e2e_main_hook_opportunistically_cleans_stale_breadcrumbs() {
+    // Defense in depth: even without ever invoking `clawband post`, a normal
+    // Bash hook invocation through the main path should sweep stale `.ask-*`
+    // breadcrumbs once the throttle marker allows it (fresh HOME => no marker
+    // yet => runs immediately).
+    let home = tempfile::tempdir().unwrap();
+    let cfg = home.path().join(".clawband");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let stale = cfg.join(".ask-toolu_stale");
+    let fresh = cfg.join(".ask-toolu_fresh");
+    touch_with_age(&stale, 400); // older than the 300s TTL
+    touch_with_age(&fresh, 10);
+
+    let out = run(&bash("ls -la"), &[("HOME", home.path().to_str().unwrap())]);
+    assert_eq!(decision(&out), None);
+
+    assert!(
+        !stale.exists(),
+        "stale breadcrumb should be swept by the opportunistic cleanup on the hot path"
+    );
+    assert!(fresh.exists(), "fresh breadcrumb should survive");
+}

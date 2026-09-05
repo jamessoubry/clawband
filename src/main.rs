@@ -2290,12 +2290,11 @@ fn write_ask_breadcrumb(cmd: &str, reason: &str, call_id: &str) {
     }
 }
 
-/// Delete `.ask-*` breadcrumb files in the config dir that are older than 5 minutes.
-/// Called by `cmd_post` to prevent orphaned crumbs (denied commands whose PostToolUse
-/// never fires) from accumulating indefinitely.
-fn cleanup_stale_breadcrumbs() {
-    let cfg = config_dir();
-    let Ok(entries) = fs::read_dir(&cfg) else {
+/// Delete `.ask-*` breadcrumb files in `dir` that are older than 5 minutes.
+/// Shared implementation used by both `cleanup_stale_breadcrumbs()` (real config dir)
+/// and unit tests (temp dirs).
+fn cleanup_stale_breadcrumbs_in(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -2313,6 +2312,51 @@ fn cleanup_stale_breadcrumbs() {
                 }
             }
         }
+    }
+}
+
+/// Delete `.ask-*` breadcrumb files in the config dir that are older than 5 minutes.
+/// Called by `cmd_post` to prevent orphaned crumbs (denied commands whose PostToolUse
+/// never fires) from accumulating indefinitely.
+fn cleanup_stale_breadcrumbs() {
+    cleanup_stale_breadcrumbs_in(&config_dir());
+}
+
+/// Marker file used to throttle opportunistic breadcrumb cleanup from the hot
+/// PreToolUse path — we only want to pay the `read_dir` cost at most once per
+/// `interval_secs`, not on every single command.
+const BREADCRUMB_CLEANUP_MARKER: &str = ".breadcrumb-cleanup-marker";
+
+/// True if it has been at least `interval_secs` since the marker file at
+/// `marker_path` was last touched (or if it doesn't exist yet). Pure/testable —
+/// takes `now` explicitly rather than reading `SystemTime::now()` internally.
+fn should_run_opportunistic_cleanup(
+    marker_path: &Path,
+    now: std::time::SystemTime,
+    interval_secs: u64,
+) -> bool {
+    match fs::metadata(marker_path).and_then(|m| m.modified()) {
+        Ok(modified) => now
+            .duration_since(modified)
+            .map(|d| d.as_secs() >= interval_secs)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// Defense in depth for issue #278: `cleanup_stale_breadcrumbs()` is normally only
+/// invoked from `cmd_post` (the PostToolUse companion hook). On hosts where the
+/// PostToolUse registration is missing or broken, breadcrumbs accumulate without
+/// bound. This is called opportunistically from the main PreToolUse path — every
+/// invocation checks a cheap marker-file mtime, and only actually scans the config
+/// dir (and rewrites the marker) once per hour at most.
+fn maybe_cleanup_stale_breadcrumbs_opportunistic() {
+    let cfg = config_dir();
+    let marker = cfg.join(BREADCRUMB_CLEANUP_MARKER);
+    if should_run_opportunistic_cleanup(&marker, std::time::SystemTime::now(), 3600) {
+        cleanup_stale_breadcrumbs_in(&cfg);
+        let _ = fs::create_dir_all(&cfg);
+        let _ = fs::write(&marker, b"");
     }
 }
 
@@ -3541,6 +3585,52 @@ fn cmd_trust(args: &[&str]) {
     println!("[CLAWBAND] Trusted: {}", canonical.display());
 }
 
+/// Scan `dir` for `.ask-*` breadcrumb files older than `threshold_secs`.
+/// Returns `Some((count, oldest_age_secs))` if any are found, else `None`.
+/// Used by `cmd_verify` to detect a broken/missing PostToolUse hook registration
+/// (issue #278) — if breadcrumbs are piling up past the threshold, the normal
+/// `cmd_post`-driven cleanup clearly isn't running on this host.
+fn find_stale_breadcrumbs(dir: &Path, threshold_secs: u64) -> Option<(usize, u64)> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut count = 0usize;
+    let mut oldest = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with(".ask-") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(age) = modified.elapsed() {
+                    let secs = age.as_secs();
+                    if secs > threshold_secs {
+                        count += 1;
+                        oldest = oldest.max(secs);
+                    }
+                }
+            }
+        }
+    }
+    if count > 0 {
+        Some((count, oldest))
+    } else {
+        None
+    }
+}
+
+/// Human-readable "Xh Ym" formatting for a stale-breadcrumb age, used in the
+/// `cmd_verify` warning.
+fn format_age_secs(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
 fn cmd_verify() -> i32 {
     let g = "\x1b[32m";
     let y = "\x1b[33m";
@@ -3667,6 +3757,20 @@ fn cmd_verify() -> i32 {
         println!(
             "  {d}self-protect: off{r}  {d}(run: clawband install --protect to add user-defined protected paths){r}"
         );
+    }
+
+    // 11. Stale breadcrumb accumulation (issue #278) — informational warning, not
+    // a hard failure. If `.ask-*` files are piling up past an hour old, the
+    // PostToolUse-driven cleanup in `cmd_post` isn't running on this host.
+    if let Some((count, oldest_secs)) = find_stale_breadcrumbs(&cfg, 3600) {
+        println!(
+            "  {warn} {count} stale breadcrumb file(s) found (oldest: {}) — this usually means \
+the PostToolUse hook isn't registered; try `clawband install` or check {}",
+            format_age_secs(oldest_secs),
+            sp.display()
+        );
+    } else {
+        println!("  {ok} no stale breadcrumb files");
     }
 
     if failures == 0 {
@@ -6140,6 +6244,12 @@ fn main() {
     let config = load_config();
     let mode = resolve_mode(mode_flag.as_deref(), config.file_mode);
     let ask_fallback = config.ask_fallback;
+
+    // Defense in depth (issue #278): opportunistically sweep stale `.ask-*`
+    // breadcrumbs from the hot path too, in case the PostToolUse companion hook
+    // (the primary cleanup path, in `cmd_post`) is missing or broken on this host.
+    // Throttled internally to at most once per hour — negligible overhead.
+    maybe_cleanup_stale_breadcrumbs_opportunistic();
 
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
@@ -13173,5 +13283,112 @@ mod tests {
         );
         // And check_command must indeed deny it
         assert_eq!(decision(cmd), Some("deny".to_string()));
+    }
+
+    // ── issue #278: stale breadcrumb cleanup / detection ───────────────────────
+
+    fn touch_with_age(path: &Path, age_secs: u64) {
+        fs::write(path, b"x").unwrap();
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        let times = fs::FileTimes::new().set_modified(old);
+        f.set_times(times).unwrap();
+    }
+
+    #[test]
+    fn should_run_opportunistic_cleanup_no_marker_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".breadcrumb-cleanup-marker");
+        assert!(should_run_opportunistic_cleanup(
+            &marker,
+            std::time::SystemTime::now(),
+            3600
+        ));
+    }
+
+    #[test]
+    fn should_run_opportunistic_cleanup_recent_marker_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".breadcrumb-cleanup-marker");
+        touch_with_age(&marker, 10); // touched 10s ago
+        assert!(!should_run_opportunistic_cleanup(
+            &marker,
+            std::time::SystemTime::now(),
+            3600
+        ));
+    }
+
+    #[test]
+    fn should_run_opportunistic_cleanup_old_marker_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".breadcrumb-cleanup-marker");
+        touch_with_age(&marker, 4000); // older than the 3600s interval
+        assert!(should_run_opportunistic_cleanup(
+            &marker,
+            std::time::SystemTime::now(),
+            3600
+        ));
+    }
+
+    #[test]
+    fn cleanup_stale_breadcrumbs_in_removes_old_keeps_fresh_and_unrelated() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_crumb = dir.path().join(".ask-toolu_old");
+        let fresh_crumb = dir.path().join(".ask-toolu_fresh");
+        let unrelated = dir.path().join("deny.patterns");
+
+        touch_with_age(&old_crumb, 400); // older than the 300s TTL
+        touch_with_age(&fresh_crumb, 10); // within TTL
+        touch_with_age(&unrelated, 400); // not a breadcrumb — must survive regardless of age
+
+        cleanup_stale_breadcrumbs_in(dir.path());
+
+        assert!(!old_crumb.exists(), "stale breadcrumb should be removed");
+        assert!(fresh_crumb.exists(), "fresh breadcrumb should survive");
+        assert!(
+            unrelated.exists(),
+            "non-breadcrumb files must never be touched"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_breadcrumbs_in_missing_dir_is_noop() {
+        // Must not panic when the config dir doesn't exist at all.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        cleanup_stale_breadcrumbs_in(&missing);
+    }
+
+    #[test]
+    fn find_stale_breadcrumbs_none_when_all_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_with_age(&dir.path().join(".ask-toolu_a"), 10);
+        assert_eq!(find_stale_breadcrumbs(dir.path(), 3600), None);
+    }
+
+    #[test]
+    fn find_stale_breadcrumbs_detects_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_with_age(&dir.path().join(".ask-toolu_a"), 4000);
+        touch_with_age(&dir.path().join(".ask-toolu_b"), 8000);
+        touch_with_age(&dir.path().join(".ask-toolu_c"), 10); // fresh, not counted
+        touch_with_age(&dir.path().join("allow.patterns"), 9000); // not a breadcrumb
+
+        let result = find_stale_breadcrumbs(dir.path(), 3600);
+        assert_eq!(result, Some((2, 8000)));
+    }
+
+    #[test]
+    fn find_stale_breadcrumbs_empty_dir_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(find_stale_breadcrumbs(dir.path(), 3600), None);
+    }
+
+    #[test]
+    fn format_age_secs_formats_hours_and_minutes() {
+        assert_eq!(format_age_secs(30), "0m");
+        assert_eq!(format_age_secs(90), "1m");
+        assert_eq!(format_age_secs(3600), "1h 0m");
+        assert_eq!(format_age_secs(3900), "1h 5m");
     }
 }
