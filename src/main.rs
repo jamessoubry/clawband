@@ -12413,9 +12413,9 @@ mod tests {
         fs::write(&trusted_path, format!("{key} {hash}\n")).unwrap();
         // Override HOME for the duration of this assertion
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
         let result = is_project_allow_trusted(&allow_path);
-        std::env::set_var("HOME", orig_home);
+        std::env::set_var(ENV_HOME, orig_home);
         assert!(result, "allow.patterns with correct hash must be trusted");
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -12439,9 +12439,9 @@ mod tests {
         )
         .unwrap();
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
         let result = is_project_allow_trusted(&allow_path);
-        std::env::set_var("HOME", orig_home);
+        std::env::set_var(ENV_HOME, orig_home);
         assert!(
             !result,
             "allow.patterns with wrong hash must not be trusted"
@@ -12468,9 +12468,9 @@ mod tests {
     fn skip_flag_absent_when_no_file() {
         let fake_home = fake_home_for_skip_test("absent");
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
         let state = check_skip_flag();
-        std::env::set_var("HOME", orig_home);
+        std::env::set_var(ENV_HOME, orig_home);
         assert_eq!(state, SkipFlagState::Absent);
         let _ = fs::remove_dir_all(&fake_home);
     }
@@ -12484,9 +12484,9 @@ mod tests {
         fs::set_permissions(&flag, fs::Permissions::from_mode(0o600)).unwrap();
 
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
         let state = check_skip_flag();
-        std::env::set_var("HOME", orig_home);
+        std::env::set_var(ENV_HOME, orig_home);
         assert_eq!(
             state,
             SkipFlagState::Active,
@@ -12505,9 +12505,9 @@ mod tests {
         fs::set_permissions(&flag, fs::Permissions::from_mode(0o666)).unwrap();
 
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
         let state = check_skip_flag();
-        std::env::set_var("HOME", orig_home);
+        std::env::set_var(ENV_HOME, orig_home);
         match state {
             SkipFlagState::Rejected(_) => {}
             other => panic!("expected Rejected for world-writable flag file, got {other:?}"),
@@ -12525,9 +12525,9 @@ mod tests {
         fs::set_permissions(&flag, fs::Permissions::from_mode(0o620)).unwrap();
 
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
         let state = check_skip_flag();
-        std::env::set_var("HOME", orig_home);
+        std::env::set_var(ENV_HOME, orig_home);
         match state {
             SkipFlagState::Rejected(_) => {}
             other => panic!("expected Rejected for group-writable flag file, got {other:?}"),
@@ -12540,7 +12540,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let fake_home = fake_home_for_skip_test("cli_enable");
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
 
         cmd_skip(&["enable".to_string()]);
         let flag = fake_home.join(".clawband/skip");
@@ -12553,7 +12553,7 @@ mod tests {
             "a freshly-enabled flag must be Active"
         );
 
-        std::env::set_var("HOME", orig_home);
+        std::env::set_var(ENV_HOME, orig_home);
         let _ = fs::remove_dir_all(&fake_home);
     }
 
@@ -12561,7 +12561,7 @@ mod tests {
     fn cmd_skip_disable_removes_file() {
         let fake_home = fake_home_for_skip_test("cli_disable");
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
 
         cmd_skip(&["enable".to_string()]);
         let flag = fake_home.join(".clawband/skip");
@@ -12574,7 +12574,7 @@ mod tests {
         // disabling again (already-absent) must not panic or error out
         cmd_skip(&["disable".to_string()]);
 
-        std::env::set_var("HOME", orig_home);
+        std::env::set_var(ENV_HOME, orig_home);
         let _ = fs::remove_dir_all(&fake_home);
     }
 
