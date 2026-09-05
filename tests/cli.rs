@@ -846,14 +846,14 @@ fn e2e_echo_dollar_home_no_false_positive() {
 #[test]
 fn e2e_scan_nonregular_file_no_hang() {
     // Ask clawband to evaluate `bash /dev/stdin` — the hook must not hang trying
-    // to read the non-regular file and must return no decision (safe skip).
+    // to read the non-regular file, and must fail closed with an ask rather
+    // than silently letting unreviewed content through (issue #282).
     let out = run(&bash("bash /dev/stdin"), &[]);
-    // No hang means we reach this assertion. The decision should be None
-    // (no pattern fires on the command itself; script scan skips /dev/stdin).
+    // No hang means we reach this assertion.
     assert_eq!(
         decision(&out),
-        None,
-        "non-regular script path should be skipped without hanging"
+        Some("ask"),
+        "non-regular script path should ask, not be silently skipped"
     );
 }
 

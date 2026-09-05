@@ -1711,11 +1711,24 @@ fn scan_script_file(
     ask_pats: &[Pattern],
     allow_pats: &[Pattern],
 ) -> Option<(String, String)> {
-    // Skip non-regular files (FIFOs, devices, sockets, /dev/stdin, etc.) to
-    // avoid hanging the hook on a blocking read. (Separate issue #282.)
+    // Non-regular files (FIFOs, devices, sockets, /dev/stdin, /dev/fd/N,
+    // process-substitution targets, etc.) must never be opened/read here —
+    // doing so risks a blocking read that hangs the hook indefinitely. But
+    // "can't inspect" must not be silently treated as "safe": these paths are
+    // exactly how `bash < /dev/stdin`, `source /dev/fd/N`, and
+    // `bash < <(...)` smuggle unreviewed content past a naive scanner. Detect
+    // this purely from filesystem metadata (no open/read of the file's
+    // content) and fail closed with an ask (issue #282, mirrors the #281 fix
+    // for oversized files).
     let meta = fs::metadata(path).ok()?;
     if !meta.file_type().is_file() {
-        return None;
+        return Some((
+            "ask".into(),
+            format!(
+                "Script target {path} is not a regular file (FIFO, device, socket, or similar) \u{2014} \
+                 its contents could not be safely inspected without risking a hang. Review it manually before running.\n"
+            ),
+        ));
     }
     // Files over the size cap are never pulled into memory for scanning — but
     // "couldn't inspect" must not be silently treated as "safe". Fail closed
@@ -10557,13 +10570,65 @@ mod tests {
     // ── Item #4: scan_script_file robustness ──────────────────────────────────
 
     #[test]
-    fn scan_script_file_nonregular_skipped() {
-        // /dev/stdin is a non-regular file — the scanner must skip it silently
-        // without hanging. (If the machine doesn't have /dev/stdin this is a
-        // no-op pass, which is also acceptable behaviour.)
+    fn scan_script_file_nonregular_asks() {
+        // /dev/stdin is a non-regular file. Previously the scanner silently
+        // skipped it (issue #282: uninspectable content treated as safe,
+        // letting `bash < /dev/stdin` etc. bypass review entirely). It must
+        // now fail closed with an ask, without ever opening/reading the file
+        // (which could block indefinitely on a FIFO-like target).
+        let meta = fs::metadata("/dev/stdin");
+        if meta.is_err() {
+            // No /dev/stdin on this machine — nothing to assert.
+            return;
+        }
         let result = scan_script_file("/dev/stdin", &deny_pats(), &ask_pats(), &no_allow());
-        // Must not hang and must return None (no decision on non-regular file).
-        assert_eq!(result, None);
+        assert_eq!(
+            result.as_ref().map(|(d, _)| d.as_str()),
+            Some("ask"),
+            "non-regular script target must ask, not silently pass"
+        );
+    }
+
+    #[test]
+    fn scan_script_file_fifo_asks_without_hanging() {
+        // A real named pipe (FIFO) must trigger ask purely from metadata —
+        // the scanner must never open/read it, since that would block
+        // indefinitely with nothing on the other end. This test completing
+        // at all (rather than hanging) is itself part of the assertion.
+        use std::os::unix::net::UnixListener;
+
+        // mkfifo isn't in std; shell out to the `mkfifo` coreutil which is
+        // present on every CI Linux image we run on.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("test.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                let path = fifo_path.to_str().unwrap().to_string();
+                let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
+                assert_eq!(
+                    result.as_ref().map(|(d, _)| d.as_str()),
+                    Some("ask"),
+                    "FIFO script target must ask, not silently pass"
+                );
+            }
+            _ => {
+                // mkfifo unavailable on this machine — fall back to a unix
+                // socket, which is also a non-regular file type and doesn't
+                // require reads to construct.
+                let sock_path = dir.path().join("test.sock");
+                let _listener = UnixListener::bind(&sock_path).unwrap();
+                let path = sock_path.to_str().unwrap().to_string();
+                let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
+                assert_eq!(
+                    result.as_ref().map(|(d, _)| d.as_str()),
+                    Some("ask"),
+                    "socket script target must ask, not silently pass"
+                );
+            }
+        }
     }
 
     #[test]
