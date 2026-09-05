@@ -4606,3 +4606,76 @@ fn e2e_main_hook_opportunistically_cleans_stale_breadcrumbs() {
     );
     assert!(fresh.exists(), "fresh breadcrumb should survive");
 }
+
+// ── issue #281: oversized scripts must ASK, never silently pass ──────────────
+
+const SCRIPT_SCAN_MAX_BYTES_TEST: usize = 1024 * 1024; // must match SCRIPT_SCAN_MAX_BYTES
+
+#[test]
+fn e2e_oversized_script_with_benign_content_asks() {
+    // A script over the 1 MiB scan limit filled with harmless content must
+    // still ASK — "couldn't inspect" must not be silently treated as safe.
+    let mut f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    let line = "echo hello\n";
+    let needed = (SCRIPT_SCAN_MAX_BYTES_TEST / line.len()) + 1;
+    for _ in 0..needed {
+        write!(f, "{line}").unwrap();
+    }
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "oversized benign script must ask, not pass silently: {out}"
+    );
+}
+
+#[test]
+fn e2e_oversized_script_with_dangerous_content_asks() {
+    // A script over the scan limit that hides a destructive command past the
+    // padding must also ASK (the content is never reached for inspection).
+    let mut f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    writeln!(f, "#!/bin/bash").unwrap();
+    let line = "echo padding\n";
+    let needed = (SCRIPT_SCAN_MAX_BYTES_TEST / line.len()) + 1;
+    for _ in 0..needed {
+        write!(f, "{line}").unwrap();
+    }
+    writeln!(f, "rm -rf /").unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "oversized script hiding a dangerous command must ask, not pass: {out}"
+    );
+}
+
+#[test]
+fn e2e_script_just_under_limit_scans_normally() {
+    // A script just under the scan limit must behave exactly as before —
+    // content-based scanning, no regression from the #281 fix.
+    let mut f = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    let header = "#!/bin/bash\n";
+    write!(f, "{header}").unwrap();
+    let line = "# padding line to bulk up the file safely\n";
+    let dangerous = "rm -rf /\n";
+    let budget = SCRIPT_SCAN_MAX_BYTES_TEST - header.len() - dangerous.len() - 1;
+    let needed = budget / line.len();
+    for _ in 0..needed {
+        write!(f, "{line}").unwrap();
+    }
+    write!(f, "{dangerous}").unwrap();
+    let meta = std::fs::metadata(f.path()).unwrap();
+    assert!(
+        meta.len() as usize <= SCRIPT_SCAN_MAX_BYTES_TEST,
+        "test file must be at or under the scan limit"
+    );
+    let path = f.path().to_str().unwrap().to_string();
+    let out = run(&bash(&format!("bash {path}")), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "script under the size limit must be scanned normally and catch the dangerous line: {out}"
+    );
+}
