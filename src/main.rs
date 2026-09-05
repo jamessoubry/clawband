@@ -1712,14 +1712,26 @@ fn scan_script_file(
     allow_pats: &[Pattern],
 ) -> Option<(String, String)> {
     // Skip non-regular files (FIFOs, devices, sockets, /dev/stdin, etc.) to
-    // avoid hanging the hook on a blocking read.  Also skip files over the size
-    // cap so we never pull a huge file into memory.
+    // avoid hanging the hook on a blocking read. (Separate issue #282.)
     let meta = fs::metadata(path).ok()?;
     if !meta.file_type().is_file() {
         return None;
     }
+    // Files over the size cap are never pulled into memory for scanning — but
+    // "couldn't inspect" must not be silently treated as "safe". Fail closed
+    // with an ask so a human reviews it (issue #281). The size cap remains a
+    // performance guard only, not a security decision.
     if meta.len() > SCRIPT_SCAN_MAX_BYTES {
-        return None;
+        return Some((
+            "ask".into(),
+            format!(
+                "Script file {} is {} bytes, exceeding the {} byte scan limit \u{2014} \
+                 its contents could not be inspected. Review the file manually before running.\n",
+                path,
+                meta.len(),
+                SCRIPT_SCAN_MAX_BYTES
+            ),
+        ));
     }
     let content = fs::read_to_string(path).ok()?;
 
@@ -10555,12 +10567,13 @@ mod tests {
     }
 
     #[test]
-    fn scan_script_oversized_file_skipped() {
+    fn scan_script_oversized_benign_content_asks() {
+        // Oversized file containing only benign content must still ASK — the
+        // decision is "couldn't inspect", not "inspected and found nothing"
+        // (issue #281: uninspectable content must never be silently allowed).
         use std::io::Write;
         let tmp = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
-        // Write a file larger than SCRIPT_SCAN_MAX_BYTES (1 MiB).
-        // Fill with benign content so the only reason to skip is size.
         let mut f = fs::File::create(&path).unwrap();
         let line = b"echo hello\n";
         let needed = (SCRIPT_SCAN_MAX_BYTES as usize / line.len()) + 1;
@@ -10570,8 +10583,66 @@ mod tests {
         drop(f);
         let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
         assert_eq!(
-            result, None,
-            "oversized file should be skipped (no decision)"
+            result.as_ref().map(|(d, _)| d.as_str()),
+            Some("ask"),
+            "oversized file must fail closed with ask, even with benign content"
+        );
+    }
+
+    #[test]
+    fn scan_script_oversized_dangerous_content_still_asks() {
+        // Oversized file with a genuinely dangerous command padded far past the
+        // limit must ALSO ask (not silently pass) — content is never reached
+        // because the size check happens before any read (issue #281).
+        use std::io::Write;
+        let tmp = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(b"#!/bin/bash\n").unwrap();
+        let line = b"echo padding\n";
+        let needed = (SCRIPT_SCAN_MAX_BYTES as usize / line.len()) + 1;
+        for _ in 0..needed {
+            f.write_all(line).unwrap();
+        }
+        f.write_all(b"rm -rf /\n").unwrap();
+        drop(f);
+        let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
+        assert_eq!(
+            result.as_ref().map(|(d, _)| d.as_str()),
+            Some("ask"),
+            "oversized file must ask even when it hides a dangerous command"
+        );
+    }
+
+    #[test]
+    fn scan_script_just_under_limit_behaves_normally() {
+        // A file just under the size cap must be scanned as before — content
+        // determines the decision, no regression from the #281 fix.
+        use std::io::Write;
+        let tmp = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(b"#!/bin/bash\n").unwrap();
+        let line = b"# padding line to bulk up the file safely\n";
+        let header_len = b"#!/bin/bash\n".len();
+        let dangerous = b"rm -rf /\n";
+        let budget = SCRIPT_SCAN_MAX_BYTES as usize - header_len - dangerous.len() - 1;
+        let needed = budget / line.len();
+        for _ in 0..needed {
+            f.write_all(line).unwrap();
+        }
+        f.write_all(dangerous).unwrap();
+        drop(f);
+        let meta = fs::metadata(&path).unwrap();
+        assert!(
+            meta.len() <= SCRIPT_SCAN_MAX_BYTES,
+            "test file must be at or under the scan limit"
+        );
+        let result = scan_script_file(&path, &deny_pats(), &ask_pats(), &no_allow());
+        assert_eq!(
+            result.as_ref().map(|(d, _)| d.as_str()),
+            Some("deny"),
+            "file under the size limit must be scanned normally and catch the dangerous line"
         );
     }
 
