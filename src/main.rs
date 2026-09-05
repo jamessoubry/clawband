@@ -353,6 +353,104 @@ fn logging_enabled() -> bool {
     env::var(ENV_CLAWBAND_LOG).as_deref() == Ok("1") || log_marker().exists()
 }
 
+// ─── Skip flag (total-bypass escape hatch) ───────────────────────────────────
+// Historically this was gated on a `CLAWBAND_SKIP=1` environment variable, which
+// meant *any* process able to influence the hook's environment — a wrapper
+// script, a plugin, a compromised toolchain, or the agent itself patching its
+// own subprocess env — could silently disable every check with zero friction
+// and zero trace. That's backwards: the environment the hook runs in is not
+// something the operator reliably controls once an agent has any code
+// execution at all.
+//
+// The flag is now a *file*: `~/.clawband/skip`. Presence alone is not enough —
+// the file must be a regular file (not a symlink), owned by the user currently
+// running clawband, and not writable by group or other. A flag file that fails
+// any of those checks is treated exactly as if it were absent (bypass NOT
+// honored), with the reason logged to stderr so the operator can see something
+// is wrong. `clawband skip enable`/`disable`/`status` is the supported way to
+// manage it — it creates the file with 0600 permissions so there's no manual
+// `chmod` step to forget.
+//
+// Honest threat model: this raises the bar from "one env var, invisible" to "a
+// deliberate file action that itself triggers the `write to ~/.clawband/`
+// protected-ask pattern when attempted via Bash." It is an administrative
+// escape hatch for a human operator, NOT a security boundary that survives a
+// genuinely compromised or adversarial agent process running as the same
+// user — such a process could, in principle, still create a correctly-owned,
+// correctly-permissioned file itself (same-user same-uid write access is an
+// inherent limit of any same-user bypass mechanism, not something a file
+// format can fix). What it does close off is the *cheap, silent* path: setting
+// an env var leaves no trace and requires no privileged action, whereas
+// creating this file is a deliberate, visible, ownership-checked filesystem
+// action that is itself subject to clawband's own file-protection patterns.
+
+fn skip_flag_path() -> PathBuf {
+    config_dir().join("skip")
+}
+
+/// Outcome of inspecting `~/.clawband/skip`.
+#[derive(Debug, PartialEq, Eq)]
+enum SkipFlagState {
+    /// No flag file present (or it can't be stat'd) — normal operation.
+    Absent,
+    /// Present, a regular file, owned by the current effective user, and not
+    /// group/world-writable — bypass is honored.
+    Active,
+    /// Present but failed an ownership/permission/type check — bypass is NOT
+    /// honored. The `String` is a human-readable reason for the stderr warning.
+    Rejected(String),
+}
+
+/// Check `~/.clawband/skip` for the total-bypass flag. See the module
+/// comment above for the threat model this is (and isn't) defending against.
+fn check_skip_flag() -> SkipFlagState {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = skip_flag_path();
+    // symlink_metadata (not metadata) so a symlink is inspected as a symlink,
+    // not silently followed to whatever it points at.
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return SkipFlagState::Absent,
+    };
+
+    if meta.file_type().is_symlink() {
+        return SkipFlagState::Rejected(format!(
+            "{} is a symlink — refusing to follow it; recreate with `clawband skip enable`",
+            path.display()
+        ));
+    }
+    if !meta.is_file() {
+        return SkipFlagState::Rejected(format!(
+            "{} is not a regular file — ignoring",
+            path.display()
+        ));
+    }
+
+    let current_uid = unsafe { libc::geteuid() };
+    if meta.uid() != current_uid {
+        return SkipFlagState::Rejected(format!(
+            "{} is owned by uid {} (expected uid {}) — refusing to honor the bypass",
+            path.display(),
+            meta.uid(),
+            current_uid
+        ));
+    }
+
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        return SkipFlagState::Rejected(format!(
+            "{} is group/world-writable (mode {:o}) — refusing to honor the bypass; \
+             run `clawband skip enable` to recreate it with safe permissions",
+            path.display(),
+            mode & 0o777
+        ));
+    }
+
+    SkipFlagState::Active
+}
+
 // Return the last `n` non-empty lines of `content`, in order. Pure/testable.
 fn tail_lines(content: &str, n: usize) -> Vec<&str> {
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -2691,7 +2789,7 @@ const PROTECT_PATHS_TEMPLATE: &str =
 ~/.claude/settings\\.json$\n\
 ~/.claude/hooks/clawband$\n\
 ~/.clawband/.*\n\
-# Shell startup files — block injecting CLAWBAND_SKIP=1 (or hook removal) here.\n\
+# Shell startup files — block silently removing/editing the hook registration here.\n\
 ~/\\.(bash_profile|bash_login|bash_aliases|bashrc|profile|zshrc|zprofile|zshenv|zlogin|zlogout)$\n\
 ~/.config/fish/config\\.fish$\n\
 ~/.bashrc\\.d/\n\
@@ -3610,6 +3708,83 @@ fn cmd_trust(args: &[&str]) {
     println!("[CLAWBAND] Trusted: {}", canonical.display());
 }
 
+/// `clawband skip enable|disable|status` — manage the `~/.clawband/skip` total-
+/// bypass flag. See the module comment above `check_skip_flag()` for the full
+/// threat model this is (and isn't) meant to address.
+fn cmd_skip(args: &[String]) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let g = "\x1b[32m";
+    let y = "\x1b[33m";
+    let red = "\x1b[31m";
+    let d = "\x1b[2m";
+    let r = "\x1b[0m";
+    let bold = "\x1b[1m";
+    let path = skip_flag_path();
+
+    match args.first().map(|s| s.as_str()) {
+        Some("enable") => {
+            if let Err(e) = fs::create_dir_all(config_dir()) {
+                eprintln!("clawband: failed to create {}: {e}", config_dir().display());
+                std::process::exit(1);
+            }
+            if let Err(e) = fs::write(&path, "") {
+                eprintln!("clawband: failed to create {}: {e}", path.display());
+                std::process::exit(1);
+            }
+            if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "clawband: failed to set permissions on {}: {e}",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+            println!(
+                "{red}{bold}Bypass enabled.{r} {} exists (mode 0600) — ALL security checks \
+                 are disabled until you run `clawband skip disable`.",
+                path.display()
+            );
+            println!(
+                "{d}This is an administrative escape hatch, not a security boundary: any \
+                 process running as you could still recreate this file itself.{r}"
+            );
+        }
+        Some("disable") => match fs::remove_file(&path) {
+            Ok(()) => println!("{g}Bypass disabled.{r} Removed {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!(
+                    "{d}Bypass already disabled — {} does not exist.{r}",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("clawband: failed to remove {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        },
+        Some("status") | None => match check_skip_flag() {
+            SkipFlagState::Active => println!(
+                "{red}{bold}ON{r} — {} is active: all checks are disabled",
+                path.display()
+            ),
+            SkipFlagState::Rejected(reason) => {
+                println!(
+                    "{y}REJECTED{r} — {} exists but is not honored: {reason}",
+                    path.display()
+                );
+            }
+            SkipFlagState::Absent => {
+                println!("{g}off{r} — {} does not exist", path.display());
+            }
+        },
+        Some(other) => {
+            eprintln!("clawband: unknown `skip` subcommand: {other}");
+            eprintln!("usage: clawband skip <enable|disable|status>");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Scan `dir` for `.ask-*` breadcrumb files older than `threshold_secs`.
 /// Returns `Some((count, oldest_age_secs))` if any are found, else `None`.
 /// Used by `cmd_verify` to detect a broken/missing PostToolUse hook registration
@@ -3733,12 +3908,21 @@ fn cmd_verify() -> i32 {
         }
     }
 
-    // 5. CLAWBAND_SKIP
-    if env::var(ENV_CLAWBAND_SKIP).as_deref() == Ok("1") {
-        println!("  {bad} {red}{bold}CLAWBAND_SKIP=1 — ALL CHECKS DISABLED{r}");
-        failures += 1;
-    } else {
-        println!("  {ok} CLAWBAND_SKIP not set");
+    // 5. Skip flag (~/.clawband/skip)
+    match check_skip_flag() {
+        SkipFlagState::Active => {
+            println!(
+                "  {bad} {red}{bold}skip flag active ({}) — ALL CHECKS DISABLED{r}",
+                skip_flag_path().display()
+            );
+            failures += 1;
+        }
+        SkipFlagState::Rejected(reason) => {
+            println!("  {warn} skip flag present but rejected: {d}{reason}{r}");
+        }
+        SkipFlagState::Absent => {
+            println!("  {ok} skip flag not set");
+        }
     }
 
     // 7. Self-test: prove the engine blocks and passes correctly
@@ -4516,6 +4700,9 @@ fn cmd_help() {
         "  {b}trust{r} {d}[path]{r}                  Trust project allow.patterns at path (default: .clawband/allow.patterns)"
     );
     println!(
+        "  {b}skip{r} {d}<enable|disable|status>{r}  Total-bypass escape hatch — see 'Skip flag' below"
+    );
+    println!(
         "  {b}upgrade{r} {d}[--check]{r}             Self-update: fetch and replace the running binary"
     );
     println!(
@@ -4553,7 +4740,21 @@ fn cmd_help() {
     println!("  RTK_ENABLED=1   Strip 'rtk'/'rtk proxy' prefix before matching");
     println!("  SQZ_ENABLED=1   Strip 'sqz compress' suffix before matching");
     println!("  CLAWBAND_LOG=1  Append every block/prompt to ~/.clawband.log");
-    println!("  CLAWBAND_SKIP=1 Bypass all checks (trusted wrapper scripts)");
+    println!();
+
+    println!("{bold}Skip flag{r}  {d}(~/.clawband/skip — total bypass){r}");
+    println!(
+        "  {y}clawband skip enable{r}   Create the flag file (0600, owned by you) — ALL checks disabled"
+    );
+    println!("  {y}clawband skip disable{r}  Remove the flag file — normal operation resumes");
+    println!("  {d}clawband skip status{r}   Show whether the bypass is active/rejected/absent");
+    println!(
+        "  {d}An administrative escape hatch, not a security boundary: a compromised agent{r}"
+    );
+    println!("  {d}running as the same user could still create this file itself. It closes off{r}");
+    println!(
+        "  {d}the silent env-var path, not every path — see README.md for the full threat model.{r}"
+    );
     println!();
 
     println!("{bold}Decisions{r}");
@@ -4588,7 +4789,7 @@ fn cmd_stats() {
     let rtk = env::var(ENV_RTK_ENABLED).as_deref() == Ok("1");
     let sqz = env::var(ENV_SQZ_ENABLED).as_deref() == Ok("1");
     let logging = logging_enabled();
-    let skip = env::var(ENV_CLAWBAND_SKIP).as_deref() == Ok("1");
+    let skip_state = check_skip_flag();
     let log_path = PathBuf::from(&home).join(".clawband.log");
 
     // Parse audit log if present
@@ -4684,13 +4885,21 @@ fn cmd_stats() {
     println!("  RTK_ENABLED    {}", flag(rtk));
     println!("  SQZ_ENABLED    {}", flag(sqz));
     println!("  CLAWBAND_LOG   {}", flag(logging));
-    if skip {
-        let red = "\x1b[31m";
-        println!(
-            "  CLAWBAND_SKIP  {red}{bold}ON — ALL CHECKS DISABLED{r}  {d}clawband is bypassed in this environment{r}"
-        );
-    } else {
-        println!("  CLAWBAND_SKIP  {}", flag(skip));
+    match &skip_state {
+        SkipFlagState::Active => {
+            let red = "\x1b[31m";
+            println!(
+                "  skip flag      {red}{bold}ON — ALL CHECKS DISABLED{r}  {d}({}){r}",
+                skip_flag_path().display()
+            );
+        }
+        SkipFlagState::Rejected(reason) => {
+            let y = "\x1b[33m";
+            println!("  skip flag      {y}present but REJECTED{r}  {d}{reason}{r}");
+        }
+        SkipFlagState::Absent => {
+            println!("  skip flag      {}", flag(false));
+        }
     }
 
     println!("\n{bold}Audit log{r}");
@@ -4710,7 +4919,9 @@ fn cmd_stats() {
             println!("  {y}ask{r}    {bold}{log_ask}{r}");
             if log_skip > 0 {
                 let red = "\x1b[31m";
-                println!("  {red}skip{r}   {bold}{log_skip}{r}  {d}(bypassed by CLAWBAND_SKIP){r}");
+                println!(
+                    "  {red}skip{r}   {bold}{log_skip}{r}  {d}(bypassed by ~/.clawband/skip){r}"
+                );
             }
         }
     } else if logging {
@@ -5506,7 +5717,6 @@ const ENV_PWD: &str = "PWD";
 const ENV_PATH: &str = "PATH";
 const ENV_CLAWBAND_MODE: &str = "CLAWBAND_MODE";
 const ENV_CLAWBAND_LOG: &str = "CLAWBAND_LOG";
-const ENV_CLAWBAND_SKIP: &str = "CLAWBAND_SKIP";
 const ENV_CLAWBAND_SUGGEST_THRESHOLD: &str = "CLAWBAND_SUGGEST_THRESHOLD";
 const ENV_RTK_ENABLED: &str = "RTK_ENABLED";
 const ENV_SQZ_ENABLED: &str = "SQZ_ENABLED";
@@ -6234,6 +6444,10 @@ fn main() {
             );
             return;
         }
+        Some("skip") => {
+            cmd_skip(&filtered_args[2..]);
+            return;
+        }
         Some("verify") => {
             std::process::exit(cmd_verify());
         }
@@ -6307,22 +6521,33 @@ fn main() {
 
     let log_enabled = logging_enabled();
 
-    if env::var(ENV_CLAWBAND_SKIP).as_deref() == Ok("1") {
-        // Total bypass — emit a prominent warning so the operator knows checks are off,
-        // then leave an audit trail in the log file when logging is enabled.
-        eprintln!("[CLAWBAND] WARNING: CLAWBAND_SKIP=1 — all security checks are disabled");
-        let cmd_preview = v["tool_input"]["command"]
-            .as_str()
-            .unwrap_or("<non-bash tool>")
-            .to_string();
-        if log_enabled {
-            log_action(
-                "skip",
-                "CLAWBAND_SKIP=1 — all checks bypassed",
-                &cmd_preview,
+    match check_skip_flag() {
+        SkipFlagState::Active => {
+            // Total bypass — emit a prominent warning so the operator knows checks are
+            // off, then leave an audit trail in the log file when logging is enabled.
+            eprintln!(
+                "[CLAWBAND] WARNING: {} exists — all security checks are disabled",
+                skip_flag_path().display()
             );
+            let cmd_preview = v["tool_input"]["command"]
+                .as_str()
+                .unwrap_or("<non-bash tool>")
+                .to_string();
+            if log_enabled {
+                log_action(
+                    "skip",
+                    "~/.clawband/skip — all checks bypassed",
+                    &cmd_preview,
+                );
+            }
+            return;
         }
-        return;
+        SkipFlagState::Rejected(reason) => {
+            // Present but untrusted — do NOT bypass; warn and fall through to
+            // normal checks below.
+            eprintln!("[CLAWBAND] WARNING: skip flag ignored — {reason}");
+        }
+        SkipFlagState::Absent => {}
     }
 
     // ── Write/Edit/MultiEdit/NotebookEdit guard ──────────────────────────────
@@ -11572,17 +11797,17 @@ mod tests {
         assert_eq!(decision("shredder something"), None);
     }
 
-    // ── CLAWBAND_SKIP early-return (#37) ──────────────────────────────────────
-    // Unit tests call check_command() directly, bypassing the env-var guard in
+    // ── skip-flag early-return (#37, #283) ────────────────────────────────────
+    // Unit tests call check_command() directly, bypassing the skip-flag guard in
     // main().  Verify that `find . -delete` is normally denied (so the skip is
-    // meaningful) — the e2e suite verifies that CLAWBAND_SKIP=1 produces no
-    // block JSON and emits the warning to stderr.
+    // meaningful) — the e2e suite verifies that an active ~/.clawband/skip flag
+    // produces no block JSON and emits the warning to stderr.
     #[test]
     fn find_delete_normally_denied() {
         assert_eq!(
             decision("find . -delete"),
             Some("deny".into()),
-            "find . -delete must be denied when CLAWBAND_SKIP is not set"
+            "find . -delete must be denied when the skip flag is not set"
         );
     }
 
@@ -12222,6 +12447,135 @@ mod tests {
             "allow.patterns with wrong hash must not be trusted"
         );
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── issue #283: filesystem skip flag (replaces CLAWBAND_SKIP env var) ──────
+
+    /// Set up a fresh fake `$HOME` under `tmp` and return its path. Callers are
+    /// responsible for restoring the original `HOME` and cleaning up `tmp`.
+    fn fake_home_for_skip_test(tag: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "cb_skip_unit_{tag}_{}_{}",
+            std::process::id(),
+            tag.len() // cheap extra entropy so parallel tests with similar tags don't collide
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".clawband")).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn skip_flag_absent_when_no_file() {
+        let fake_home = fake_home_for_skip_test("absent");
+        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
+        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        let state = check_skip_flag();
+        std::env::set_var("HOME", orig_home);
+        assert_eq!(state, SkipFlagState::Absent);
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn skip_flag_active_with_strict_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_home = fake_home_for_skip_test("active");
+        let flag = fake_home.join(".clawband/skip");
+        fs::write(&flag, "").unwrap();
+        fs::set_permissions(&flag, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
+        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        let state = check_skip_flag();
+        std::env::set_var("HOME", orig_home);
+        assert_eq!(
+            state,
+            SkipFlagState::Active,
+            "a 0600 file owned by the current user must activate the bypass"
+        );
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn skip_flag_rejected_when_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_home = fake_home_for_skip_test("worldwritable");
+        let flag = fake_home.join(".clawband/skip");
+        fs::write(&flag, "").unwrap();
+        // world-writable — must NOT be honored regardless of ownership
+        fs::set_permissions(&flag, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
+        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        let state = check_skip_flag();
+        std::env::set_var("HOME", orig_home);
+        match state {
+            SkipFlagState::Rejected(_) => {}
+            other => panic!("expected Rejected for world-writable flag file, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn skip_flag_rejected_when_group_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_home = fake_home_for_skip_test("groupwritable");
+        let flag = fake_home.join(".clawband/skip");
+        fs::write(&flag, "").unwrap();
+        // group-writable only — still must NOT be honored
+        fs::set_permissions(&flag, fs::Permissions::from_mode(0o620)).unwrap();
+
+        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
+        std::env::set_var("HOME", fake_home.to_str().unwrap());
+        let state = check_skip_flag();
+        std::env::set_var("HOME", orig_home);
+        match state {
+            SkipFlagState::Rejected(_) => {}
+            other => panic!("expected Rejected for group-writable flag file, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn cmd_skip_enable_creates_file_with_safe_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_home = fake_home_for_skip_test("cli_enable");
+        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
+        std::env::set_var("HOME", fake_home.to_str().unwrap());
+
+        cmd_skip(&["enable".to_string()]);
+        let flag = fake_home.join(".clawband/skip");
+        assert!(flag.exists(), "enable must create the flag file");
+        let mode = fs::metadata(&flag).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "enable must create the file with mode 0600");
+        assert_eq!(
+            check_skip_flag(),
+            SkipFlagState::Active,
+            "a freshly-enabled flag must be Active"
+        );
+
+        std::env::set_var("HOME", orig_home);
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn cmd_skip_disable_removes_file() {
+        let fake_home = fake_home_for_skip_test("cli_disable");
+        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
+        std::env::set_var("HOME", fake_home.to_str().unwrap());
+
+        cmd_skip(&["enable".to_string()]);
+        let flag = fake_home.join(".clawband/skip");
+        assert!(flag.exists());
+
+        cmd_skip(&["disable".to_string()]);
+        assert!(!flag.exists(), "disable must remove the flag file");
+        assert_eq!(check_skip_flag(), SkipFlagState::Absent);
+
+        // disabling again (already-absent) must not panic or error out
+        cmd_skip(&["disable".to_string()]);
+
+        std::env::set_var("HOME", orig_home);
+        let _ = fs::remove_dir_all(&fake_home);
     }
 
     // ── issue #104: subshell bypass — pipe/redirect to subshell, $(which) scan ──

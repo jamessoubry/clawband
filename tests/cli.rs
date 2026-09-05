@@ -6,7 +6,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 /// Run the built clawband binary with `stdin`, returning (stdout, exit_ok).
-/// Optional env overrides are applied (e.g. CLAWBAND_SKIP, HOME).
+/// Optional env overrides are applied (e.g. HOME — used to point at a fake
+/// config dir for skip-flag / pattern-file tests).
 fn run(stdin: &str, env: &[(&str, &str)]) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_clawband"));
     cmd.stdin(Stdio::piped())
@@ -14,8 +15,7 @@ fn run(stdin: &str, env: &[(&str, &str)]) -> String {
         .stderr(Stdio::null());
     // Neutralise ambient config so tests are deterministic regardless of the
     // machine's real ~/.clawband or env.
-    cmd.env_remove("CLAWBAND_SKIP")
-        .env_remove("RTK_ENABLED")
+    cmd.env_remove("RTK_ENABLED")
         .env_remove("SQZ_ENABLED")
         .env_remove("CLAWBAND_LOG");
     cmd.env("HOME", "/nonexistent-clawband-test-home");
@@ -39,8 +39,7 @@ fn run_with_stderr(stdin: &str, env: &[(&str, &str)]) -> (String, String) {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.env_remove("CLAWBAND_SKIP")
-        .env_remove("RTK_ENABLED")
+    cmd.env_remove("RTK_ENABLED")
         .env_remove("SQZ_ENABLED")
         .env_remove("CLAWBAND_LOG");
     cmd.env("HOME", "/nonexistent-clawband-test-home");
@@ -109,26 +108,144 @@ fn e2e_ask_command() {
     assert_eq!(decision(&out), Some("ask"));
 }
 
-#[test]
-fn e2e_skip_bypasses_everything() {
-    let out = run(&bash("docker system prune"), &[("CLAWBAND_SKIP", "1")]);
-    assert_eq!(decision(&out), None, "CLAWBAND_SKIP=1 should bypass");
+/// Create a fresh fake `$HOME` (with `.clawband/`) for skip-flag e2e tests, and
+/// return it as an owned `PathBuf`. Callers pass `.to_str().unwrap()` into the
+/// `env` slice for `run()`/`run_with_stderr()`.
+fn fake_home_for_skip(tag: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!("cb_skip_e2e_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".clawband")).unwrap();
+    home
 }
 
 #[test]
-fn e2e_skip_warning_emitted_to_stderr() {
-    // CLAWBAND_SKIP=1 must produce no block JSON (bypass) AND emit a prominent
-    // warning on stderr so the operator knows checks are disabled (#37).
-    let (stdout, stderr) = run_with_stderr(&bash("find . -delete"), &[("CLAWBAND_SKIP", "1")]);
+fn e2e_skip_flag_bypasses_everything() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = fake_home_for_skip("bypass");
+    let flag = home.join(".clawband/skip");
+    std::fs::write(&flag, "").unwrap();
+    std::fs::set_permissions(&flag, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let h = home.to_str().unwrap();
+
+    let out = run(&bash("docker system prune"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "an active ~/.clawband/skip flag should bypass"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_skip_flag_warning_emitted_to_stderr() {
+    // An active skip flag must produce no block JSON (bypass) AND emit a
+    // prominent warning on stderr so the operator knows checks are disabled
+    // (#37, #283).
+    use std::os::unix::fs::PermissionsExt;
+    let home = fake_home_for_skip("bypass_stderr");
+    let flag = home.join(".clawband/skip");
+    std::fs::write(&flag, "").unwrap();
+    std::fs::set_permissions(&flag, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let h = home.to_str().unwrap();
+
+    let (stdout, stderr) = run_with_stderr(&bash("find . -delete"), &[("HOME", h)]);
     assert_eq!(
         decision(&stdout),
         None,
-        "CLAWBAND_SKIP=1 must bypass (no block JSON): {stdout}"
+        "active skip flag must bypass (no block JSON): {stdout}"
     );
     assert!(
-        stderr.contains("CLAWBAND_SKIP"),
-        "stderr must contain CLAWBAND_SKIP warning: {stderr:?}"
+        stderr.contains("skip") && stderr.contains(".clawband"),
+        "stderr must mention the skip flag path: {stderr:?}"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_skip_flag_world_writable_is_rejected() {
+    // A skip flag that's group/world-writable must NOT bypass — this is the
+    // core security property #283 asks for: a loosely-permissioned flag file
+    // defeats the whole point, so it must be ignored (with a warning) rather
+    // than honored.
+    use std::os::unix::fs::PermissionsExt;
+    let home = fake_home_for_skip("rejected");
+    let flag = home.join(".clawband/skip");
+    std::fs::write(&flag, "").unwrap();
+    std::fs::set_permissions(&flag, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let h = home.to_str().unwrap();
+
+    let (stdout, stderr) = run_with_stderr(&bash("docker system prune"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&stdout),
+        Some("deny"),
+        "a world-writable skip flag must NOT bypass checks: {stdout}"
+    );
+    assert!(
+        stderr.contains("skip flag ignored") || stderr.contains("REJECTED"),
+        "stderr should explain why the flag was ignored: {stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_no_skip_flag_behaves_normally() {
+    let home = fake_home_for_skip("absent");
+    let h = home.to_str().unwrap();
+    let out = run(&bash("docker system prune"), &[("HOME", h)]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "with no skip flag present, deny patterns must still fire"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn e2e_skip_enable_disable_status_cli() {
+    use std::process::Command;
+    let home = fake_home_for_skip("cli");
+    let h = home.to_str().unwrap();
+    let flag = home.join(".clawband/skip");
+
+    let run_skip = |arg: &str| -> (String, i32) {
+        let out = Command::new(env!("CARGO_BIN_EXE_clawband"))
+            .arg("skip")
+            .arg(arg)
+            .env("HOME", h)
+            .output()
+            .expect("run clawband skip");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code().unwrap_or(-1),
+        )
+    };
+
+    let (status_before, code) = run_skip("status");
+    assert_eq!(code, 0);
+    assert!(
+        status_before.contains("off"),
+        "status before enable should report off: {status_before}"
+    );
+    assert!(!flag.exists());
+
+    let (enable_out, code) = run_skip("enable");
+    assert_eq!(code, 0);
+    assert!(enable_out.contains("Bypass enabled"), "{enable_out}");
+    assert!(flag.exists(), "enable must create the flag file");
+
+    let (status_on, code) = run_skip("status");
+    assert_eq!(code, 0);
+    assert!(
+        status_on.contains("ON"),
+        "status after enable should report ON: {status_on}"
+    );
+
+    let (disable_out, code) = run_skip("disable");
+    assert_eq!(code, 0);
+    assert!(disable_out.contains("disabled"), "{disable_out}");
+    assert!(!flag.exists(), "disable must remove the flag file");
+
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -2837,8 +2954,7 @@ fn post(post_json: &str, home: &str) -> String {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    cmd.env_remove("CLAWBAND_SKIP")
-        .env_remove("RTK_ENABLED")
+    cmd.env_remove("RTK_ENABLED")
         .env_remove("SQZ_ENABLED")
         .env_remove("CLAWBAND_LOG");
     cmd.env("HOME", home);
@@ -3228,7 +3344,7 @@ fn home_with_shell_init_protect() -> std::path::PathBuf {
 
 fn write_to(file_path: &str) -> String {
     format!(
-        r#"{{"tool_name":"Write","tool_input":{{"file_path":{:?},"content":"export CLAWBAND_SKIP=1\n"}}}}"#,
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":{:?},"content":"remove hook registration\n"}}}}"#,
         file_path
     )
 }

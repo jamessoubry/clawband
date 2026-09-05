@@ -263,7 +263,7 @@ This does three things:
    - `~/.claude/settings.json` — Claude Code's settings (where hooks are registered)
    - `~/.claude/hooks/clawband` — the clawband binary itself
    - `~/.clawband/*` — all clawband config files
-   - shell startup files (`~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`, `~/.zprofile`, `~/.zshenv`) — so Claude can't export `CLAWBAND_SKIP=1` (or remove the hook) by editing them
+   - shell startup files (`~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`, `~/.zprofile`, `~/.zshenv`) — so Claude can't remove the hook by editing them
 3. **Extends the Bash deny patterns** (when protect.paths is present) to block shell tamper commands: `rm`/`mv`/`shred` referencing clawband files, output redirection (`>`/`>>`) to those files, `sed -i` or `tee` targeting `settings.json`, and `chmod -x` on the hook binary.
 
 ### What is still allowed
@@ -336,6 +336,9 @@ clawband stats                        # show pattern counts and audit log summar
 clawband test '<command>'             # dry-run: print DENY/ASK/PASS without executing
 clawband patterns                     # list all active patterns (built-in + user + project)
 clawband log                          # view the audit log (--enable, -n N, --clear, --path)
+clawband skip enable                  # create ~/.clawband/skip (0600) — total bypass, see 'Options'
+clawband skip disable                 # remove ~/.clawband/skip — resume normal operation
+clawband skip status                  # show whether the bypass is active / rejected / absent
 clawband uninstall                    # remove clawband hooks from settings
 clawband --version
 ```
@@ -370,22 +373,36 @@ Set as environment variables (in your shell profile, or prefixed on the hook com
 | `RTK_ENABLED` | `0` | Strip `rtk` prefix before matching ([RTK](https://github.com/rtk-ai/rtk) users) |
 | `SQZ_ENABLED` | `0` | Strip `sqz compress` suffix before matching ([sqz](https://github.com/ojuschugh1/sqz) users) |
 | `CLAWBAND_LOG` | `0` | Append every block/prompt to `~/.clawband.log` |
-| `CLAWBAND_SKIP` | `0` | **Total bypass** — disables *all* checks (see below) |
 
-### About `CLAWBAND_SKIP`
+### Total bypass: the skip flag (`~/.clawband/skip`)
 
-`CLAWBAND_SKIP=1` is a complete bypass: clawband exits immediately and the command runs with no checks at all — deny patterns included. It does **not** downgrade blocks to prompts; it skips everything.
+**Breaking change (v3.15.0):** the `CLAWBAND_SKIP=1` environment variable has been removed. It's replaced with a filesystem flag: `~/.clawband/skip`.
 
-Crucially, clawband reads this variable from **its own process environment**, *not* from the command string. That means a model cannot bypass the guard by prefixing a command:
+The reason for the change: clawband reads its own process environment, and *any* process that can influence that environment before the hook runs — a wrapper script, a plugin, a compromised toolchain, or an agent quietly exporting the variable into its own subprocess env — could silently disable every check with zero friction and no visible trace. An env var set moments before the hook runs is not something an operator can reliably audit or defend.
+
+A file is different. `~/.clawband/skip` only activates the bypass if it:
+
+- is a **regular file** (not a symlink — symlinks are rejected outright)
+- is **owned by the user currently running clawband**
+- is **not writable by group or other** (i.e. no `022` bits set)
+
+If the file exists but fails any of those checks, the bypass is **not** honored — clawband proceeds with normal checks and logs why to stderr. This means dropping a loosely-permissioned or wrong-owner file in `~/.clawband/` does nothing; only a deliberate, correctly-permissioned file works.
+
+Manage it with the CLI, which creates the file with safe permissions (0600) so there's no manual `chmod` to get wrong:
 
 ```sh
-CLAWBAND_SKIP=1 rm -rf /     # STILL BLOCKED — the prefix is just text in the
-                             # command string; rm -rf / still matches
+clawband skip enable    # create ~/.clawband/skip (mode 0600) — ALL checks disabled
+clawband skip status    # show whether the bypass is active / rejected / absent
+clawband skip disable   # remove the flag — normal operation resumes
 ```
 
-The variable only takes effect when it is actually exported into the hook's environment. The safe, intended use is a one-off inline prefix on a **trusted wrapper you invoke yourself**, where it applies to that single invocation.
+While active, `clawband stats` shows a red **ALL CHECKS DISABLED** warning, and (with `CLAWBAND_LOG=1`) every bypassed command is recorded as a `SKIP` event in `~/.clawband.log`.
 
-⚠️ **Footgun:** if you `export CLAWBAND_SKIP=1` globally (shell profile or Claude Code `settings.json` `env` block), clawband is silently disabled for the entire session. `clawband stats` shows a red **ALL CHECKS DISABLED** warning when it detects this, and (with `CLAWBAND_LOG=1`) every bypassed command is recorded as a `SKIP` event in `~/.clawband.log`.
+Note that a write to `~/.clawband/skip` via a raw Bash redirect or `tee` (e.g. `echo > ~/.clawband/skip`) is itself caught by clawband's built-in `write to ~/.clawband/` protected-ask pattern, which prompts even in `bypassPermissions` (YOLO) mode — so an agent can't create the flag file silently through Bash either; it has to go through `clawband skip enable`, or a filesystem write the agent's sandbox otherwise permits outside clawband's view entirely.
+
+⚠️ **Honest threat model:** this is an administrative escape hatch for a human operator, not a security boundary that survives a genuinely compromised or adversarial agent process running as the same user. A process with arbitrary same-user filesystem write access could, in principle, still create a correctly-owned, correctly-permissioned flag file itself — that's an inherent limit of any same-user bypass mechanism, and no file format can fully close it. What this change does close off is the *cheap, invisible* path: setting an env var required no privileged action and left no trace, whereas creating this file is a deliberate, visible, ownership-checked filesystem action.
+
+**Migrating from `CLAWBAND_SKIP=1`:** remove the env var from wherever you set it (shell profile, Claude Code `settings.json` `env` block, wrapper scripts) and run `clawband skip enable` / `clawband skip disable` instead.
 
 ## Using clawband with other agents (Codex, Gemini, Hermes, OpenClaw, OpenCode)
 
