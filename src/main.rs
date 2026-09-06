@@ -4490,20 +4490,12 @@ fn download_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// Download the `.sha256` sidecar for `binary_url` and verify that the local
-/// file at `path` matches. Returns Err with a message if the download fails or
-/// the hash does not match.
-fn verify_sha256(path: &std::path::Path, binary_url: &str) -> Result<(), String> {
-    let sha_url = format!("{}.sha256", binary_url);
-    let expected = fetch_url(&sha_url)
-        .map_err(|e| format!("could not download SHA256 sidecar from {sha_url}: {e}"))?;
-    let expected = expected.trim();
-    if expected.is_empty() {
-        return Err(format!("SHA256 sidecar at {sha_url} is empty"));
-    }
-
-    // Shell out to sha256sum (Linux) or shasum -a 256 (macOS)
-    let actual = if cfg!(target_os = "macos") {
+/// Compute the SHA-256 hex digest of a local file by shelling out to
+/// `sha256sum` (Linux) or `shasum -a 256` (macOS) — same tools already used
+/// by `verify_sha256`, kept as a standalone helper so `verify_attestation`
+/// can reuse it without re-implementing the platform dispatch.
+fn compute_sha256_hex(path: &std::path::Path) -> Result<String, String> {
+    if cfg!(target_os = "macos") {
         let out = std::process::Command::new("shasum")
             .args(["-a", "256", path.to_string_lossy().as_ref()])
             .output()
@@ -4514,11 +4506,11 @@ fn verify_sha256(path: &std::path::Path, binary_url: &str) -> Result<(), String>
                 out.status
             ));
         }
-        String::from_utf8_lossy(&out.stdout)
+        Ok(String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
             .next()
             .unwrap_or("")
-            .to_string()
+            .to_string())
     } else {
         let out = std::process::Command::new("sha256sum")
             .arg(path.to_string_lossy().as_ref())
@@ -4530,12 +4522,32 @@ fn verify_sha256(path: &std::path::Path, binary_url: &str) -> Result<(), String>
                 out.status
             ));
         }
-        String::from_utf8_lossy(&out.stdout)
+        Ok(String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
             .next()
             .unwrap_or("")
-            .to_string()
-    };
+            .to_string())
+    }
+}
+
+/// Download the `.sha256` sidecar for `binary_url` and verify that the local
+/// file at `path` matches. Returns Err with a message if the download fails or
+/// the hash does not match.
+///
+/// This proves the download wasn't corrupted or tampered with *in transit*.
+/// It does NOT prove the release itself was published legitimately — see
+/// `verify_attestation` for the authenticity check that covers a compromised
+/// release-publish step.
+fn verify_sha256(path: &std::path::Path, binary_url: &str) -> Result<(), String> {
+    let sha_url = format!("{}.sha256", binary_url);
+    let expected = fetch_url(&sha_url)
+        .map_err(|e| format!("could not download SHA256 sidecar from {sha_url}: {e}"))?;
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return Err(format!("SHA256 sidecar at {sha_url} is empty"));
+    }
+
+    let actual = compute_sha256_hex(path)?;
 
     if actual != expected {
         return Err(format!(
@@ -4544,6 +4556,206 @@ fn verify_sha256(path: &std::path::Path, binary_url: &str) -> Result<(), String>
     }
 
     Ok(())
+}
+
+// ─── Artifact attestation verification ───────────────────────────────────────
+//
+// GitHub repo/workflow this binary's release attestations must be tied to.
+const ATTESTATION_REPO: &str = "jamessoubry/clawband";
+const ATTESTATION_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
+
+/// Decode a standard-alphabet base64 string (with or without `=` padding).
+/// No external crate needed — this is only used to unwrap the small DSSE
+/// envelope payload inside a GitHub attestations-API JSON response.
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'=' && !b.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4 + 3);
+    let mut chunk = [0u8; 4];
+    let mut n = 0usize;
+    for b in cleaned {
+        let v = val(b).ok_or_else(|| "invalid base64 character".to_string())?;
+        chunk[n] = v;
+        n += 1;
+        if n == 4 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            out.push((chunk[2] << 6) | chunk[3]);
+            n = 0;
+        }
+    }
+    match n {
+        0 => {}
+        2 => out.push((chunk[0] << 2) | (chunk[1] >> 4)),
+        3 => {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        1 => return Err("invalid base64 length".to_string()),
+        _ => unreachable!(),
+    }
+    Ok(out)
+}
+
+/// Verify that GitHub has an artifact-attestation record for the downloaded
+/// binary, tying it back to a build produced by this repo's release
+/// workflow. This is the *authenticity* root of trust for `clawband
+/// upgrade`: `verify_sha256` only proves the download wasn't corrupted or
+/// tampered with in transit — it says nothing about whether the release
+/// itself was published legitimately. An attacker who compromises the
+/// release-publish step can swap both the binary and its `.sha256` sidecar
+/// with matching malicious content, and SHA-256 alone would accept it.
+///
+/// Verification strategy (in order of preference):
+///   1. If the `gh` CLI is available, shell out to `gh attestation verify`,
+///      which performs full cryptographic Sigstore bundle verification
+///      (Rekor transparency-log inclusion, Fulcio certificate chain, DSSE
+///      signature) against the real attestation created by
+///      `actions/attest-build-provenance` in CI.
+///   2. Otherwise, fall back to GitHub's REST API
+///      (`GET /repos/{owner}/{repo}/attestations/{digest}`), fetched over
+///      TLS the same way the `.sha256` sidecar is (via `fetch_url`), and
+///      perform a structural check: an attestation record exists for this
+///      exact digest, its in-toto subject digest matches, and its
+///      provenance predicate names this repo and the release workflow file.
+///      This does not independently re-verify the Sigstore signature chain
+///      the way `gh attestation verify` does, but it still closes the gap
+///      described above: only the genuine, unmodified workflow run — holding
+///      a short-lived OIDC-issued Sigstore identity — can cause GitHub to
+///      create a matching attestation record in the first place. A
+///      compromised publish step that merely swaps release assets cannot
+///      also fabricate a matching entry in GitHub's attestation store.
+///
+/// Fails closed: any missing, malformed, or unreachable attestation data is
+/// treated as a verification failure. It is never silently downgraded to
+/// checksum-only trust.
+fn verify_attestation(path: &std::path::Path) -> Result<(), String> {
+    if gh_cli_available() {
+        return verify_attestation_via_gh(path);
+    }
+    let digest = compute_sha256_hex(path)?;
+    if digest.is_empty() {
+        return Err("could not compute SHA-256 digest of downloaded binary".to_string());
+    }
+    verify_attestation_via_api(&digest)
+}
+
+fn gh_cli_available() -> bool {
+    std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn verify_attestation_via_gh(path: &std::path::Path) -> Result<(), String> {
+    let out = std::process::Command::new("gh")
+        .args([
+            "attestation",
+            "verify",
+            path.to_string_lossy().as_ref(),
+            "--repo",
+            ATTESTATION_REPO,
+        ])
+        .output()
+        .map_err(|e| format!("could not run gh attestation verify: {e}"))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("gh attestation verify failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+fn verify_attestation_via_api(digest_hex: &str) -> Result<(), String> {
+    let url = format!(
+        "https://api.github.com/repos/{}/attestations/sha256:{}",
+        ATTESTATION_REPO, digest_hex
+    );
+    let body = fetch_url(&url)
+        .map_err(|e| format!("could not fetch attestation record from {url}: {e}"))?;
+
+    validate_attestation_response(&body, digest_hex)
+}
+
+/// Parse and structurally validate a GitHub attestations-API response body
+/// against the digest of the downloaded binary. Split out from
+/// `verify_attestation_via_api` so it can be unit tested without a network
+/// call.
+fn validate_attestation_response(body: &str, expected_digest_hex: &str) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| format!("attestation response is not valid JSON: {e}"))?;
+
+    let attestations = v["attestations"]
+        .as_array()
+        .ok_or_else(|| "attestation response is missing an 'attestations' array".to_string())?;
+    if attestations.is_empty() {
+        return Err("attestation response contains no attestations".to_string());
+    }
+
+    for att in attestations {
+        let payload_b64 = match att["bundle"]["dsseEnvelope"]["payload"].as_str() {
+            Some(p) => p,
+            None => continue,
+        };
+        let payload_bytes = match base64_decode(payload_b64) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let statement: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+
+        let subject_ok = statement["subject"]
+            .as_array()
+            .map(|subs| {
+                subs.iter().any(|s| {
+                    s["digest"]["sha256"]
+                        .as_str()
+                        .map(|d| d.eq_ignore_ascii_case(expected_digest_hex))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !subject_ok {
+            continue;
+        }
+
+        let predicate_type = statement["predicateType"].as_str().unwrap_or("");
+        if !predicate_type.starts_with("https://slsa.dev/provenance/") {
+            continue;
+        }
+
+        let workflow = &statement["predicate"]["buildDefinition"]["externalParameters"]["workflow"];
+        let repo_ok = workflow["repository"]
+            .as_str()
+            .map(|r| r.trim_end_matches('/').ends_with(ATTESTATION_REPO))
+            .unwrap_or(false);
+        let path_ok = workflow["path"]
+            .as_str()
+            .map(|p| p == ATTESTATION_WORKFLOW_PATH)
+            .unwrap_or(false);
+
+        if repo_ok && path_ok {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "no valid attestation found for digest sha256:{expected_digest_hex} matching repo {ATTESTATION_REPO} and workflow {ATTESTATION_WORKFLOW_PATH}"
+    ))
 }
 
 /// Verify a downloaded binary by running `<path> --version` and checking that
@@ -4689,6 +4901,18 @@ fn cmd_upgrade(args: &[String]) {
     println!("  {d}Verifying SHA256 checksum …{r}");
     if let Err(e) = verify_sha256(&tmp_path, &download_url) {
         eprintln!("clawband upgrade: checksum verification failed — {e}");
+        eprintln!("clawband upgrade: aborting; the running binary is unchanged.");
+        let _ = fs::remove_file(&tmp_path);
+        std::process::exit(1);
+    }
+
+    // 7b. Verify GitHub artifact attestation — the authenticity root of
+    // trust. SHA-256 above only proves the download matches what the
+    // release published; this proves the release itself came from the real
+    // CI workflow. Fails closed: no fallback to checksum-only trust.
+    println!("  {d}Verifying GitHub artifact attestation …{r}");
+    if let Err(e) = verify_attestation(&tmp_path) {
+        eprintln!("clawband upgrade: attestation verification failed — {e}");
         eprintln!("clawband upgrade: aborting; the running binary is unchanged.");
         let _ = fs::remove_file(&tmp_path);
         std::process::exit(1);
@@ -11581,6 +11805,228 @@ mod tests {
           "prerelease": false
         }"#;
         assert_eq!(parse_tag_name(json), Some("v2.30.0".to_string()));
+    }
+
+    // ── upgrade: base64_decode ────────────────────────────────────────────────
+
+    #[test]
+    fn base64_decode_no_padding() {
+        // "hello" base64-encoded without padding
+        assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello".to_vec());
+    }
+
+    #[test]
+    fn base64_decode_with_padding() {
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello".to_vec());
+    }
+
+    #[test]
+    fn base64_decode_exact_multiple_of_four() {
+        // "test" -> "dGVzdA==" (6 chars payload) — try a clean 4-char-aligned one
+        assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob".to_vec());
+    }
+
+    #[test]
+    fn base64_decode_invalid_char_errors() {
+        assert!(base64_decode("not!valid$$").is_err());
+    }
+
+    #[test]
+    fn base64_decode_invalid_length_errors() {
+        // A single leftover base64 digit (1 mod 4) is never valid.
+        assert!(base64_decode("a").is_err());
+    }
+
+    #[test]
+    fn base64_decode_json_roundtrip() {
+        // Simulate a small in-toto statement payload as GitHub would send it.
+        let json = r#"{"subject":[{"digest":{"sha256":"abc123"}}]}"#;
+        let encoded = {
+            // Minimal local base64 encoder just for building the test fixture.
+            const CHARS: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let bytes = json.as_bytes();
+            // skipcq: RS-W1079 — String::new() is the idiomatic empty-growable-string
+            // constructor here (mutated via push in the loop below); String::default()
+            // is no clearer and less conventional for this use.
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = *chunk.get(1).unwrap_or(&0);
+                let b2 = *chunk.get(2).unwrap_or(&0);
+                out.push(CHARS[(b0 >> 2) as usize] as char);
+                out.push(CHARS[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+                if chunk.len() > 1 {
+                    out.push(CHARS[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+                if chunk.len() > 2 {
+                    out.push(CHARS[(b2 & 0x3f) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+            out
+        };
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), json);
+    }
+
+    // ── upgrade: validate_attestation_response ────────────────────────────────
+
+    fn make_attestation_body(
+        subject_digest: &str,
+        predicate_type: &str,
+        repo: &str,
+        path: &str,
+    ) -> String {
+        let statement = format!(
+            r#"{{"_type":"https://in-toto.io/Statement/v1","subject":[{{"name":"clawband-linux-x86_64","digest":{{"sha256":"{subject_digest}"}}}}],"predicateType":"{predicate_type}","predicate":{{"buildDefinition":{{"externalParameters":{{"workflow":{{"repository":"{repo}","path":"{path}","ref":"refs/tags/v3.17.0"}}}}}}}}}}"#
+        );
+        // base64-encode the statement the same way the test fixture encoder above does
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = statement.as_bytes();
+        // skipcq: RS-W1079 — see rationale above; idiomatic empty-growable-string
+        // constructor mutated via push in the loop below.
+        let mut payload_b64 = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = *chunk.get(1).unwrap_or(&0);
+            let b2 = *chunk.get(2).unwrap_or(&0);
+            payload_b64.push(CHARS[(b0 >> 2) as usize] as char);
+            payload_b64.push(CHARS[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                payload_b64.push(CHARS[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+            } else {
+                payload_b64.push('=');
+            }
+            if chunk.len() > 2 {
+                payload_b64.push(CHARS[(b2 & 0x3f) as usize] as char);
+            } else {
+                payload_b64.push('=');
+            }
+        }
+
+        format!(
+            r#"{{"attestations":[{{"bundle":{{"dsseEnvelope":{{"payload":"{payload_b64}","payloadType":"application/vnd.in-toto+json"}}}}}}]}}"#
+        )
+    }
+
+    #[test]
+    fn validate_attestation_response_valid_matches() {
+        let digest = "deadbeef";
+        let body = make_attestation_body(
+            digest,
+            "https://slsa.dev/provenance/v1",
+            "https://github.com/jamessoubry/clawband",
+            ".github/workflows/release.yml",
+        );
+        assert!(validate_attestation_response(&body, digest).is_ok());
+    }
+
+    #[test]
+    fn validate_attestation_response_digest_mismatch_fails_closed() {
+        let body = make_attestation_body(
+            "deadbeef",
+            "https://slsa.dev/provenance/v1",
+            "https://github.com/jamessoubry/clawband",
+            ".github/workflows/release.yml",
+        );
+        assert!(validate_attestation_response(&body, "totally-different-digest").is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_wrong_repo_fails_closed() {
+        let digest = "deadbeef";
+        let body = make_attestation_body(
+            digest,
+            "https://slsa.dev/provenance/v1",
+            "https://github.com/some-attacker/evil-fork",
+            ".github/workflows/release.yml",
+        );
+        assert!(validate_attestation_response(&body, digest).is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_wrong_workflow_path_fails_closed() {
+        let digest = "deadbeef";
+        let body = make_attestation_body(
+            digest,
+            "https://slsa.dev/provenance/v1",
+            "https://github.com/jamessoubry/clawband",
+            ".github/workflows/some-other-workflow.yml",
+        );
+        assert!(validate_attestation_response(&body, digest).is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_wrong_predicate_type_fails_closed() {
+        let digest = "deadbeef";
+        let body = make_attestation_body(
+            digest,
+            "https://example.com/not-slsa",
+            "https://github.com/jamessoubry/clawband",
+            ".github/workflows/release.yml",
+        );
+        assert!(validate_attestation_response(&body, digest).is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_empty_attestations_fails_closed() {
+        let body = r#"{"attestations":[]}"#;
+        assert!(validate_attestation_response(body, "deadbeef").is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_missing_attestations_key_fails_closed() {
+        let body = r#"{"something_else": true}"#;
+        assert!(validate_attestation_response(body, "deadbeef").is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_malformed_json_fails_closed() {
+        assert!(validate_attestation_response("not json at all", "deadbeef").is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_malformed_payload_fails_closed() {
+        // Valid outer JSON, but dsseEnvelope.payload isn't valid base64.
+        let body =
+            r#"{"attestations":[{"bundle":{"dsseEnvelope":{"payload":"!!!not-base64!!!"}}}}]}"#;
+        assert!(validate_attestation_response(body, "deadbeef").is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_missing_payload_field_fails_closed() {
+        let body = r#"{"attestations":[{"bundle":{"dsseEnvelope":{}}}]}"#;
+        assert!(validate_attestation_response(body, "deadbeef").is_err());
+    }
+
+    #[test]
+    fn validate_attestation_response_case_insensitive_digest_match() {
+        let body = make_attestation_body(
+            "DEADBEEF",
+            "https://slsa.dev/provenance/v1",
+            "https://github.com/jamessoubry/clawband",
+            ".github/workflows/release.yml",
+        );
+        assert!(validate_attestation_response(&body, "deadbeef").is_ok());
+    }
+
+    // ── upgrade: compute_sha256_hex ────────────────────────────────────────────
+
+    #[test]
+    fn compute_sha256_hex_known_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("sample.txt");
+        std::fs::write(&file_path, b"hello world\n").unwrap();
+        let digest = compute_sha256_hex(&file_path).unwrap();
+        // sha256sum of "hello world\n"
+        assert_eq!(
+            digest,
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
     }
 
     // ── upgrade: platform_asset ───────────────────────────────────────────────
