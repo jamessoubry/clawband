@@ -41,8 +41,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "clawband"
-version = "3.14.6"
+version = "3.15.3"
 dependencies = [
+ "libc",
  "regex",
  "serde_json",
  "streaming-iterator",
