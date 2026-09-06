@@ -6330,46 +6330,82 @@ fn check_command<'a>(
     None
 }
 
-/// Returns true if `raw` (an unquoted or quoted path/argument) resolves — as a
-/// bare textual last path segment — to a directory named `.clawband`.  Used to
-/// catch `cd ~/.clawband` / `cd .clawband` / `d=~/.clawband` regardless of the
-/// exact prefix (`~/`, `$HOME/`, relative, etc.) without needing full shell
-/// path resolution.
-fn is_clawband_dir_arg(raw: &str) -> bool {
+/// Returns true if `raw` (an unquoted or quoted path/argument) refers
+/// specifically to the *global* `~/.clawband` directory (i.e. `config_dir()`)
+/// — not to just any directory that happens to end in `.clawband`.
+///
+/// This distinction matters: the codebase already has a separate concept of
+/// project-local `.clawband/` config dirs (see `project_config_dir()`) which
+/// are NOT the security-sensitive global skip-flag location. A bare relative
+/// `cd .clawband` (or `./.clawband`) could resolve to one of those depending
+/// on the shell's cwd, so it is deliberately NOT treated as a match here —
+/// only forms that explicitly reference the home directory (`~/.clawband`,
+/// `$HOME/.clawband`, `${HOME}/.clawband`) or a literal absolute path equal
+/// to the resolved `config_dir()` are matched.
+fn is_global_clawband_dir_arg(raw: &str) -> bool {
     let trimmed = raw.trim_matches(|c| c == '"' || c == '\'');
     let trimmed = trimmed.trim_end_matches('/');
-    trimmed.rsplit('/').next() == Some(".clawband")
+    if trimmed.rsplit('/').next() != Some(".clawband") {
+        return false;
+    }
+    if let Some(rest) = trimmed.strip_prefix('~') {
+        return rest == "/.clawband";
+    }
+    if let Some(rest) = trimmed.strip_prefix("$HOME") {
+        return rest == "/.clawband";
+    }
+    if let Some(rest) = trimmed.strip_prefix("${HOME}") {
+        return rest == "/.clawband";
+    }
+    // Literal absolute path — only a match if it's exactly the resolved
+    // global config dir, not merely "ends in .clawband".
+    let home = env::var(ENV_HOME).unwrap_or_default();
+    if home.is_empty() {
+        return false;
+    }
+    let home_trimmed = home.trim_end_matches('/');
+    trimmed == format!("{home_trimmed}/.clawband")
 }
 
 /// Detects the `cd`-then-relative-write bypass class for the `~/.clawband/skip`
 /// flag file.  `builtin_protected_ask()`'s "write to ~/.clawband/" pattern only
 /// matches when the literal substring `.clawband/` appears directly in the
-/// redirect/tee operand.  An agent can dodge that by first `cd`-ing into a
-/// `.clawband`-ending directory (or pointing a shell variable at one) and then
-/// writing/chmod'ing a *bare* filename, e.g.:
+/// redirect/tee operand.  An agent can dodge that by first `cd`-ing into the
+/// global `~/.clawband` directory (or pointing a shell variable at it) and then
+/// writing/chmod'ing/touching/copying-over a *bare* filename, e.g.:
 ///
 ///   cd ~/.clawband && : > skip && chmod 600 skip
 ///   d=~/.clawband; : > "$d/skip"; chmod 600 "$d/skip"
 ///
-/// This is a heuristic, not full shell-semantic variable resolution (that's
-/// undecidable in general) — it deliberately favors catching this bypass class
-/// over exhaustive precision, consistent with how the rest of this file
-/// balances heuristic detection against false positives. It tracks, across the
-/// compound command's segments:
-///   - whether a `cd` targeted a `.clawband`-ending directory, and
-///   - which shell variables (if any) were assigned a `.clawband`-ending path,
+/// IMPORTANT — this is best-effort defense-in-depth against common, careless
+/// bypass idioms, not a guarantee against a deliberately adversarial agent.
+/// Enumerating every shell primitive capable of creating/overwriting a file
+/// (heredocs, `dd`, `sed -n w`, `printf`, arbitrary language one-liners, ...)
+/// is fundamentally unbounded — this codebase already documents that same
+/// "undecidable in general" limitation elsewhere for the skip-bypass feature
+/// as a whole. A same-user process with genuinely arbitrary file-write access
+/// cannot be fully defended against by any same-user file-based scheme; this
+/// function only aims to catch the small set of idioms an agent is most
+/// likely to reach for (redirects, `tee`, `chmod`, `touch`, `cp`), not to be
+/// exhaustive. It tracks, walking the compound command's segments in order:
+///   - whether the *current* directory (updated on every `cd`, so a later
+///     unrelated `cd` correctly clears this) is the global `~/.clawband` dir
+///     — see `is_global_clawband_dir_arg` for what counts as "global" (it
+///     deliberately excludes unrelated project-local `.clawband/` dirs), and
+///   - which shell variables (if any) were assigned the global `.clawband`
+///     path,
 ///
-/// then flags any later write/tee/chmod operation targeting a bare `skip`
-/// filename (optionally prefixed by one of those tracked variables, e.g.
-/// `"$d/skip"`).
+/// then flags any later write/tee/chmod/touch/cp operation targeting a bare
+/// `skip` filename (optionally prefixed by `./` or one of those tracked
+/// variables, e.g. `"$d/skip"`).
 fn detect_clawband_skip_cd_bypass(segments: &[&str]) -> bool {
     let cd_re = Regex::new(r#"(?i)^\s*cd\s+(\S+)\s*$"#).unwrap();
     let assign_re = Regex::new(r#"(?i)^\s*[A-Za-z_][A-Za-z0-9_]*=(\S+)\s*$"#).unwrap();
-    // Matches a redirect/tee/chmod operation whose operand is a bare `skip`,
-    // optionally prefixed with a shell variable reference (`$d/skip`,
-    // `${d}/skip`) and/or wrapped in quotes.
+    // Matches a redirect/tee/chmod/touch/cp operation whose operand is a bare
+    // `skip`, optionally prefixed with `./` or a shell variable reference
+    // (`$d/skip`, `${d}/skip`) and/or wrapped in quotes.
     let write_re = Regex::new(
-        r#"(?i)(?:>{1,2}\s*|tee\b[^|;&\n]*|chmod\s+\S+\s+)["']?(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/)?skip["']?\b"#,
+        r#"(?i)(?:>{1,2}\s*|tee\b[^|;&\n]*|chmod\s+\S+\s+|touch\b[^|;&\n]*?\s+|cp\s+\S+\s+)["']?(?:\./|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/)?skip["']?\b"#,
     )
     .unwrap();
 
@@ -6379,13 +6415,14 @@ fn detect_clawband_skip_cd_bypass(segments: &[&str]) -> bool {
     for seg in segments {
         let seg = seg.trim();
         if let Some(cap) = cd_re.captures(seg) {
-            if is_clawband_dir_arg(&cap[1]) {
-                clawband_dir_active = true;
-            }
+            // Every `cd` updates the tracked effective directory — a `cd`
+            // away from `~/.clawband` must clear the flag, not just leave it
+            // set (see second-opinion review, finding 2).
+            clawband_dir_active = is_global_clawband_dir_arg(&cap[1]);
             continue;
         }
         if let Some(cap) = assign_re.captures(seg) {
-            if is_clawband_dir_arg(&cap[1]) {
+            if is_global_clawband_dir_arg(&cap[1]) {
                 clawband_var_seen = true;
             }
             continue;
@@ -7075,6 +7112,26 @@ mod tests {
 
     fn decision(cmd: &str) -> Option<String> {
         check_command(cmd, &deny_pats(), &ask_pats(), &allow_pats()).map(|(d, _)| d.to_string())
+    }
+
+    // `cargo test`'s default parallel execution runs test functions on
+    // separate threads within the *same process*, so any test that mutates a
+    // process-global env var (`HOME`, `CLAWBAND_SUGGEST_THRESHOLD`, ...) can
+    // race with another such test reading/restoring that same var
+    // concurrently — this was observed causing flaky failures in
+    // `record_ask_and_suggest_returns_none_below_threshold` and
+    // `record_ask_and_suggest_returns_tip_at_threshold` (second-opinion
+    // review on PR #292, finding 3). All tests that mutate process-global env
+    // vars must acquire this lock for the full duration of the mutation +
+    // assertions, releasing it via normal scope-drop at the end of the test.
+    //
+    // `.lock().unwrap_or_else(|e| e.into_inner())` recovers from lock
+    // poisoning (e.g. a prior test panicking while holding the lock) so one
+    // failing test doesn't cascade into spurious failures in every other
+    // env-mutating test that runs after it.
+    fn env_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     // Runs the full main()-equivalent pipeline including subshell scanning
@@ -12499,6 +12556,8 @@ mod tests {
 
     #[test]
     fn is_project_allow_trusted_roundtrip() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Write an allow.patterns, register it in a temp trusted file, verify trusted
         use std::fs;
         let tmp = std::env::temp_dir().join(format!("cb_trust_unit_{}", std::process::id()));
@@ -12525,6 +12584,8 @@ mod tests {
 
     #[test]
     fn is_project_allow_trusted_wrong_hash_returns_false() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         // If the trusted file has a wrong hash, must not be trusted
         use std::fs;
         let tmp = std::env::temp_dir().join(format!("cb_trust_unit_wrong_{}", std::process::id()));
@@ -12569,6 +12630,8 @@ mod tests {
 
     #[test]
     fn skip_flag_absent_when_no_file() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = fake_home_for_skip_test("absent");
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
         std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
@@ -12580,6 +12643,8 @@ mod tests {
 
     #[test]
     fn skip_flag_active_with_strict_permissions() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let fake_home = fake_home_for_skip_test("active");
         let flag = fake_home.join(".clawband/skip");
@@ -12600,6 +12665,8 @@ mod tests {
 
     #[test]
     fn skip_flag_rejected_when_world_writable() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let fake_home = fake_home_for_skip_test("worldwritable");
         let flag = fake_home.join(".clawband/skip");
@@ -12620,6 +12687,8 @@ mod tests {
 
     #[test]
     fn skip_flag_rejected_when_group_writable() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let fake_home = fake_home_for_skip_test("groupwritable");
         let flag = fake_home.join(".clawband/skip");
@@ -12640,6 +12709,8 @@ mod tests {
 
     #[test]
     fn cmd_skip_enable_creates_file_with_safe_permissions() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let fake_home = fake_home_for_skip_test("cli_enable");
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
@@ -12662,6 +12733,8 @@ mod tests {
 
     #[test]
     fn cmd_skip_disable_removes_file() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = fake_home_for_skip_test("cli_disable");
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
         std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
@@ -13456,6 +13529,11 @@ mod tests {
 
     #[test]
     fn record_ask_and_suggest_returns_none_below_threshold() {
+        // Mutates process-global HOME + CLAWBAND_SUGGEST_THRESHOLD — serialize
+        // against other env-mutating tests (second-opinion review on PR #292,
+        // finding 3 — this was one of the two tests observed flaking under
+        // cargo test's default parallel execution).
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         // config_dir() returns $HOME/.clawband so the log lives in .clawband/
         let log_path = dir.path().join(".clawband").join("approval_log.json");
@@ -13491,6 +13569,11 @@ mod tests {
 
     #[test]
     fn record_ask_and_suggest_returns_tip_at_threshold() {
+        // Mutates process-global HOME + CLAWBAND_SUGGEST_THRESHOLD — serialize
+        // against other env-mutating tests (second-opinion review on PR #292,
+        // finding 3 — the other test observed flaking under cargo test's
+        // default parallel execution).
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
 
         let old_home = env::var(ENV_HOME).ok();
@@ -13522,6 +13605,9 @@ mod tests {
 
     #[test]
     fn suggest_threshold_env_var_override() {
+        // Mutates process-global CLAWBAND_SUGGEST_THRESHOLD — serialize
+        // against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "5");
         assert_eq!(suggest_threshold(), 5);
         env::remove_var("CLAWBAND_SUGGEST_THRESHOLD");
@@ -13530,6 +13616,9 @@ mod tests {
 
     #[test]
     fn maybe_append_ask_tip_augments_standard_reason_at_threshold() {
+        // Mutates process-global HOME + CLAWBAND_SUGGEST_THRESHOLD — serialize
+        // against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let old_home = env::var(ENV_HOME).ok();
         env::set_var("HOME", dir.path());
@@ -13870,6 +13959,81 @@ mod tests {
             protected_decision(cmd),
             None,
             "an unrelated cd + write must not be flagged: {cmd}"
+        );
+    }
+
+    // ─── Skip-flag cd/variable-indirection bypass, round 2 (second-opinion
+    // review on PR #292, findings 1 & 2) ────────────────────────────────────
+
+    #[test]
+    fn protected_ask_catches_cd_then_touch_skip() {
+        // Finding 1: `touch` is an equally-valid way to create the file that
+        // the original fix's write_re did not cover.
+        let cmd = "cd ~/.clawband && touch skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "cd into ~/.clawband followed by `touch skip` must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_cd_then_touch_dot_slash_skip() {
+        let cmd = "cd ~/.clawband && touch ./skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "cd into ~/.clawband followed by `touch ./skip` must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_cd_then_cp_onto_skip() {
+        // Finding 1: `cp` overwriting the bare `skip` filename with arbitrary
+        // content was also not covered by the original write_re.
+        let cmd = "cd ~/.clawband && cp /etc/hostname skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "cd into ~/.clawband followed by `cp ... skip` must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_cd_then_cp_onto_dot_slash_skip() {
+        let cmd = "cd ~/.clawband && cp /etc/hostname ./skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "cd into ~/.clawband followed by `cp ... ./skip` must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_cd_away_from_clawband_then_write_not_flagged() {
+        // Finding 2, bug 1: the tracked "current directory" state must be
+        // cleared by a later unrelated `cd`, not sticky for the rest of the
+        // compound command. This targets /tmp/skip, not ~/.clawband/skip.
+        let cmd = "cd ~/.clawband && cd /tmp && : > skip";
+        assert_eq!(
+            protected_decision(cmd),
+            None,
+            "a cd away from ~/.clawband before the write must clear the tracked state: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_project_local_clawband_dir_not_flagged() {
+        // Finding 2, bug 2: an unrelated project-local `.clawband/` dir (see
+        // project_config_dir()) must not be conflated with the global
+        // ~/.clawband skip-flag location just because the final path
+        // component matches.
+        let cmd = "cd /work/project/.clawband && : > skip";
+        assert_eq!(
+            protected_decision(cmd),
+            None,
+            "a write inside an unrelated project-local .clawband dir must not trigger \
+             the global skip-flag detector: {cmd}"
         );
     }
 
