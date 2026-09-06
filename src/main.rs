@@ -3735,7 +3735,13 @@ fn cmd_skip(args: &[String]) {
             // calls silently follow symlinks by default, which would
             // truncate and chmod whatever file the symlink points at.
             match fs::symlink_metadata(&path) {
-                Ok(meta) if !meta.file_type().is_file() => {
+                Ok(meta)
+                    if {
+                        let ft = meta.file_type();
+                        let is_plain_file = ft.is_file() && !ft.is_symlink();
+                        !is_plain_file
+                    } =>
+                {
                     eprintln!(
                         "clawband: refusing to enable: {} already exists and is not a regular \
                          file — remove it manually first",
@@ -6350,7 +6356,7 @@ fn is_global_clawband_dir_arg(raw: &str) -> bool {
     // `"`/`'`, removing them all is safe and lets every quoting style
     // (`$HOME/.clawband`, `"$HOME"/.clawband`, `"$HOME/.clawband"`) normalize
     // to the same form before the checks below.
-    let trimmed: String = raw.chars().filter(|c| *c != '"' && *c != '\'').collect();
+    let trimmed: String = raw.replace(['"', '\''], "");
     let trimmed = trimmed.trim_end_matches('/');
     if trimmed.rsplit('/').next() != Some(".clawband") {
         return false;
@@ -6440,7 +6446,7 @@ fn detect_clawband_skip_cd_bypass(segments: &[&str]) -> bool {
             // form as quoting the whole operand (`"$d/skip"`) or no quoting
             // at all (`$d/skip`) — a legitimate path never contains a
             // literal `"`/`'`, so this is safe.
-            let seg_no_quotes: String = seg.chars().filter(|c| *c != '"' && *c != '\'').collect();
+            let seg_no_quotes: String = seg.replace(['"', '\''], "");
             if write_re.is_match(&seg_no_quotes) {
                 return true;
             }
@@ -13557,7 +13563,7 @@ mod tests {
         // custom path via CLAWBAND_SUGGEST_THRESHOLD env var override.
         // We patch HOME so approval_log_path() resolves to our temp dir.
         let old_home = env::var(ENV_HOME).ok();
-        env::set_var("HOME", dir.path());
+        env::set_var(ENV_HOME, dir.path());
         env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "3");
 
         // First ask: no tip
@@ -13570,7 +13576,7 @@ mod tests {
 
         // Restore env
         if let Some(h) = old_home {
-            env::set_var("HOME", h);
+            env::set_var(ENV_HOME, h);
         } else {
             env::remove_var("HOME");
         }
@@ -13592,7 +13598,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let old_home = env::var(ENV_HOME).ok();
-        env::set_var("HOME", dir.path());
+        env::set_var(ENV_HOME, dir.path());
         env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "3");
 
         // Two calls below threshold
@@ -13611,7 +13617,7 @@ mod tests {
 
         // Restore env
         if let Some(h) = old_home {
-            env::set_var("HOME", h);
+            env::set_var(ENV_HOME, h);
         } else {
             env::remove_var("HOME");
         }
@@ -13636,7 +13642,7 @@ mod tests {
         let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let old_home = env::var(ENV_HOME).ok();
-        env::set_var("HOME", dir.path());
+        env::set_var(ENV_HOME, dir.path());
         env::set_var("CLAWBAND_SUGGEST_THRESHOLD", "1");
 
         let reason = "Review before running \u{2014} 'dropdb' matched in: dropdb mydb\nTo always allow:\n  ! clawband allow 'dropdb'\n";
@@ -13647,7 +13653,7 @@ mod tests {
         );
 
         if let Some(h) = old_home {
-            env::set_var("HOME", h);
+            env::set_var(ENV_HOME, h);
         } else {
             env::remove_var("HOME");
         }
