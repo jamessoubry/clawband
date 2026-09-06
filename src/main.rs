@@ -6343,7 +6343,14 @@ fn check_command<'a>(
 /// `$HOME/.clawband`, `${HOME}/.clawband`) or a literal absolute path equal
 /// to the resolved `config_dir()` are matched.
 fn is_global_clawband_dir_arg(raw: &str) -> bool {
-    let trimmed = raw.trim_matches(|c| c == '"' || c == '\'');
+    // Strip quote characters wherever they appear, not just around the whole
+    // string — real shell usage commonly quotes just the variable/expansion
+    // component (`"$HOME"/.clawband`) rather than the entire argument
+    // (`"$HOME/.clawband"`). Since a legitimate path never contains a literal
+    // `"`/`'`, removing them all is safe and lets every quoting style
+    // (`$HOME/.clawband`, `"$HOME"/.clawband`, `"$HOME/.clawband"`) normalize
+    // to the same form before the checks below.
+    let trimmed: String = raw.chars().filter(|c| *c != '"' && *c != '\'').collect();
     let trimmed = trimmed.trim_end_matches('/');
     if trimmed.rsplit('/').next() != Some(".clawband") {
         return false;
@@ -6427,8 +6434,16 @@ fn detect_clawband_skip_cd_bypass(segments: &[&str]) -> bool {
             }
             continue;
         }
-        if (clawband_dir_active || clawband_var_seen) && write_re.is_match(seg) {
-            return true;
+        if clawband_dir_active || clawband_var_seen {
+            // Strip quote characters before matching so that quoting *just*
+            // the variable component (`"$d"/skip`) normalizes to the same
+            // form as quoting the whole operand (`"$d/skip"`) or no quoting
+            // at all (`$d/skip`) — a legitimate path never contains a
+            // literal `"`/`'`, so this is safe.
+            let seg_no_quotes: String = seg.chars().filter(|c| *c != '"' && *c != '\'').collect();
+            if write_re.is_match(&seg_no_quotes) {
+                return true;
+            }
         }
     }
     false
@@ -14034,6 +14049,37 @@ mod tests {
             None,
             "a write inside an unrelated project-local .clawband dir must not trigger \
              the global skip-flag detector: {cmd}"
+        );
+    }
+
+    // ─── Skip-flag cd/variable-indirection bypass, round 3 (second-opinion
+    // review on PR #292, finding: quoted-variable-component false negative)
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn protected_ask_catches_quoted_variable_component_skip_write() {
+        // Finding: only the variable reference itself is quoted (`"$d"`),
+        // with `/skip` following outside the quotes — a very common real-
+        // world shell spelling that the original regex (which only allowed
+        // a quote wrapping the *entire* `$d/skip` expression) missed.
+        let cmd = r#"d=~/.clawband; touch "$d"/skip"#;
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "a quoted variable component (\"$d\"/skip) must still be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_quoted_home_component_cd() {
+        // Same quoting gap on the `cd` side: `"$HOME"/.clawband` quotes only
+        // the `$HOME` expansion, not the whole `$HOME/.clawband` path.
+        let cmd = r#"cd "$HOME"/.clawband && touch skip"#;
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "cd \"$HOME\"/.clawband (quoted variable component) must still be recognized \
+             as the global clawband dir: {cmd}"
         );
     }
 
