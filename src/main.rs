@@ -4656,8 +4656,7 @@ fn gh_cli_available() -> bool {
     std::process::Command::new("gh")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn verify_attestation_via_gh(path: &std::path::Path) -> Result<(), String> {
@@ -11847,6 +11846,9 @@ mod tests {
             const CHARS: &[u8] =
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             let bytes = json.as_bytes();
+            // skipcq: RS-W1079 — String::new() is the idiomatic empty-growable-string
+            // constructor here (mutated via push in the loop below); String::default()
+            // is no clearer and less conventional for this use.
             let mut out = String::new();
             for chunk in bytes.chunks(3) {
                 let b0 = chunk[0];
@@ -11885,6 +11887,8 @@ mod tests {
         // base64-encode the statement the same way the test fixture encoder above does
         const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let bytes = statement.as_bytes();
+        // skipcq: RS-W1079 — see rationale above; idiomatic empty-growable-string
+        // constructor mutated via push in the loop below.
         let mut payload_b64 = String::new();
         for chunk in bytes.chunks(3) {
             let b0 = chunk[0];
