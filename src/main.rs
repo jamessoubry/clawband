@@ -3735,13 +3735,13 @@ fn cmd_skip(args: &[String]) {
             // calls silently follow symlinks by default, which would
             // truncate and chmod whatever file the symlink points at.
             match fs::symlink_metadata(&path) {
-                Ok(meta)
-                    if {
-                        let ft = meta.file_type();
-                        let is_plain_file = ft.is_file() && !ft.is_symlink();
-                        !is_plain_file
-                    } =>
-                {
+                // skipcq: RS-A1000 — intent here is the opposite of DeepSource's
+                // assumed case: we want to reject symlinks (and anything else
+                // non-regular), not treat is_file()/is_symlink() as interchangeable.
+                // symlink_metadata (not metadata) means is_file() is false for any
+                // symlink regardless of what it points to, which is exactly the
+                // check we need.
+                Ok(meta) if !meta.file_type().is_file() => {
                     eprintln!(
                         "clawband: refusing to enable: {} already exists and is not a regular \
                          file — remove it manually first",
