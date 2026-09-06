@@ -248,6 +248,75 @@ fn e2e_skip_enable_disable_status_cli() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// `clawband skip enable` must refuse to run if a pre-existing symlink sits at
+/// the flag path, rather than following it (the default behavior of
+/// `fs::write`/`fs::set_permissions`) and silently truncating + chmod'ing
+/// whatever file the symlink points at.
+#[test]
+fn e2e_skip_enable_refuses_preexisting_symlink() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = fake_home_for_skip("symlink");
+    let h = home.to_str().unwrap();
+    let flag = home.join(".clawband/skip");
+
+    // A file the attacker/prior-process wants to protect from being clobbered.
+    let victim = home.join("victim.txt");
+    std::fs::write(&victim, "important data - do not touch").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Pre-create the skip-flag path as a symlink pointing at the victim file.
+    std::os::unix::fs::symlink(&victim, &flag).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&flag)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "sanity check: flag path must actually be a symlink before enable runs"
+    );
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_clawband"))
+        .arg("skip")
+        .arg("enable")
+        .env("HOME", h)
+        .output()
+        .expect("run clawband skip enable");
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "enable must exit non-zero when the flag path is a pre-existing symlink"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("Bypass enabled"),
+        "must not report success when refusing to overwrite a symlink: {stdout}"
+    );
+
+    // The symlink itself must be untouched (still a symlink, not replaced).
+    assert!(
+        std::fs::symlink_metadata(&flag)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink at the flag path must not be replaced"
+    );
+
+    // Most importantly: the victim file's content and permissions must be
+    // completely untouched — no truncation, no chmod to 0600.
+    let victim_contents = std::fs::read_to_string(&victim).unwrap();
+    assert_eq!(
+        victim_contents, "important data - do not touch",
+        "victim file content must be untouched by a refused `skip enable`"
+    );
+    let victim_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        victim_mode, 0o644,
+        "victim file permissions must be untouched by a refused `skip enable`"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn e2e_non_bash_tool_non_sensitive_path_is_noop() {
     // Write tool to a non-sensitive path: no decision (pass through).

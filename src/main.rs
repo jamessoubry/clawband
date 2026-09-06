@@ -3728,6 +3728,28 @@ fn cmd_skip(args: &[String]) {
                 eprintln!("clawband: failed to create {}: {e}", config_dir().display());
                 std::process::exit(1);
             }
+            // Use symlink_metadata (does NOT follow symlinks) rather than
+            // metadata (which does) so a pre-existing symlink at the flag
+            // path is caught here instead of falling through to fs::write /
+            // fs::set_permissions below — both of those standard library
+            // calls silently follow symlinks by default, which would
+            // truncate and chmod whatever file the symlink points at.
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.file_type().is_file() => {
+                    eprintln!(
+                        "clawband: refusing to enable: {} already exists and is not a regular \
+                         file — remove it manually first",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+                Ok(_) => {} // pre-existing regular file — safe to overwrite in place below
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!("clawband: failed to inspect {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            }
             if let Err(e) = fs::write(&path, "") {
                 eprintln!("clawband: failed to create {}: {e}", path.display());
                 std::process::exit(1);
@@ -6308,6 +6330,73 @@ fn check_command<'a>(
     None
 }
 
+/// Returns true if `raw` (an unquoted or quoted path/argument) resolves — as a
+/// bare textual last path segment — to a directory named `.clawband`.  Used to
+/// catch `cd ~/.clawband` / `cd .clawband` / `d=~/.clawband` regardless of the
+/// exact prefix (`~/`, `$HOME/`, relative, etc.) without needing full shell
+/// path resolution.
+fn is_clawband_dir_arg(raw: &str) -> bool {
+    let trimmed = raw.trim_matches(|c| c == '"' || c == '\'');
+    let trimmed = trimmed.trim_end_matches('/');
+    trimmed.rsplit('/').next() == Some(".clawband")
+}
+
+/// Detects the `cd`-then-relative-write bypass class for the `~/.clawband/skip`
+/// flag file.  `builtin_protected_ask()`'s "write to ~/.clawband/" pattern only
+/// matches when the literal substring `.clawband/` appears directly in the
+/// redirect/tee operand.  An agent can dodge that by first `cd`-ing into a
+/// `.clawband`-ending directory (or pointing a shell variable at one) and then
+/// writing/chmod'ing a *bare* filename, e.g.:
+///
+///   cd ~/.clawband && : > skip && chmod 600 skip
+///   d=~/.clawband; : > "$d/skip"; chmod 600 "$d/skip"
+///
+/// This is a heuristic, not full shell-semantic variable resolution (that's
+/// undecidable in general) — it deliberately favors catching this bypass class
+/// over exhaustive precision, consistent with how the rest of this file
+/// balances heuristic detection against false positives. It tracks, across the
+/// compound command's segments:
+///   - whether a `cd` targeted a `.clawband`-ending directory, and
+///   - which shell variables (if any) were assigned a `.clawband`-ending path,
+///
+/// then flags any later write/tee/chmod operation targeting a bare `skip`
+/// filename (optionally prefixed by one of those tracked variables, e.g.
+/// `"$d/skip"`).
+fn detect_clawband_skip_cd_bypass(segments: &[&str]) -> bool {
+    let cd_re = Regex::new(r#"(?i)^\s*cd\s+(\S+)\s*$"#).unwrap();
+    let assign_re = Regex::new(r#"(?i)^\s*[A-Za-z_][A-Za-z0-9_]*=(\S+)\s*$"#).unwrap();
+    // Matches a redirect/tee/chmod operation whose operand is a bare `skip`,
+    // optionally prefixed with a shell variable reference (`$d/skip`,
+    // `${d}/skip`) and/or wrapped in quotes.
+    let write_re = Regex::new(
+        r#"(?i)(?:>{1,2}\s*|tee\b[^|;&\n]*|chmod\s+\S+\s+)["']?(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/)?skip["']?\b"#,
+    )
+    .unwrap();
+
+    let mut clawband_dir_active = false;
+    let mut clawband_var_seen = false;
+
+    for seg in segments {
+        let seg = seg.trim();
+        if let Some(cap) = cd_re.captures(seg) {
+            if is_clawband_dir_arg(&cap[1]) {
+                clawband_dir_active = true;
+            }
+            continue;
+        }
+        if let Some(cap) = assign_re.captures(seg) {
+            if is_clawband_dir_arg(&cap[1]) {
+                clawband_var_seen = true;
+            }
+            continue;
+        }
+        if (clawband_dir_active || clawband_var_seen) && write_re.is_match(seg) {
+            return true;
+        }
+    }
+    false
+}
+
 // ─── Protected-ask tier check ─────────────────────────────────────────────────
 // Separate from check_command() so the bypass suppression logic in main() can
 // skip it.  Returns the reason string on a match, None on no match.
@@ -6332,12 +6421,14 @@ fn check_protected_ask(
     }
     let clean = strip_safe_pipes(command);
     let segments = split_segments(&clean);
+    let mut kept_segments: Vec<&str> = Vec::with_capacity(segments.len());
     for segment in &segments {
         let segment: &str = strip_comment(segment.as_str());
         // Allow patterns suppress protected-ask just like regular ask.
         if allow_pats.iter().any(|p| p.matches(segment)) {
             continue;
         }
+        kept_segments.push(segment);
         for pat in protected_ask_pats {
             if pat.matches(segment) {
                 return Some(format!(
@@ -6351,6 +6442,18 @@ fn check_protected_ask(
                 ));
             }
         }
+    }
+    // Belt-and-braces: catch `cd`-then-relative-write and variable-expansion
+    // dodges of the `.clawband/` path-substring patterns above (see
+    // detect_clawband_skip_cd_bypass doc comment).
+    if detect_clawband_skip_cd_bypass(&kept_segments) {
+        return Some(format!(
+            "Review before running \u{2014} 'write to ~/.clawband/skip (via cd or variable indirection)' matched in: {}\n\
+             This will prompt even in bypassPermissions (YOLO) mode.\n\
+             To always allow:\n  ! {} allow '<the underlying command>'\n",
+            command,
+            hook_command_string()
+        ));
     }
     None
 }
@@ -13729,6 +13832,45 @@ mod tests {
     fn protected_ask_clawband_dir_bypasses_yolo() {
         let cmd = r#"echo '.*' > ~/.clawband/allow.patterns"#;
         assert_eq!(protected_decision(cmd), Some("protected-ask".to_string()));
+    }
+
+    // ─── Skip-flag cd/variable-indirection bypass (second-opinion review on
+    // PR #292, finding 1) ───────────────────────────────────────────────────
+    // `write to ~/.clawband/` only matches when the literal substring
+    // `.clawband/` appears directly in the redirect/tee operand. An agent
+    // can dodge that by `cd`-ing into a `.clawband`-ending dir, or pointing
+    // a shell variable at one, then writing/chmod'ing a bare `skip`.
+
+    #[test]
+    fn protected_ask_catches_cd_then_bare_skip_write() {
+        let cmd = "cd ~/.clawband && : > skip && chmod 600 skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "cd into ~/.clawband followed by a bare `skip` write must still be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_variable_indirection_skip_write() {
+        let cmd = r#"d=~/.clawband; : > "$d/skip"; chmod 600 "$d/skip""#;
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "a variable set to ~/.clawband then referenced as \"$d/skip\" must still be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_unrelated_cd_and_write_not_flagged() {
+        // Regression: ordinary unrelated cd + file-write must NOT be flagged
+        // as a skip-flag bypass attempt.
+        let cmd = "cd /tmp && echo hi > out.txt";
+        assert_eq!(
+            protected_decision(cmd),
+            None,
+            "an unrelated cd + write must not be flagged: {cmd}"
+        );
     }
 
     #[test]
