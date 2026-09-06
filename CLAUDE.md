@@ -19,7 +19,7 @@ cargo build --release && ~/.cargo/bin/clawband install
 
 ## Architecture
 
-- Single binary (`src/main.rs`) — no runtime dependencies beyond `regex` and `serde_json`
+- Single binary (`src/main.rs`) — minimal runtime dependencies: `regex` and `serde_json` for the core engine, plus `sha2` (deliberate exception, added in v3.16.0) for collision-resistant SHA-256 integrity hashing of project `allow.patterns` trust records — a security boundary that should not be hand-rolled
 - `builtin_deny()` / `builtin_ask()` — built-in pattern tiers
 - `check_command()` — main evaluation pipeline: compound-split → deny → ask → echo-scan → write-then-exec → fetch-then-exec → subshell
 - `Pattern::from_user()` — loads user patterns from `~/.clawband/{deny,ask,allow}.patterns` and `.clawband/` project dirs

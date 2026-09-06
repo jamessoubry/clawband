@@ -1539,34 +1539,101 @@ fn project_config_dir() -> Option<PathBuf> {
 // Project allow.patterns requires explicit `clawband trust` — auto-loading is a
 // supply-chain vector: a `.*` in a committed allow.patterns disables all protection.
 
-fn fnv1a_64(data: &[u8]) -> u64 {
-    let mut hash: u64 = 14695981039346656037;
-    for &b in data {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(1099511628211);
+/// SHA-256 hex digest of `data`. Used for allow.patterns trust integrity —
+/// this is a security boundary (defends against a malicious repo change to
+/// a project's allow.patterns), so it needs a collision-resistant hash, not
+/// a checksum-grade one like FNV-1a. This is the one place in clawband where
+/// we intentionally reach for a crypto crate (`sha2`) rather than hand-roll
+/// something, because integrity hashing is exactly the kind of primitive
+/// that should not be hand-rolled.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
     }
-    hash
+    out
 }
 
 fn trusted_file() -> PathBuf {
     config_dir().join("trusted")
 }
 
+/// A single structured trust record: which file, which hash algorithm, and
+/// the digest under that algorithm. Stored as `key=value` lines grouped into
+/// blocks separated by a blank line, e.g.:
+///
+/// ```text
+/// path=/home/user/project/.clawband/allow.patterns
+/// algorithm=sha256
+/// digest=<hex>
+/// ```
+///
+/// Records missing any of the three fields (including legacy single-line
+/// `<path> <fnv1a-hash>` entries from clawband < 3.16) are silently dropped
+/// during parsing — an old-format or malformed entry is treated as "not
+/// present", which falls through to the normal untrusted path. It never
+/// panics and never treats garbage as a match.
+struct TrustEntry {
+    path: String,
+    algorithm: String,
+    digest: String,
+}
+
+fn parse_trust_entries(content: &str) -> Vec<TrustEntry> {
+    let mut entries = Vec::new();
+    for block in content.split("\n\n") {
+        let mut path = None;
+        let mut algorithm = None;
+        let mut digest = None;
+        for line in block.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("path=") {
+                path = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("algorithm=") {
+                algorithm = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("digest=") {
+                digest = Some(v.to_string());
+            }
+            // Any other line shape (e.g. a legacy "path hash" line) is
+            // simply ignored here — it will not satisfy the three required
+            // fields below, so the whole block is dropped rather than
+            // partially trusted.
+        }
+        if let (Some(path), Some(algorithm), Some(digest)) = (path, algorithm, digest) {
+            entries.push(TrustEntry {
+                path,
+                algorithm,
+                digest,
+            });
+        }
+    }
+    entries
+}
+
+/// Best-effort canonicalization: resolves symlinks/`..` when the path
+/// exists, falling back to the path as-given when it doesn't (so a
+/// not-yet-existing path still gets a stable, comparable string instead of
+/// causing a hard failure). Binding trust to the canonical path prevents a
+/// relative-path or symlink trick from producing a false trust match.
+fn canonical_key(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn is_project_allow_trusted(allow_path: &Path) -> bool {
     let Ok(data) = fs::read(allow_path) else {
         return false;
     };
-    let hash = fnv1a_64(&data);
-    let key = allow_path.to_string_lossy();
+    let digest = sha256_hex(&data);
+    let key = canonical_key(allow_path);
     let trusted = fs::read_to_string(trusted_file()).unwrap_or_default();
-    for line in trusted.lines() {
-        let mut parts = line.splitn(2, ' ');
-        if let (Some(path), Some(h)) = (parts.next(), parts.next()) {
-            if path == key {
-                if let Ok(stored) = h.trim().parse::<u64>() {
-                    return stored == hash;
-                }
-            }
+    for entry in parse_trust_entries(&trusted) {
+        if entry.path == key && entry.algorithm == "sha256" {
+            return entry.digest.eq_ignore_ascii_case(&digest);
         }
     }
     false
@@ -3688,19 +3755,33 @@ fn cmd_trust(args: &[&str]) {
             std::process::exit(1);
         }
     };
-    let hash = fnv1a_64(&data);
+    let digest = sha256_hex(&data);
     let key = canonical.to_string_lossy().into_owned();
 
-    // Read existing trusted file, replace or append
+    // Read existing trusted file, drop any prior entry for this path
+    // (including stale legacy-format entries, which parse_trust_entries()
+    // already excludes), then append the new structured sha256 record.
     let tf = trusted_file();
     let existing = fs::read_to_string(&tf).unwrap_or_default();
-    let mut lines: Vec<String> = existing
-        .lines()
-        .filter(|l| !l.starts_with(&key))
-        .map(String::from)
+    let mut entries: Vec<TrustEntry> = parse_trust_entries(&existing)
+        .into_iter()
+        .filter(|e| e.path != key)
         .collect();
-    lines.push(format!("{key} {hash}"));
-    let content = lines.join("\n") + "\n";
+    entries.push(TrustEntry {
+        path: key.clone(),
+        algorithm: "sha256".to_string(),
+        digest,
+    });
+    let content = entries
+        .iter()
+        .map(|e| {
+            format!(
+                "path={}\nalgorithm={}\ndigest={}\n",
+                e.path, e.algorithm, e.digest
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     if let Some(parent) = tf.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -12544,27 +12625,31 @@ mod tests {
         );
     }
 
-    // ── issue #132: project allow.patterns trust infrastructure ──────────────
+    // ── issue #132 / #284: project allow.patterns trust infrastructure ───────
+    // #284 replaced the FNV-1a checksum with SHA-256 and the ad-hoc
+    // "<path> <hash>" line with a structured path/algorithm/digest record.
 
     #[test]
-    fn fnv1a_64_deterministic() {
-        // Same input must always yield the same hash
-        let h1 = fnv1a_64(b"^git reset --hard HEAD$\n");
-        let h2 = fnv1a_64(b"^git reset --hard HEAD$\n");
-        assert_eq!(h1, h2, "fnv1a_64 must be deterministic");
+    fn sha256_hex_deterministic() {
+        let h1 = sha256_hex(b"^git reset --hard HEAD$\n");
+        let h2 = sha256_hex(b"^git reset --hard HEAD$\n");
+        assert_eq!(h1, h2, "sha256_hex must be deterministic");
     }
 
     #[test]
-    fn fnv1a_64_differs_for_different_input() {
-        let h1 = fnv1a_64(b"abc");
-        let h2 = fnv1a_64(b"abd");
-        assert_ne!(h1, h2, "fnv1a_64 must differ for different inputs");
+    fn sha256_hex_differs_for_different_input() {
+        let h1 = sha256_hex(b"abc");
+        let h2 = sha256_hex(b"abd");
+        assert_ne!(h1, h2, "sha256_hex must differ for different inputs");
     }
 
     #[test]
-    fn fnv1a_64_empty_input_is_offset_basis() {
-        // FNV-1a of empty input is the offset basis (14695981039346656037)
-        assert_eq!(fnv1a_64(b""), 14695981039346656037u64);
+    fn sha256_hex_matches_known_vector() {
+        // NIST test vector: SHA-256("abc")
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
@@ -12575,61 +12660,159 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn is_project_allow_trusted_roundtrip() {
-        // Mutates process-global HOME — serialize against other env-mutating tests.
-        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // Write an allow.patterns, register it in a temp trusted file, verify trusted
+    /// Set up a temp dir + fake $HOME containing an allow.patterns file and
+    /// its structured trust record, matching what `clawband trust` writes.
+    /// Returns (tmp dir, fake home dir, canonicalized allow_path).
+    fn setup_trust_fixture(name: &str, data: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
         use std::fs;
-        let tmp = std::env::temp_dir().join(format!("cb_trust_unit_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let allow_path = tmp.join("allow.patterns");
-        let data = b"^ls -la\n";
         fs::write(&allow_path, data).unwrap();
-        let hash = fnv1a_64(data);
-        let key = allow_path.to_string_lossy().into_owned();
-        // Write a fake trusted file in a temp home
+        let canonical = allow_path.canonicalize().unwrap();
         let fake_home = tmp.join("home");
         fs::create_dir_all(fake_home.join(".clawband")).unwrap();
-        let trusted_path = fake_home.join(".clawband/trusted");
-        fs::write(&trusted_path, format!("{key} {hash}\n")).unwrap();
-        // Override HOME for the duration of this assertion
+        (tmp, fake_home, canonical)
+    }
+
+    fn with_fake_home<T>(fake_home: &Path, f: impl FnOnce() -> T) -> T {
         let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
         std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
-        let result = is_project_allow_trusted(&allow_path);
+        let result = f();
         std::env::set_var(ENV_HOME, orig_home);
-        assert!(result, "allow.patterns with correct hash must be trusted");
+        result
+    }
+
+    #[test]
+    fn is_project_allow_trusted_roundtrip_sha256() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let data = b"^ls -la\n";
+        let (tmp, fake_home, canonical) = setup_trust_fixture("cb_trust_unit_sha256", data);
+        let digest = sha256_hex(data);
+        let key = canonical.to_string_lossy().into_owned();
+        fs::write(
+            fake_home.join(".clawband/trusted"),
+            format!("path={key}\nalgorithm=sha256\ndigest={digest}\n"),
+        )
+        .unwrap();
+        let result = with_fake_home(&fake_home, || is_project_allow_trusted(&canonical));
+        assert!(
+            result,
+            "allow.patterns with correct sha256 digest must be trusted"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn is_project_allow_trusted_wrong_hash_returns_false() {
-        // Mutates process-global HOME — serialize against other env-mutating tests.
+    fn is_project_allow_trusted_tampered_content_returns_false() {
+        // The core security property: once trusted content changes, the
+        // digest no longer matches and the file must fall back to untrusted.
         let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // If the trusted file has a wrong hash, must not be trusted
-        use std::fs;
-        let tmp = std::env::temp_dir().join(format!("cb_trust_unit_wrong_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-        let allow_path = tmp.join("allow.patterns");
-        fs::write(&allow_path, b"^ls -la\n").unwrap();
-        let wrong_hash: u64 = 999999999;
-        let key = allow_path.to_string_lossy().into_owned();
-        let fake_home = tmp.join("home");
-        fs::create_dir_all(fake_home.join(".clawband")).unwrap();
+        let original = b"^ls -la\n";
+        let (tmp, fake_home, canonical) = setup_trust_fixture("cb_trust_unit_tamper", original);
+        let digest = sha256_hex(original);
+        let key = canonical.to_string_lossy().into_owned();
         fs::write(
             fake_home.join(".clawband/trusted"),
-            format!("{key} {wrong_hash}\n"),
+            format!("path={key}\nalgorithm=sha256\ndigest={digest}\n"),
         )
         .unwrap();
-        let orig_home = std::env::var(ENV_HOME).unwrap_or_default();
-        std::env::set_var(ENV_HOME, fake_home.to_str().unwrap());
-        let result = is_project_allow_trusted(&allow_path);
-        std::env::set_var(ENV_HOME, orig_home);
+        // Tamper with the allow.patterns content after it was trusted —
+        // e.g. a malicious repo change adding `.*` to disable protection.
+        fs::write(&canonical, b".*\n").unwrap();
+        let result = with_fake_home(&fake_home, || is_project_allow_trusted(&canonical));
         assert!(
             !result,
-            "allow.patterns with wrong hash must not be trusted"
+            "allow.patterns whose content changed after trust must not be trusted"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_project_allow_trusted_wrong_digest_returns_false() {
+        // Mutates process-global HOME — serialize against other env-mutating tests.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home, canonical) = setup_trust_fixture("cb_trust_unit_wrong", b"^ls -la\n");
+        let key = canonical.to_string_lossy().into_owned();
+        fs::write(
+            fake_home.join(".clawband/trusted"),
+            format!("path={key}\nalgorithm=sha256\ndigest={}\n", "0".repeat(64)),
+        )
+        .unwrap();
+        let result = with_fake_home(&fake_home, || is_project_allow_trusted(&canonical));
+        assert!(
+            !result,
+            "allow.patterns with wrong digest must not be trusted"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_project_allow_trusted_legacy_fnv1a_entry_is_untrusted_not_crashed() {
+        // A trust file written by clawband < 3.16 (bare "<path> <hash>" line,
+        // no path=/algorithm=/digest= keys) must be treated as "not trusted"
+        // — gracefully falling through to normal deny/ask/allow evaluation —
+        // never panicking and never being misread as a valid match.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home, canonical) = setup_trust_fixture("cb_trust_unit_legacy", b"^ls -la\n");
+        let key = canonical.to_string_lossy().into_owned();
+        // Legacy single-line format: "<path> <fnv1a_u64_hash>"
+        fs::write(
+            fake_home.join(".clawband/trusted"),
+            format!("{key} 12345678901234567890\n"),
+        )
+        .unwrap();
+        let result = with_fake_home(&fake_home, || is_project_allow_trusted(&canonical));
+        assert!(
+            !result,
+            "legacy FNV-1a trust entries must be treated as untrusted, not crash"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_trust_entries_ignores_malformed_blocks() {
+        // Missing digest= field -> whole block dropped, no panic.
+        let entries = parse_trust_entries("path=/foo/allow.patterns\nalgorithm=sha256\n");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_trust_entries_parses_multiple_structured_records() {
+        let content = "path=/a/allow.patterns\nalgorithm=sha256\ndigest=aa\n\npath=/b/allow.patterns\nalgorithm=sha256\ndigest=bb\n";
+        let entries = parse_trust_entries(content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "/a/allow.patterns");
+        assert_eq!(entries[0].digest, "aa");
+        assert_eq!(entries[1].path, "/b/allow.patterns");
+        assert_eq!(entries[1].digest, "bb");
+    }
+
+    #[test]
+    fn is_project_allow_trusted_binds_to_canonical_path() {
+        // Trust is stored against the canonicalized path. Looking up via a
+        // non-canonical (relative / `.`-containing) path to the same file
+        // must still resolve to the same trust entry, and a *different*
+        // file at a distinct canonical path must not match.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let data = b"^ls -la\n";
+        let (tmp, fake_home, canonical) = setup_trust_fixture("cb_trust_unit_canon", data);
+        let digest = sha256_hex(data);
+        let key = canonical.to_string_lossy().into_owned();
+        fs::write(
+            fake_home.join(".clawband/trusted"),
+            format!("path={key}\nalgorithm=sha256\ndigest={digest}\n"),
+        )
+        .unwrap();
+        // Build a non-canonical path to the same file (extra "." segment)
+        // and confirm it still resolves via canonicalization.
+        let noncanonical = tmp.join(".").join("allow.patterns");
+        let result = with_fake_home(&fake_home, || is_project_allow_trusted(&noncanonical));
+        assert!(
+            result,
+            "a non-canonical path to the same trusted file must still resolve via canonicalization"
         );
         let _ = fs::remove_dir_all(&tmp);
     }

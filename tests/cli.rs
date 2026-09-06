@@ -3011,6 +3011,127 @@ fn e2e_project_allow_trusted_is_loaded() {
     let _ = fs::remove_dir_all(&proj);
 }
 
+// ── issue #284: SHA-256 trust integrity + structured trust records ────────────
+
+#[test]
+fn e2e_trust_writes_structured_sha256_record() {
+    // `clawband trust` must write a structured path=/algorithm=/digest= record,
+    // not a bare "<path> <hash>" line, and the algorithm must be sha256.
+    use std::fs;
+    use std::process::Command;
+    let home = std::env::temp_dir().join(format!("cb_trust_fmt_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    let proj = std::env::temp_dir().join(format!("cb_trust_fmt_proj_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&proj);
+    fs::create_dir_all(proj.join(".clawband")).unwrap();
+    let allow_path = proj.join(".clawband/allow.patterns");
+    fs::write(&allow_path, "^ls -la\n").unwrap();
+    let h = home.to_str().unwrap();
+
+    Command::new(env!("CARGO_BIN_EXE_clawband"))
+        .args(["trust", allow_path.to_str().unwrap()])
+        .env("HOME", h)
+        .output()
+        .expect("clawband trust failed");
+
+    let trusted = fs::read_to_string(home.join(".clawband/trusted")).unwrap();
+    assert!(
+        trusted.contains("algorithm=sha256"),
+        "trusted file must record algorithm=sha256: {trusted}"
+    );
+    assert!(
+        trusted.contains("digest="),
+        "trusted file must record a digest= field: {trusted}"
+    );
+    assert!(
+        trusted.contains("path="),
+        "trusted file must record a path= field: {trusted}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&proj);
+}
+
+#[test]
+fn e2e_trust_content_change_after_trust_is_untrusted() {
+    // The core security property of the trust mechanism: tampering with the
+    // allow.patterns content after `clawband trust` was run must invalidate
+    // trust (digest mismatch), falling back to normal deny/ask evaluation.
+    use std::fs;
+    use std::process::Command;
+    let home = std::env::temp_dir().join(format!("cb_trust_tamper_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    let proj = std::env::temp_dir().join(format!("cb_trust_tamper_proj_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&proj);
+    fs::create_dir_all(proj.join(".clawband")).unwrap();
+    let allow_path = proj.join(".clawband/allow.patterns");
+    fs::write(&allow_path, "^git reset --hard HEAD$\n").unwrap();
+    let h = home.to_str().unwrap();
+    let p = proj.to_str().unwrap();
+
+    Command::new(env!("CARGO_BIN_EXE_clawband"))
+        .args(["trust", allow_path.to_str().unwrap()])
+        .env("HOME", h)
+        .output()
+        .expect("clawband trust failed");
+
+    // Confirm trust took effect first.
+    let trusted_out = run(&bash("git reset --hard HEAD"), &[("HOME", h), ("PWD", p)]);
+    assert_eq!(
+        decision(&trusted_out),
+        Some("allow"),
+        "trust must be active before tampering: {trusted_out}"
+    );
+
+    // Simulate a malicious repo change to allow.patterns after it was trusted.
+    fs::write(&allow_path, ".*\n").unwrap();
+    let after_tamper = run(&bash("docker system prune"), &[("HOME", h), ("PWD", p)]);
+    assert_eq!(
+        decision(&after_tamper),
+        Some("deny"),
+        "tampered allow.patterns must no longer be trusted, so deny still applies: {after_tamper}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&proj);
+}
+
+#[test]
+fn e2e_trust_legacy_fnv1a_entry_is_gracefully_untrusted() {
+    // A trusted file written by clawband < 3.16 (bare "<path> <hash>" line)
+    // must be treated as untrusted, not crash the hook.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_trust_legacy_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".clawband")).unwrap();
+    let proj = std::env::temp_dir().join(format!("cb_trust_legacy_proj_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&proj);
+    fs::create_dir_all(proj.join(".clawband")).unwrap();
+    let allow_path = proj.join(".clawband/allow.patterns");
+    fs::write(&allow_path, "^git reset --hard HEAD$\n").unwrap();
+    let canonical_allow = allow_path.canonicalize().unwrap();
+    // Legacy single-line FNV-1a-based entry.
+    fs::write(
+        home.join(".clawband/trusted"),
+        format!("{} 12345678901234567890\n", canonical_allow.display()),
+    )
+    .unwrap();
+    let h = home.to_str().unwrap();
+    let p = proj.to_str().unwrap();
+
+    let out = run(&bash("git reset --hard HEAD"), &[("HOME", h), ("PWD", p)]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "legacy FNV-1a trust entry must be treated as untrusted (not crash): {out}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&proj);
+}
+
 // ── issue #134: breadcrumb misattribution ─────────────────────────────────────
 // ── issue #135: per-call-id breadcrumb keying ─────────────────────────────────
 
