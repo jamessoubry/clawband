@@ -11650,11 +11650,11 @@ mod tests {
         let unquoted = redact_secrets("PASSWORD=mySecretPass123 run-thing");
         assert!(!unquoted.contains("mySecretPass123"));
 
-        let double_quoted = redact_secrets(r#"Token="my-secret-token" run-thing"#);
-        assert!(!double_quoted.contains("my-secret-token"));
+        let double_quoted = redact_secrets(r#"Token="FAKETOKENVALUEEXAMPLE" run-thing"#);
+        assert!(!double_quoted.contains("FAKETOKENVALUEEXAMPLE"));
 
-        let single_quoted = redact_secrets("Secret='another-secret' run-thing");
-        assert!(!single_quoted.contains("another-secret"));
+        let single_quoted = redact_secrets("Secret='FAKESECRETVALUEEXAMPLE' run-thing");
+        assert!(!single_quoted.contains("FAKESECRETVALUEEXAMPLE"));
 
         // Quote characters around the value must be preserved so the redacted
         // preview still reads like a normal key=value assignment.
@@ -11792,6 +11792,35 @@ mod tests {
             out.contains("***REDACTED***"),
             "expected redaction marker in output, got: {out}"
         );
+    }
+
+    #[test]
+    fn probe_underscore_prefixed_key_names() {
+        let cases = [
+            "GITHUB_TOKEN=ghp_supersecretvalue1234 gh api foo",
+            "SLACK_BOT_TOKEN=xoxb-supersecretvalue gh api foo",
+            "DB_PASSWORD=hunter2hunter2 psql",
+            "OPENAI_API_KEY=sk-supersecretvalue1234 run",
+            "STRIPE_SECRET_KEY=sk_live_supersecretvalue run",
+        ];
+        for cmd in cases {
+            let out = redact_secrets(cmd);
+            println!("{:?} -> {:?}", cmd, out);
+        }
+    }
+
+    #[test]
+    fn probe_auth_header_unquoted_no_trailing_quote_in_command() {
+        // Command built without wrapping quotes around the header value at all
+        // (e.g. constructed programmatically rather than typed at a shell).
+        let cases = [
+            "curl -H Authorization:Bearer-sk-plaintoken123 https://example.com extra-arg",
+            "some-request Authorization: sk-noquotes-secret-abc && echo done",
+        ];
+        for cmd in cases {
+            let out = redact_secrets(cmd);
+            println!("{:?} -> {:?}", cmd, out);
+        }
     }
 
     // ── Item #2: PROTECT_PATHS_TEMPLATE contains auto-executed-file patterns ──
