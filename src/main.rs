@@ -11650,9 +11650,11 @@ mod tests {
         let unquoted = redact_secrets("PASSWORD=mySecretPass123 run-thing");
         assert!(!unquoted.contains("mySecretPass123"));
 
+        // skipcq -- fake test fixture value, not a real credential
         let double_quoted = redact_secrets(r#"Token="FAKETOKENVALUEEXAMPLE" run-thing"#);
         assert!(!double_quoted.contains("FAKETOKENVALUEEXAMPLE"));
 
+        // skipcq -- fake test fixture value, not a real credential
         let single_quoted = redact_secrets("Secret='FAKESECRETVALUEEXAMPLE' run-thing");
         assert!(!single_quoted.contains("FAKESECRETVALUEEXAMPLE"));
 
