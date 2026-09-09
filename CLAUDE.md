@@ -26,6 +26,14 @@ cargo build --release && ~/.cargo/bin/clawband install
 - `emit_decision()` — routes output per mode (Claude, Codex, Gemini, Hermes, Openclaw, Opencode)
 - Version bumps: `Cargo.toml` version field (Cargo.lock updates automatically via `cargo update -p clawband`)
 
+## Logging (`~/.clawband.log`)
+
+- Opt-in only (`CLAWBAND_LOG=1` or the `clawband log --enable` marker) — off by default.
+- Created via a plain `OpenOptions::append().create()` with no explicit mode set, so it inherits the process umask (typically `0644`/`0664` — group/world **readable** on most systems). It is not created `0600`; treat it as a regular file, not a secrets vault.
+- Retention: none. `maybe_rotate_log()` renames the live file to a single `.clawband.log.1` backup once it exceeds the size cap — there is no pruning, deletion, or bounded history beyond that one backup.
+- Since v3.17.1, `log_action()` runs `redact_secrets()` on the command preview before truncating it, stripping common secret-bearing forms (`Authorization:` headers, `Bearer <token>`, `AWS_SECRET_ACCESS_KEY=`/`AWS_SESSION_TOKEN=`, `password=`/`passwd=`/`pwd=`, `token=`, `api_key=`/`apikey=`/`api-key=`, `secret=`) to `***REDACTED***`.
+- **This is best-effort pattern matching, not an exhaustive secret scanner** — same defense-in-depth spirit as the skip-flag bypass detection elsewhere in this project. On a shared machine, don't assume the log is safe from a determined reader: an unrecognized secret format, a custom env var name, or a base64/encoded blob will pass through untouched.
+
 ## Testing
 
 All pattern changes must include:

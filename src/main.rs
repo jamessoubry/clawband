@@ -488,6 +488,87 @@ fn maybe_rotate_log(path: &std::path::Path) {
     let _ = fs::rename(path, backup);
 }
 
+/// Best-effort redaction of common secret-bearing forms before a command is
+/// written to the log preview. This is defense-in-depth pattern matching, not
+/// an exhaustive secret scanner — see the log-safety notes in CLAUDE.md.
+///
+/// Handles (case-insensitively): `Authorization:` headers, `Bearer <token>`,
+/// `AWS_SECRET_ACCESS_KEY=`/`AWS_SESSION_TOKEN=`, `password=`/`passwd=`/`pwd=`,
+/// `token=`, `api_key=`/`apikey=`/`api-key=`, and `secret=`. Values may be
+/// unquoted or wrapped in single/double quotes.
+fn redact_secrets(command: &str) -> String {
+    use std::sync::OnceLock;
+    static AUTH_HEADER_RE: OnceLock<Regex> = OnceLock::new();
+    static BEARER_RE: OnceLock<Regex> = OnceLock::new();
+    static KV_SECRET_RE: OnceLock<Regex> = OnceLock::new();
+
+    const REDACTED: &str = "***REDACTED***";
+
+    // The regex crate doesn't support backreferences, so each pattern is
+    // split into three quote-style alternatives (double-quoted, single-quoted,
+    // unquoted) rather than matching an opening quote and requiring the same
+    // quote to close it.
+    let auth_header_re = AUTH_HEADER_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(authorization\s*:\s*)(?:"([^"]+)"|'([^']+)'|([^\s'"]+(?:\s+[^\s'"]+)?))"#,
+        )
+        .unwrap()
+    });
+    let bearer_re = BEARER_RE
+        .get_or_init(|| Regex::new(r#"(?i)(bearer\s+)(?:"([^"]+)"|'([^']+)'|(\S+))"#).unwrap());
+    // Matches KEY=value / KEY="value" / KEY='value' for the various secret-ish
+    // key names, requiring a word boundary before the key so we don't clobber
+    // e.g. `mytoken=` (unlikely, but keeps false positives down).
+    let kv_secret_re = KV_SECRET_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(aws_secret_access_key|aws_session_token|password|passwd|pwd|token|api[_-]?key|secret)(\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s'"]*))"#,
+        )
+        .unwrap()
+    });
+
+    // Given a match with three mutually-exclusive quote-style capture groups
+    // (double, single, unquoted), rebuild the string with the value replaced
+    // but the original quoting preserved.
+    fn rebuild(prefix: &str, dq: Option<&str>, sq: Option<&str>, uq: Option<&str>) -> String {
+        if dq.is_some() {
+            format!("{}\"{}\"", prefix, REDACTED)
+        } else if sq.is_some() {
+            format!("{}'{}'", prefix, REDACTED)
+        } else {
+            debug_assert!(uq.is_some());
+            format!("{}{}", prefix, REDACTED)
+        }
+    }
+
+    let redacted = auth_header_re.replace_all(command, |caps: &regex::Captures| {
+        rebuild(
+            &caps[1],
+            caps.get(2).map(|m| m.as_str()),
+            caps.get(3).map(|m| m.as_str()),
+            caps.get(4).map(|m| m.as_str()),
+        )
+    });
+    let redacted = bearer_re.replace_all(&redacted, |caps: &regex::Captures| {
+        rebuild(
+            &caps[1],
+            caps.get(2).map(|m| m.as_str()),
+            caps.get(3).map(|m| m.as_str()),
+            caps.get(4).map(|m| m.as_str()),
+        )
+    });
+    let redacted = kv_secret_re.replace_all(&redacted, |caps: &regex::Captures| {
+        let prefix = format!("{}{}", &caps[1], &caps[2]);
+        rebuild(
+            &prefix,
+            caps.get(3).map(|m| m.as_str()),
+            caps.get(4).map(|m| m.as_str()),
+            caps.get(5).map(|m| m.as_str()),
+        )
+    });
+
+    redacted.into_owned()
+}
+
 fn log_action(decision: &str, reason: &str, command: &str) {
     let path = log_path();
     // Rotate before appending if the log is oversized.
@@ -496,10 +577,13 @@ fn log_action(decision: &str, reason: &str, command: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Redact BEFORE truncating: a secret must never survive as a partially
+    // visible fragment because it happened to straddle the 200-char cutoff.
+    let redacted_command = redact_secrets(command);
     // Truncate by CHARACTERS, not bytes — a byte slice that lands inside a
     // multibyte UTF-8 char would panic, which (since logging runs before the
     // decision is emitted) would crash the hook and fail open. See utf8 test.
-    let cmd_preview: String = command.chars().take(200).collect();
+    let cmd_preview: String = redacted_command.chars().take(200).collect();
     // Flatten newlines so each event is exactly one line (reasons may contain a
     // multi-line "To always allow" hint).
     let reason = reason.replace('\n', " ");
@@ -11460,6 +11544,123 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(&home);
+    }
+
+    // ── Issue #286: redact secrets from log previews ──────────────────────────
+
+    #[test]
+    fn redact_secrets_covers_all_documented_forms() {
+        let cases = [
+            (
+                r#"curl -H "Authorization: Bearer sk-abc123secret" https://api.example.com"#,
+                "sk-abc123secret",
+            ),
+            (
+                "curl -H 'Authorization: sk-plain-token-xyz' https://api.example.com",
+                "sk-plain-token-xyz",
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY=abcd1234efgh aws s3 ls",
+                "abcd1234efgh",
+            ),
+            (
+                "AWS_SESSION_TOKEN=zzzz9999yyyy aws sts get-caller-identity",
+                "zzzz9999yyyy",
+            ),
+            ("mysql -u root -p password=hunter2 db", "hunter2"),
+            ("some-tool --passwd=letmein123", "letmein123"),
+            ("some-tool --pwd='p@ssw0rd!'", "p@ssw0rd!"),
+            (r#"curl -H "token=abcdef123456""#, "abcdef123456"),
+            (
+                "export api_key=AIzaSyXXXXXXXXXXXXXXXXXXXXXX",
+                "AIzaSyXXXXXXXXXXXXXXXXXXXXXX",
+            ),
+            (
+                "export apikey=AIzaSyYYYYYYYYYYYYYYYYYYYYYY",
+                "AIzaSyYYYYYYYYYYYYYYYYYYYYYY",
+            ),
+            (
+                "export api-key=AIzaSyZZZZZZZZZZZZZZZZZZZZZZ",
+                "AIzaSyZZZZZZZZZZZZZZZZZZZZZZ",
+            ),
+            ("secret=topsecretvalue terraform apply", "topsecretvalue"),
+        ];
+        for (input, sensitive) in cases {
+            let out = redact_secrets(input);
+            assert!(
+                !out.contains(sensitive),
+                "expected {:?} to be redacted from {:?}, got {:?}",
+                sensitive,
+                input,
+                out
+            );
+            assert!(
+                out.contains("***REDACTED***"),
+                "expected redaction marker in output for {:?}, got {:?}",
+                input,
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn redact_secrets_handles_quoted_and_unquoted_values_case_insensitively() {
+        let unquoted = redact_secrets("PASSWORD=mySecretPass123 run-thing");
+        assert!(!unquoted.contains("mySecretPass123"));
+
+        let double_quoted = redact_secrets(r#"Token="my-secret-token" run-thing"#);
+        assert!(!double_quoted.contains("my-secret-token"));
+
+        let single_quoted = redact_secrets("Secret='another-secret' run-thing");
+        assert!(!single_quoted.contains("another-secret"));
+
+        // Quote characters around the value must be preserved so the redacted
+        // preview still reads like a normal key=value assignment.
+        assert!(double_quoted.contains(r#""***REDACTED***""#));
+        assert!(single_quoted.contains("'***REDACTED***'"));
+    }
+
+    #[test]
+    fn redact_secrets_leaves_normal_commands_unchanged() {
+        let benign = [
+            "git status",
+            "ls -la /tmp",
+            "cargo build --release",
+            "echo hello world",
+            "git commit -m 'fix: update docs'",
+        ];
+        for cmd in benign {
+            assert_eq!(
+                redact_secrets(cmd),
+                cmd,
+                "benign command should pass through unchanged: {:?}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn redact_secrets_runs_before_truncation_so_secret_cannot_leak() {
+        // Build a command where the secret value would still be partially
+        // visible after a naive 200-char truncation if redaction ran after
+        // (or not at all). Redaction must strip the value regardless of
+        // where it falls relative to the 200-char cutoff used by log_action.
+        let padding = "x".repeat(150);
+        let secret = "SUPER_LEAKY_SECRET_VALUE_1234567890";
+        let cmd = format!("echo {} && password={}", padding, secret);
+        let redacted = redact_secrets(&cmd);
+        // Simulate log_action's own truncation on the *redacted* string.
+        let preview: String = redacted.chars().take(200).collect();
+        assert!(
+            !preview.contains(secret),
+            "secret must not survive redaction+truncation: {:?}",
+            preview
+        );
+        assert!(
+            !preview.contains("SUPER_LEAKY"),
+            "no partial fragment of the secret should leak: {:?}",
+            preview
+        );
     }
 
     // ── Item #2: PROTECT_PATHS_TEMPLATE contains auto-executed-file patterns ──
