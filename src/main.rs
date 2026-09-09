@@ -508,9 +508,26 @@ fn redact_secrets(command: &str) -> String {
     // split into three quote-style alternatives (double-quoted, single-quoted,
     // unquoted) rather than matching an opening quote and requiring the same
     // quote to close it.
+    // The header value runs to end-of-line (or, when the whole thing sits
+    // inside a shell `"..."` argument like `curl -H "Authorization: ..."`,
+    // to that argument's closing quote), not just the first
+    // whitespace-delimited token — an AWS SigV4 header like
+    // `Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=host;x-amz-date, Signature=SECRET`
+    // has multiple space/comma/semicolon-joined fields (semicolons are a
+    // legitimate part of the `SignedHeaders` list, not a shell separator, so
+    // they must NOT stop the match) and the entire value is sensitive, so it
+    // must all be swallowed rather than stopping at the first "word" or the
+    // first semicolon.
+    // The regex crate has no look-around, so "stop at the next literal quote
+    // if there is one, otherwise run to end of line" is expressed as two
+    // ordered unquoted alternatives rather than a trailing lookahead: the
+    // quote-terminated form is tried first (so `curl -H "Authorization: ..."`
+    // stops at that closing `"` instead of swallowing the rest of the shell
+    // command), and the to-end-of-line form is the fallback for headers that
+    // aren't inside a quoted shell argument at all.
     let auth_header_re = AUTH_HEADER_RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)(authorization\s*:\s*)(?:"([^"]+)"|'([^']+)'|([^\s'"]+(?:\s+[^\s'"]+)?))"#,
+            r#"(?i)(authorization\s*:\s*)(?:"((?:[^"\\]|\\.)+)"|'((?:[^'\\]|\\.)+)'|([^\r\n]+)"|([^\r\n]+))"#,
         )
         .unwrap()
     });
@@ -518,10 +535,14 @@ fn redact_secrets(command: &str) -> String {
         .get_or_init(|| Regex::new(r#"(?i)(bearer\s+)(?:"([^"]+)"|'([^']+)'|(\S+))"#).unwrap());
     // Matches KEY=value / KEY="value" / KEY='value' for the various secret-ish
     // key names, requiring a word boundary before the key so we don't clobber
-    // e.g. `mytoken=` (unlikely, but keeps false positives down).
+    // e.g. `mytoken=` (unlikely, but keeps false positives down). Quoted
+    // values are escape-aware: `\"` inside a double-quoted value (or `\'`
+    // inside a single-quoted one) does not terminate the match, so
+    // `password="MyP@ss\"word123"` redacts the whole value instead of
+    // stopping at the escaped quote and leaking the trailing `word123"`.
     let kv_secret_re = KV_SECRET_RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b(aws_secret_access_key|aws_session_token|password|passwd|pwd|token|api[_-]?key|secret)(\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s'"]*))"#,
+            r#"(?i)\b(aws_secret_access_key|aws_session_token|password|passwd|pwd|token|api[_-]?key|secret)(\s*=\s*)(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^\s'"]*))"#,
         )
         .unwrap()
     });
@@ -541,12 +562,23 @@ fn redact_secrets(command: &str) -> String {
     }
 
     let redacted = auth_header_re.replace_all(command, |caps: &regex::Captures| {
-        rebuild(
-            &caps[1],
-            caps.get(2).map(|m| m.as_str()),
-            caps.get(3).map(|m| m.as_str()),
-            caps.get(4).map(|m| m.as_str()),
-        )
+        if caps.get(2).is_some() {
+            return format!("{}\"{}\"", &caps[1], REDACTED);
+        }
+        if caps.get(3).is_some() {
+            return format!("{}'{}'", &caps[1], REDACTED);
+        }
+        // Group 4: unquoted value that was terminated by a literal `"` (e.g.
+        // the closing quote of a `curl -H "Authorization: ..."` shell
+        // argument). That quote is consumed by the match but is shell
+        // syntax, not part of the secret — it must be preserved in the
+        // output rather than silently dropped.
+        if caps.get(4).is_some() {
+            return format!("{}{}\"", &caps[1], REDACTED);
+        }
+        // Group 5: unquoted value running to end of line, no trailing quote
+        // to restore.
+        format!("{}{}", &caps[1], REDACTED)
     });
     let redacted = bearer_re.replace_all(&redacted, |caps: &regex::Captures| {
         rebuild(
@@ -584,6 +616,12 @@ fn log_action(decision: &str, reason: &str, command: &str) {
     // multibyte UTF-8 char would panic, which (since logging runs before the
     // decision is emitted) would crash the hook and fail open. See utf8 test.
     let cmd_preview: String = redacted_command.chars().take(200).collect();
+    // Deny/ask reasons frequently embed the matched command segment verbatim
+    // (e.g. "matched pattern in: password=hunter2 curl ..."), so the reason
+    // must go through the same redaction as the preview — otherwise a secret
+    // redacted out of the preview column would still leak via the reason
+    // column right next to it.
+    let reason = redact_secrets(reason);
     // Flatten newlines so each event is exactly one line (reasons may contain a
     // multi-line "To always allow" hint).
     let reason = reason.replace('\n', " ");
@@ -11572,16 +11610,20 @@ mod tests {
             ("some-tool --pwd='p@ssw0rd!'", "p@ssw0rd!"),
             (r#"curl -H "token=abcdef123456""#, "abcdef123456"),
             (
-                "export api_key=AIzaSyXXXXXXXXXXXXXXXXXXXXXX",
-                "AIzaSyXXXXXXXXXXXXXXXXXXXXXX",
+                // Deliberately not shaped like a real Google API key (no
+                // "AIza" prefix) so secret-scanners don't flag this test
+                // fixture as a live credential — see issue #286 DeepSource
+                // Secrets follow-up.
+                "export api_key=FAKEKEY1234567890EXAMPLE",
+                "FAKEKEY1234567890EXAMPLE",
             ),
             (
-                "export apikey=AIzaSyYYYYYYYYYYYYYYYYYYYYYY",
-                "AIzaSyYYYYYYYYYYYYYYYYYYYYYY",
+                "export apikey=FAKEKEY2345678901EXAMPLE",
+                "FAKEKEY2345678901EXAMPLE",
             ),
             (
-                "export api-key=AIzaSyZZZZZZZZZZZZZZZZZZZZZZ",
-                "AIzaSyZZZZZZZZZZZZZZZZZZZZZZ",
+                "export api-key=FAKEKEY3456789012EXAMPLE",
+                "FAKEKEY3456789012EXAMPLE",
             ),
             ("secret=topsecretvalue terraform apply", "topsecretvalue"),
         ];
@@ -11660,6 +11702,95 @@ mod tests {
             !preview.contains("SUPER_LEAKY"),
             "no partial fragment of the secret should leak: {:?}",
             preview
+        );
+    }
+
+    // ── Greptile P1 follow-up: decision reason must be redacted too ──────────
+
+    #[test]
+    fn log_action_redacts_secrets_from_decision_reason_not_just_preview() {
+        // Regression: a deny reason built from `format!("Blocked: '{}' matched
+        // in: {}", label, segment)` embeds the raw matched segment verbatim.
+        // If that segment carries a secret (e.g. the dangerous command was
+        // itself prefixed with `password=...`), the reason column must be
+        // redacted exactly like the preview column, not written raw.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "cb_log_reason_redact_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let reason = "Blocked: 'rm -rf /' matched in: rm -rf / password=SuperSecretReason123";
+        with_fake_home(&tmp, || {
+            log_action("deny", reason, "rm -rf / password=SuperSecretReason123");
+        });
+
+        let log_contents = fs::read_to_string(tmp.join(".clawband.log")).unwrap();
+        assert!(
+            !log_contents.contains("SuperSecretReason123"),
+            "secret embedded in the decision reason must not reach the log: {log_contents}"
+        );
+        assert!(
+            log_contents.contains("***REDACTED***"),
+            "redaction marker should appear (in reason and/or preview): {log_contents}"
+        );
+        // The reason column (second field, before the pipe-delimited preview)
+        // specifically must carry the marker, not just the preview column.
+        let reason_field = log_contents.split(" | ").nth(1).unwrap_or("");
+        assert!(
+            reason_field.contains("***REDACTED***"),
+            "the reason field itself must be redacted, got: {reason_field:?} (full line: {log_contents:?})"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── Greptile P1 follow-up: complex secret shapes must be fully redacted ──
+
+    #[test]
+    fn redact_secrets_covers_full_sigv4_authorization_header() {
+        // A real AWS SigV4 Authorization header has multiple comma-separated
+        // fields after the scheme; `Signature=...` is the actual secret and
+        // sits at the very end. The previous pattern stopped at the first
+        // whitespace-delimited "word" and left `Signature=SECRETVALUE`
+        // un-redacted.
+        let cmd = "curl -H \"Authorization: AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=SECRETVALUE1234567890\" https://example.com";
+        let out = redact_secrets(cmd);
+        assert!(
+            !out.contains("SECRETVALUE1234567890"),
+            "SigV4 Signature value must be redacted: {out}"
+        );
+        assert!(
+            !out.contains("AKIAEXAMPLE"),
+            "SigV4 Credential value must be redacted: {out}"
+        );
+        assert!(
+            out.contains("***REDACTED***"),
+            "expected redaction marker in output, got: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_handles_escaped_quote_inside_quoted_value() {
+        // `\"` inside a double-quoted value must not be treated as the
+        // closing quote — otherwise the match terminates early and leaves
+        // the trailing fragment of the secret (`word123`) exposed.
+        let cmd = r#"some-tool --password="MyP@ss\"word123" run"#;
+        let out = redact_secrets(cmd);
+        assert!(
+            !out.contains("word123"),
+            "trailing fragment after an escaped quote must not leak: {out}"
+        );
+        assert!(
+            !out.contains("MyP@ss"),
+            "leading fragment before the escaped quote must not leak: {out}"
+        );
+        assert!(
+            out.contains("***REDACTED***"),
+            "expected redaction marker in output, got: {out}"
         );
     }
 
