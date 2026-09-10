@@ -538,8 +538,8 @@ fn redact_secrets(command: &str) -> String {
     // e.g. `mytoken=` (unlikely, but keeps false positives down). Quoted
     // values are escape-aware: `\"` inside a double-quoted value (or `\'`
     // inside a single-quoted one) does not terminate the match, so
-    // `password="MyP@ss\"word123"` redacts the whole value instead of
-    // stopping at the escaped quote and leaking the trailing `word123"`.
+    // `password="FakeValA\"trail123"` redacts the whole value instead of
+    // stopping at the escaped quote and leaking the trailing `trail123"`.
     let kv_secret_re = KV_SECRET_RE.get_or_init(|| {
         Regex::new(
             r#"(?i)\b(aws_secret_access_key|aws_session_token|password|passwd|pwd|token|api[_-]?key|secret)(\s*=\s*)(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^\s'"]*))"#,
@@ -11590,25 +11590,28 @@ mod tests {
     fn redact_secrets_covers_all_documented_forms() {
         let cases = [
             (
-                r#"curl -H "Authorization: Bearer sk-abc123secret" https://api.example.com"#,
-                "sk-abc123secret",
+                r#"curl -H "Authorization: Bearer FAKEBEARERTOKEN1234EXAMPLE" https://api.example.com"#,
+                "FAKEBEARERTOKEN1234EXAMPLE",
             ),
             (
-                "curl -H 'Authorization: sk-plain-token-xyz' https://api.example.com",
-                "sk-plain-token-xyz",
+                "curl -H 'Authorization: FAKEPLAINTOKENXYZEXAMPLE' https://api.example.com",
+                "FAKEPLAINTOKENXYZEXAMPLE",
             ),
             (
-                "AWS_SECRET_ACCESS_KEY=abcd1234efgh aws s3 ls",
-                "abcd1234efgh",
+                "AWS_SECRET_ACCESS_KEY=FAKEAWSSECRETKEYEXAMPLE1234 aws s3 ls",
+                "FAKEAWSSECRETKEYEXAMPLE1234",
             ),
             (
-                "AWS_SESSION_TOKEN=zzzz9999yyyy aws sts get-caller-identity",
-                "zzzz9999yyyy",
+                "AWS_SESSION_TOKEN=FAKESESSIONTOKENEXAMPLE9999 aws sts get-caller-identity",
+                "FAKESESSIONTOKENEXAMPLE9999",
             ),
             ("mysql -u root -p password=hunter2 db", "hunter2"),
             ("some-tool --passwd=letmein123", "letmein123"),
             ("some-tool --pwd='p@ssw0rd!'", "p@ssw0rd!"),
-            (r#"curl -H "token=abcdef123456""#, "abcdef123456"),
+            (
+                r#"curl -H "token=FAKETOKENVALUE123456EXAMPLE""#,
+                "FAKETOKENVALUE123456EXAMPLE",
+            ),
             (
                 // Deliberately not shaped like a real Google API key (no
                 // "AIza" prefix) so secret-scanners don't flag this test
@@ -11690,7 +11693,7 @@ mod tests {
         // (or not at all). Redaction must strip the value regardless of
         // where it falls relative to the 200-char cutoff used by log_action.
         let padding = "x".repeat(150);
-        let secret = "SUPER_LEAKY_SECRET_VALUE_1234567890";
+        let secret = "FAKEPADDEDVALUE1234567890EXAMPLE";
         let cmd = format!("echo {} && password={}", padding, secret);
         let redacted = redact_secrets(&cmd);
         // Simulate log_action's own truncation on the *redacted* string.
@@ -11701,7 +11704,7 @@ mod tests {
             preview
         );
         assert!(
-            !preview.contains("SUPER_LEAKY"),
+            !preview.contains("FAKEPADDEDVALUE"),
             "no partial fragment of the secret should leak: {:?}",
             preview
         );
@@ -11725,14 +11728,18 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        let reason = "Blocked: 'rm -rf /' matched in: rm -rf / password=SuperSecretReason123";
+        let reason = "Blocked: 'rm -rf /' matched in: rm -rf / password=FAKEREASONVALUE123EXAMPLE";
         with_fake_home(&tmp, || {
-            log_action("deny", reason, "rm -rf / password=SuperSecretReason123");
+            log_action(
+                "deny",
+                reason,
+                "rm -rf / password=FAKEREASONVALUE123EXAMPLE",
+            );
         });
 
         let log_contents = fs::read_to_string(tmp.join(".clawband.log")).unwrap();
         assert!(
-            !log_contents.contains("SuperSecretReason123"),
+            !log_contents.contains("FAKEREASONVALUE123EXAMPLE"),
             "secret embedded in the decision reason must not reach the log: {log_contents}"
         );
         assert!(
@@ -11759,14 +11766,14 @@ mod tests {
         // sits at the very end. The previous pattern stopped at the first
         // whitespace-delimited "word" and left `Signature=SECRETVALUE`
         // un-redacted.
-        let cmd = "curl -H \"Authorization: AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=SECRETVALUE1234567890\" https://example.com";
+        let cmd = "curl -H \"Authorization: AWS4-HMAC-SHA256 Credential=FAKEAWSKEYIDEXAMPLE/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=FAKESIGVALUE1234567890EXAMPLE\" https://example.com";
         let out = redact_secrets(cmd);
         assert!(
-            !out.contains("SECRETVALUE1234567890"),
+            !out.contains("FAKESIGVALUE1234567890EXAMPLE"),
             "SigV4 Signature value must be redacted: {out}"
         );
         assert!(
-            !out.contains("AKIAEXAMPLE"),
+            !out.contains("FAKEAWSKEYIDEXAMPLE"),
             "SigV4 Credential value must be redacted: {out}"
         );
         assert!(
@@ -11780,49 +11787,20 @@ mod tests {
         // `\"` inside a double-quoted value must not be treated as the
         // closing quote — otherwise the match terminates early and leaves
         // the trailing fragment of the secret (`word123`) exposed.
-        let cmd = r#"some-tool --password="MyP@ss\"word123" run"#;
+        let cmd = r#"some-tool --password="FakeValA\"trail123" run"#;
         let out = redact_secrets(cmd);
         assert!(
-            !out.contains("word123"),
+            !out.contains("trail123"),
             "trailing fragment after an escaped quote must not leak: {out}"
         );
         assert!(
-            !out.contains("MyP@ss"),
+            !out.contains("FakeValA"),
             "leading fragment before the escaped quote must not leak: {out}"
         );
         assert!(
             out.contains("***REDACTED***"),
             "expected redaction marker in output, got: {out}"
         );
-    }
-
-    #[test]
-    fn probe_underscore_prefixed_key_names() {
-        let cases = [
-            "GITHUB_TOKEN=ghp_supersecretvalue1234 gh api foo",
-            "SLACK_BOT_TOKEN=xoxb-supersecretvalue gh api foo",
-            "DB_PASSWORD=hunter2hunter2 psql",
-            "OPENAI_API_KEY=sk-supersecretvalue1234 run",
-            "STRIPE_SECRET_KEY=sk_live_supersecretvalue run",
-        ];
-        for cmd in cases {
-            let out = redact_secrets(cmd);
-            println!("{:?} -> {:?}", cmd, out);
-        }
-    }
-
-    #[test]
-    fn probe_auth_header_unquoted_no_trailing_quote_in_command() {
-        // Command built without wrapping quotes around the header value at all
-        // (e.g. constructed programmatically rather than typed at a shell).
-        let cases = [
-            "curl -H Authorization:Bearer-sk-plaintoken123 https://example.com extra-arg",
-            "some-request Authorization: sk-noquotes-secret-abc && echo done",
-        ];
-        for cmd in cases {
-            let out = redact_secrets(cmd);
-            println!("{:?} -> {:?}", cmd, out);
-        }
     }
 
     // ── Item #2: PROTECT_PATHS_TEMPLATE contains auto-executed-file patterns ──
