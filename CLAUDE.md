@@ -40,6 +40,8 @@ All pattern changes must include:
 1. Unit tests in `src/main.rs` inside `#[cfg(test)] mod tests`
 2. E2e tests in `tests/cli.rs` using the `run()` / `bash()` / `decision()` helpers
 
+**Exception**: tests that inherently require credential-*shaped* literal strings (e.g. `redact_secrets()`'s fixtures) live in `src/redact_secrets_test.rs` instead, spliced into `mod tests` via `include!()` — same scope and `cargo test` behavior as inline, but the file's `_test.rs` name matches `.deepsource.toml`'s `test_patterns`, which DeepSource's Secrets scanner otherwise has no way to know is test code (it matches by file path, not by module). Renaming fixture values to obviously-fake ones was not sufficient; the analyzer flags credential *shape*, not just known vendor prefixes. Don't reach for this exception for anything else — it exists solely for secret-shaped test data.
+
 Run these in order before committing:
 ```bash
 cargo fmt              # auto-format (NOT --check — actually apply it)
