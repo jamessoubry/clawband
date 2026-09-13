@@ -1,14 +1,22 @@
 version = 1
 
+# Top-level (not nested under [analyzers.meta]) so this applies globally
+# across all analyzers, including "secrets" — DeepSource's schema requires
+# test_patterns at this level to exempt matched files from analyzers that
+# have no per-analyzer test-pattern config of their own. Previously nested
+# under the rust analyzer's [analyzers.meta], where it had no effect outside
+# that analyzer, which is why the Secrets scanner kept flagging fake
+# credential fixtures inside src/main.rs's inline #[cfg(test)] mod tests
+# block even after every literal was renamed to an obviously-fake value —
+# see issue #286 / PR #295 for the full investigation.
+test_patterns = [
+  "tests/**",
+  "**/*_test.rs",
+]
+
 [[analyzers]]
 name = "rust"
 enabled = true
-
-  [analyzers.meta]
-  test_patterns = [
-    "tests/**",
-    "**/*_test.rs",
-  ]
 
 [[exclude_patterns]]
 # Temp-file usage in test helpers is intentional and safe — tempfile crate
