@@ -56,6 +56,23 @@ cargo clippy --all-targets -- -D warnings  # no warnings
 - **Always open a PR** — never push directly to master, even for trivial changes
 - Tag releases after the user merges: `git tag vX.Y.Z && git push origin vX.Y.Z`
 
+## Codex second-opinion reviews
+
+Every open PR here also gets an independent review from a Codex CLI session (`codex-clawband` tmux, runs under James's ChatGPT plan) — a cron poller (`~/scripts/codex-pr-review.sh`, every 10 min) picks up new/updated PRs automatically. Don't wait on that poll cycle when you're the one who just acted:
+
+- **After pushing a fix commit that replies to a Codex review comment**, nudge it immediately instead of waiting for the next poll cycle:
+  `bash ~/scripts/notify-codex.sh clawband "PR #<N> has a new commit/reply addressing your review (commit <sha>) — please take another look when ready."`
+- **If Codex hasn't replied after a full round of `/backlog` (i.e. you're back here for the next tick and the PR still has no new Codex comment since your reply)**, nudge again once before moving on — don't nudge repeatedly in a loop.
+- Codex's review is a second opinion from a differently-trained model, not a duplicate of DeepSource/Greptile — treat disagreements on their merits, the way you would a human reviewer's comment. It signs its comments `— Codex (gpt-5.6-terra), automated second opinion`.
+
+## Signing PR descriptions and comments
+
+Sign every PR description and every PR comment you post (replies to Codex, DeepSource, Greptile, or James) with:
+
+`*— Claude (Sonnet 5), clawband backlog automation*`
+
+as the last line, separated by a blank line (and a `---` divider if the body already ends with other content). This mirrors the Codex second-opinion signature (`— Codex (gpt-5.6-terra), automated second opinion`) so it's always clear which comments are automated vs. James's own. Older PRs used the default "🤖 Generated with Claude Code" footer or no signature at all depending on which path created them (interactive vs. `/backlog`) — use the line above going forward instead, consistently, regardless of path.
+
 ## Backlog pipeline — cadence
 
 Run one tick at a time: wait for the previous PR to be merged before running `/backlog` again. Most backlog items touch the same files (`src/main.rs`, `Cargo.toml`, `tests/cli.rs`) so concurrent open PRs will conflict. There is no automation to prevent this — it relies on the human running `/backlog` manually after each merge.
