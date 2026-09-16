@@ -488,6 +488,119 @@ fn maybe_rotate_log(path: &std::path::Path) {
     let _ = fs::rename(path, backup);
 }
 
+/// Best-effort redaction of common secret-bearing forms before a command is
+/// written to the log preview. This is defense-in-depth pattern matching, not
+/// an exhaustive secret scanner — see the log-safety notes in CLAUDE.md.
+///
+/// Handles (case-insensitively): `Authorization:` headers, `Bearer <token>`,
+/// `AWS_SECRET_ACCESS_KEY=`/`AWS_SESSION_TOKEN=`, `password=`/`passwd=`/`pwd=`,
+/// `token=`, `api_key=`/`apikey=`/`api-key=`, and `secret=`. Values may be
+/// unquoted or wrapped in single/double quotes.
+fn redact_secrets(command: &str) -> String {
+    use std::sync::OnceLock;
+    static AUTH_HEADER_RE: OnceLock<Regex> = OnceLock::new();
+    static BEARER_RE: OnceLock<Regex> = OnceLock::new();
+    static KV_SECRET_RE: OnceLock<Regex> = OnceLock::new();
+
+    const REDACTED: &str = "***REDACTED***";
+
+    // The regex crate doesn't support backreferences, so each pattern is
+    // split into three quote-style alternatives (double-quoted, single-quoted,
+    // unquoted) rather than matching an opening quote and requiring the same
+    // quote to close it.
+    // The header value runs to end-of-line (or, when the whole thing sits
+    // inside a shell `"..."` argument like `curl -H "Authorization: ..."`,
+    // to that argument's closing quote), not just the first
+    // whitespace-delimited token — an AWS SigV4 header like
+    // `Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=host;x-amz-date, Signature=SECRET`
+    // has multiple space/comma/semicolon-joined fields (semicolons are a
+    // legitimate part of the `SignedHeaders` list, not a shell separator, so
+    // they must NOT stop the match) and the entire value is sensitive, so it
+    // must all be swallowed rather than stopping at the first "word" or the
+    // first semicolon.
+    // The regex crate has no look-around, so "stop at the next literal quote
+    // if there is one, otherwise run to end of line" is expressed as two
+    // ordered unquoted alternatives rather than a trailing lookahead: the
+    // quote-terminated form is tried first (so `curl -H "Authorization: ..."`
+    // stops at that closing `"` instead of swallowing the rest of the shell
+    // command), and the to-end-of-line form is the fallback for headers that
+    // aren't inside a quoted shell argument at all.
+    let auth_header_re = AUTH_HEADER_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(authorization\s*:\s*)(?:"((?:[^"\\]|\\.)+)"|'((?:[^'\\]|\\.)+)'|([^\r\n]+)"|([^\r\n]+))"#,
+        )
+        .unwrap()
+    });
+    let bearer_re = BEARER_RE
+        .get_or_init(|| Regex::new(r#"(?i)(bearer\s+)(?:"([^"]+)"|'([^']+)'|(\S+))"#).unwrap());
+    // Matches KEY=value / KEY="value" / KEY='value' for the various secret-ish
+    // key names, requiring a word boundary before the key so we don't clobber
+    // e.g. `mytoken=` (unlikely, but keeps false positives down). Quoted
+    // values are escape-aware: `\"` inside a double-quoted value (or `\'`
+    // inside a single-quoted one) does not terminate the match, so
+    // `password="FakeValA\"trail123"` redacts the whole value instead of
+    // stopping at the escaped quote and leaking the trailing `trail123"`.
+    let kv_secret_re = KV_SECRET_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(aws_secret_access_key|aws_session_token|password|passwd|pwd|token|api[_-]?key|secret)(\s*=\s*)(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^\s'"]*))"#,
+        )
+        .unwrap()
+    });
+
+    // Given a match with three mutually-exclusive quote-style capture groups
+    // (double, single, unquoted), rebuild the string with the value replaced
+    // but the original quoting preserved.
+    fn rebuild(prefix: &str, dq: Option<&str>, sq: Option<&str>, uq: Option<&str>) -> String {
+        if dq.is_some() {
+            format!("{}\"{}\"", prefix, REDACTED)
+        } else if sq.is_some() {
+            format!("{}'{}'", prefix, REDACTED)
+        } else {
+            debug_assert!(uq.is_some());
+            format!("{}{}", prefix, REDACTED)
+        }
+    }
+
+    let redacted = auth_header_re.replace_all(command, |caps: &regex::Captures| {
+        if caps.get(2).is_some() {
+            return format!("{}\"{}\"", &caps[1], REDACTED);
+        }
+        if caps.get(3).is_some() {
+            return format!("{}'{}'", &caps[1], REDACTED);
+        }
+        // Group 4: unquoted value that was terminated by a literal `"` (e.g.
+        // the closing quote of a `curl -H "Authorization: ..."` shell
+        // argument). That quote is consumed by the match but is shell
+        // syntax, not part of the secret — it must be preserved in the
+        // output rather than silently dropped.
+        if caps.get(4).is_some() {
+            return format!("{}{}\"", &caps[1], REDACTED);
+        }
+        // Group 5: unquoted value running to end of line, no trailing quote
+        // to restore.
+        format!("{}{}", &caps[1], REDACTED)
+    });
+    let redacted = bearer_re.replace_all(&redacted, |caps: &regex::Captures| {
+        rebuild(
+            &caps[1],
+            caps.get(2).map(|m| m.as_str()),
+            caps.get(3).map(|m| m.as_str()),
+            caps.get(4).map(|m| m.as_str()),
+        )
+    });
+    let redacted = kv_secret_re.replace_all(&redacted, |caps: &regex::Captures| {
+        let prefix = format!("{}{}", &caps[1], &caps[2]);
+        rebuild(
+            &prefix,
+            caps.get(3).map(|m| m.as_str()),
+            caps.get(4).map(|m| m.as_str()),
+            caps.get(5).map(|m| m.as_str()),
+        )
+    });
+
+    redacted.into_owned()
+}
+
 fn log_action(decision: &str, reason: &str, command: &str) {
     let path = log_path();
     // Rotate before appending if the log is oversized.
@@ -496,10 +609,19 @@ fn log_action(decision: &str, reason: &str, command: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Redact BEFORE truncating: a secret must never survive as a partially
+    // visible fragment because it happened to straddle the 200-char cutoff.
+    let redacted_command = redact_secrets(command);
     // Truncate by CHARACTERS, not bytes — a byte slice that lands inside a
     // multibyte UTF-8 char would panic, which (since logging runs before the
     // decision is emitted) would crash the hook and fail open. See utf8 test.
-    let cmd_preview: String = command.chars().take(200).collect();
+    let cmd_preview: String = redacted_command.chars().take(200).collect();
+    // Deny/ask reasons frequently embed the matched command segment verbatim
+    // (e.g. "matched pattern in: password=hunter2 curl ..."), so the reason
+    // must go through the same redaction as the preview — otherwise a secret
+    // redacted out of the preview column would still leak via the reason
+    // column right next to it.
+    let reason = redact_secrets(reason);
     // Flatten newlines so each event is exactly one line (reasons may contain a
     // multi-line "To always allow" hint).
     let reason = reason.replace('\n', " ");
@@ -11461,6 +11583,8 @@ mod tests {
         // Cleanup
         let _ = fs::remove_dir_all(&home);
     }
+
+    include!("redact_secrets_test.rs");
 
     // ── Item #2: PROTECT_PATHS_TEMPLATE contains auto-executed-file patterns ──
 

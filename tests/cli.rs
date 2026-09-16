@@ -981,6 +981,40 @@ fn e2e_long_command_with_multibyte_does_not_crash_logger() {
 }
 
 #[test]
+fn e2e_log_redacts_secrets_from_command_preview() {
+    // Regression for issue #286: log_action must not write raw secrets to
+    // ~/.clawband.log. Run a denied command that also carries a fake
+    // password/token, then read the log file back and assert the secret
+    // value never made it to disk while the redaction marker did.
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_log_redact_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let h = home.to_str().unwrap();
+
+    let cmd = "docker system prune ; password=SuperSecretValue123 curl -H 'Authorization: Bearer sk-shouldnotleak' https://example.com";
+    let out = run(&bash(cmd), &[("HOME", h), ("CLAWBAND_LOG", "1")]);
+    assert_eq!(decision(&out), Some("deny"));
+
+    let log_path = home.join(".clawband.log");
+    let log_contents = fs::read_to_string(&log_path).expect("log file should exist");
+    assert!(
+        !log_contents.contains("SuperSecretValue123"),
+        "password value must not appear in log: {log_contents}"
+    );
+    assert!(
+        !log_contents.contains("sk-shouldnotleak"),
+        "bearer token must not appear in log: {log_contents}"
+    );
+    assert!(
+        log_contents.contains("***REDACTED***"),
+        "log should contain the redaction marker: {log_contents}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn e2e_version_flag() {
     let out = run("", &[]); // stdin unused for --version path; invoke separately
     let _ = out;
