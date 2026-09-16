@@ -26,11 +26,21 @@ cargo build --release && ~/.cargo/bin/clawband install
 - `emit_decision()` — routes output per mode (Claude, Codex, Gemini, Hermes, Openclaw, Opencode)
 - Version bumps: `Cargo.toml` version field (Cargo.lock updates automatically via `cargo update -p clawband`)
 
+## Logging (`~/.clawband.log`)
+
+- Opt-in only (`CLAWBAND_LOG=1` or the `clawband log --enable` marker) — off by default.
+- Created via a plain `OpenOptions::append().create()` with no explicit mode set, so it inherits the process umask (typically `0644`/`0664` — group/world **readable** on most systems). It is not created `0600`; treat it as a regular file, not a secrets vault.
+- Retention: none. `maybe_rotate_log()` renames the live file to a single `.clawband.log.1` backup once it exceeds the size cap — there is no pruning, deletion, or bounded history beyond that one backup.
+- Since v3.17.1, `log_action()` runs `redact_secrets()` on the command preview before truncating it, stripping common secret-bearing forms (`Authorization:` headers, `Bearer <token>`, `AWS_SECRET_ACCESS_KEY=`/`AWS_SESSION_TOKEN=`, `password=`/`passwd=`/`pwd=`, `token=`, `api_key=`/`apikey=`/`api-key=`, `secret=`) to `***REDACTED***`.
+- **This is best-effort pattern matching, not an exhaustive secret scanner** — same defense-in-depth spirit as the skip-flag bypass detection elsewhere in this project. On a shared machine, don't assume the log is safe from a determined reader: an unrecognized secret format, a custom env var name, or a base64/encoded blob will pass through untouched.
+
 ## Testing
 
 All pattern changes must include:
 1. Unit tests in `src/main.rs` inside `#[cfg(test)] mod tests`
 2. E2e tests in `tests/cli.rs` using the `run()` / `bash()` / `decision()` helpers
+
+**Exception**: tests that inherently require credential-*shaped* literal strings (e.g. `redact_secrets()`'s fixtures) live in `src/redact_secrets_test.rs` instead, spliced into `mod tests` via `include!()` — same scope and `cargo test` behavior as inline, but the file's `_test.rs` name matches `.deepsource.toml`'s `test_patterns`, which DeepSource's Secrets scanner otherwise has no way to know is test code (it matches by file path, not by module). Renaming fixture values to obviously-fake ones was not sufficient; the analyzer flags credential *shape*, not just known vendor prefixes. Don't reach for this exception for anything else — it exists solely for secret-shaped test data.
 
 Run these in order before committing:
 ```bash
