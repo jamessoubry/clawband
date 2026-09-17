@@ -21,6 +21,10 @@
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor};
 
+/// Shared XXE reason string — used both by the pre-narrowing doc trail and
+/// by `python_xxe_findings`'s post-match walk (issue #261 review round).
+const XXE_REASON: &str = "XML external entity (XXE) injection — this call is explicitly configured to resolve external entities/DTDs, which can read local files or trigger SSRF/DoS; use defusedxml instead of a custom unsafe parser configuration";
+
 /// A single rule match against a file's content — which rule fired and why.
 pub struct Finding {
     /// Short rule identifier, e.g. `"dynamic-eval"`.
@@ -42,9 +46,15 @@ pub enum Lang {
     /// `dill` load/loads, `marshal.loads`, `shelve.open`, `yaml.load` without a
     /// safe `Loader=`, `yaml.unsafe_load`, `joblib.load`, `pandas.read_pickle`/
     /// `pd.read_pickle`, `numpy.load`/`np.load` with `allow_pickle=True`,
-    /// `torch.load` without `weights_only=True`, and XXE-prone XML parsing via
-    /// `xml.etree.ElementTree.parse`/`fromstring`/`XML`, `minidom.parse`/
-    /// `parseString`, `xml.sax.parse`), `tls-verify-disabled` (any call with
+    /// `torch.load` without `weights_only=True`, and XXE injection via a
+    /// *configured-unsafe* `xml.etree.ElementTree.parse`/`fromstring`/`XML`,
+    /// `minidom.parse`/`parseString`, or `xml.sax.parse` call — i.e. one that
+    /// passes an explicit `resolve_entities=True`/`forbid_dtd=False`-style
+    /// keyword argument or a custom `XMLParser` instance, not a bare call
+    /// with default arguments (modern Python 3 stdlib does not resolve
+    /// external entities by default, so bare calls are routine and are not
+    /// flagged — see the `python_xxe_findings` doc comment for the review
+    /// finding this narrowed), `tls-verify-disabled` (any call with
     /// keyword argument `verify=False`), `sql-string-interpolation`
     /// (`.execute`/`.executemany` with an f-string/`%`-format/`.format()`/
     /// `+`-concatenated argument).
@@ -112,10 +122,15 @@ fn ts_language(lang: &Lang) -> TsLanguage {
 /// unless it has a `weights_only=True` kwarg), `js_dynamic_module_load_findings`,
 /// `python_sql_string_interpolation_findings`, and
 /// `js_sql_string_interpolation_findings` — called directly from `scan()`.
-/// `numpy.load(..., allow_pickle=True)` (issue #261) is the mirror shape —
-/// flag on *presence* of a dangerous kwarg rather than absence of a safe one —
-/// which a plain query CAN express directly (same as `shell-invoking-subprocess`'s
-/// `subprocess.run(shell=True)` case below), so it needs no post-match walk.
+/// `numpy.load(..., allow_pickle=True)` (issue #261) is also a post-match
+/// walk (`python_numpy_load_findings`) rather than a plain query: a bare
+/// `value: (true)` constraint doesn't match a parenthesized
+/// `allow_pickle=(True)`, since that wraps the literal in a
+/// `parenthesized_expression` node with a different shape — the walk unwraps
+/// parenthesization before checking the literal (Greptile review round on
+/// #261's PR). `python_xxe_findings` is the same "post-match walk over the
+/// argument list" shape, used to require an explicit unsafe-configuration
+/// indicator before flagging XXE-prone XML parsing (see its doc comment).
 fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     // (rule_name, query, reason)
     //
@@ -134,7 +149,6 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     // matrix rather than re-deriving it from scratch when adding a new rule.
     let shell_invoking_reason = "shell-invoking call — if any part of the command/argument is not a fixed literal, this is a command-injection surface; prefer exec'ing the program directly with an argv array";
     let insecure_deserialize_reason = "insecure deserialization — this API can execute arbitrary code embedded in its input; if the input isn't fully trusted, use a data-only parser instead";
-    let xxe_reason = "XML external entity (XXE) injection — this parser resolves external entities and DTDs by default, which can read local files or trigger SSRF/DoS; use defusedxml or disable entity/DTD resolution before parsing untrusted XML";
     let tls_verify_disabled_reason = "TLS certificate verification disabled — this accepts connections to servers with invalid/self-signed/expired certificates, defeating TLS's protection against MITM; should not ship to production";
     match lang {
         Lang::JavaScript | Lang::TypeScript => vec![
@@ -280,80 +294,6 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#match? @obj "^(pandas|pd)$")
   (#eq? @method "read_pickle"))"#,
                 insecure_deserialize_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
-  function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method)
-  arguments: (argument_list
-    (keyword_argument
-      name: (identifier) @kw
-      value: (true)))
-  (#match? @obj "^(numpy|np)$")
-  (#eq? @method "load")
-  (#eq? @kw "allow_pickle"))"#,
-                "insecure deserialization — numpy.load() with allow_pickle=True can execute arbitrary code embedded in the array file; only pass allow_pickle=True for fully trusted files",
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
-  function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method)
-  (#match? @obj "^(ET|ElementTree|cElementTree)$")
-  (#match? @method "^(parse|fromstring|XML)$"))"#,
-                xxe_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
-  function: (attribute
-    object: (attribute
-      object: (attribute
-        object: (identifier) @mod1
-        attribute: (identifier) @mod2)
-      attribute: (identifier) @mod3)
-    attribute: (identifier) @method)
-  (#eq? @mod1 "xml")
-  (#eq? @mod2 "etree")
-  (#eq? @mod3 "ElementTree")
-  (#match? @method "^(parse|fromstring|XML)$"))"#,
-                xxe_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
-  function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method)
-  (#eq? @obj "minidom")
-  (#match? @method "^(parse|parseString)$"))"#,
-                xxe_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
-  function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method)
-  (#eq? @obj "sax")
-  (#eq? @method "parse"))"#,
-                xxe_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
-  function: (attribute
-    object: (attribute
-      object: (identifier) @mod1
-      attribute: (identifier) @mod2)
-    attribute: (identifier) @method)
-  (#eq? @mod1 "xml")
-  (#eq? @mod2 "sax")
-  (#eq? @method "parse"))"#,
-                xxe_reason,
             ),
             (
                 "tls-verify-disabled",
@@ -526,6 +466,252 @@ fn python_torch_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Fi
                     rule: "insecure-deserialize",
                     reason: "insecure deserialization — torch.load() without weights_only=True can execute arbitrary code embedded in the checkpoint via pickle; pass weights_only=True unless you need to load non-tensor Python objects from a fully trusted source",
                 });
+            }
+        }
+    }
+    findings
+}
+
+/// Unwraps a value node through any number of nested `parenthesized_expression`
+/// wrappers to reach the underlying expression node — e.g. `(True)` and
+/// `((True))` both unwrap to the bare `true` literal node. Needed because a
+/// query constraint like `value: (true)` only matches when the argument
+/// value node IS the `true` node directly; `allow_pickle=(True)` wraps it in
+/// a `parenthesized_expression` first, which is a different AST shape with
+/// the same runtime meaning, and was not being flagged (Greptile review
+/// round on #261's PR: `numpy.load(path, allow_pickle=(True))` bypassed the
+/// original `allow_pickle=True` query).
+fn unwrap_parenthesized(mut node: tree_sitter::Node) -> tree_sitter::Node {
+    while node.kind() == "parenthesized_expression" {
+        match node.named_child(0) {
+            Some(inner) => node = inner,
+            None => break,
+        }
+    }
+    node
+}
+
+/// Finds `numpy.load(...)`/`np.load(...)` calls with an `allow_pickle=True`
+/// keyword argument (issue #261; Greptile review round tightened this from a
+/// plain query into a post-match walk — see `unwrap_parenthesized`'s doc
+/// comment for why). `numpy.load` unpickles object arrays when
+/// `allow_pickle=True`, so presence of that kwarg with a truthy value
+/// (parenthesized or not) is the dangerous case.
+fn python_numpy_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
+    let ts_lang: TsLanguage = tree_sitter_python::LANGUAGE.into();
+    let query_src = r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#match? @obj "^(numpy|np)$")
+  (#eq? @method "load"))"#;
+    let query = match Query::new(&ts_lang, query_src) {
+        Ok(q) => q,
+        Err(_) => return vec![],
+    };
+    let args_index = match query.capture_names().iter().position(|n| *n == "args") {
+        Some(i) => i,
+        None => return vec![],
+    };
+
+    let mut findings = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index as usize != args_index {
+                continue;
+            }
+            let mut has_allow_pickle_true = false;
+            let mut c = cap.node.walk();
+            for child in cap.node.named_children(&mut c) {
+                if child.kind() != "keyword_argument" {
+                    continue;
+                }
+                let name_ok = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                    == Some("allow_pickle");
+                let value_true = child
+                    .child_by_field_name("value")
+                    .is_some_and(|v| unwrap_parenthesized(v).kind() == "true");
+                if name_ok && value_true {
+                    has_allow_pickle_true = true;
+                    break;
+                }
+            }
+            if has_allow_pickle_true {
+                findings.push(Finding {
+                    rule: "insecure-deserialize",
+                    reason: "insecure deserialization — numpy.load() with allow_pickle=True can execute arbitrary code embedded in the array file; only pass allow_pickle=True for fully trusted files",
+                });
+            }
+        }
+    }
+    findings
+}
+
+/// Returns true if `args_node` (a call's `argument_list`) contains an
+/// explicit indicator that XML entity/DTD resolution has been deliberately
+/// enabled: a `resolve_entities=True`-style keyword argument, a
+/// `forbid_dtd=False`/`forbid_entities=False`/`forbid_external=False`-style
+/// keyword argument (the defusedxml-style knobs, inverted to re-enable the
+/// danger they normally guard against), or a `parser=`-style argument (
+/// keyword or positional) whose value constructs a custom `XMLParser`
+/// instance. Used by `python_xxe_findings` to distinguish a genuinely unsafe
+/// call from routine default-configuration parsing.
+fn has_unsafe_xml_config(args_node: tree_sitter::Node, content: &str) -> bool {
+    let mut c = args_node.walk();
+    for child in args_node.named_children(&mut c) {
+        if child.kind() == "keyword_argument" {
+            let name = child
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(content.as_bytes()).ok());
+            let value = child.child_by_field_name("value");
+            match name {
+                Some("resolve_entities") => {
+                    if value.is_some_and(|v| unwrap_parenthesized(v).kind() == "true") {
+                        return true;
+                    }
+                }
+                Some("forbid_dtd") | Some("forbid_entities") | Some("forbid_external") => {
+                    if value.is_some_and(|v| unwrap_parenthesized(v).kind() == "false") {
+                        return true;
+                    }
+                }
+                Some("parser")
+                    if value
+                        .and_then(|v| v.utf8_text(content.as_bytes()).ok())
+                        .is_some_and(|t| t.contains("XMLParser")) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        } else if let Ok(text) = child.utf8_text(content.as_bytes()) {
+            // A bare positional argument that itself constructs a custom
+            // XMLParser (e.g. `ET.parse(path, XMLParser(resolve_entities=True))`)
+            // is the same "custom parser instance" indicator as the keyword
+            // form above.
+            if text.contains("XMLParser(") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Finds XXE-prone XML parsing calls (`ElementTree`/`minidom`/`xml.sax`,
+/// bare and fully-qualified module-path forms) that are actually configured
+/// to enable unsafe entity/DTD resolution (issue #261 review round).
+///
+/// The original rule blanket-flagged every bare `ET.parse`/`minidom.parse`/
+/// `xml.sax.parse` call on the theory that these resolve external entities
+/// by default. Greptile's review reproduced that on Python 3.11 this isn't
+/// true: `ElementTree.parse`/`fromstring`, `minidom.parse`, and
+/// `xml.sax.parse` do NOT expand external `file://` entities by default in
+/// that Python version's stdlib configuration, so the blanket rule fired on
+/// routine, safe XML parsing — a false positive that risks alert fatigue.
+/// Anthropic's security-guidance plugin's `xml_unsafe_parse` rule (the
+/// reference this project targets behavioral parity with per issue #261) has
+/// the identical blanket-flag-bare-calls shape via a plain regex with no
+/// config scoping (see `security-guidance/hooks/patterns.py`), so there is
+/// no narrower upstream behavior to match here — this deliberately diverges
+/// from the reference rather than reproducing its false positive.
+///
+/// Like `python_yaml_load_findings`/`python_torch_load_findings` above, this
+/// is a "flag conditionally on argument content" shape a plain query can't
+/// express, so it matches the call generically and only flags when
+/// `has_unsafe_xml_config` finds an explicit unsafe-configuration indicator
+/// in the argument list — i.e. a call that has been deliberately configured
+/// to resolve external entities/DTDs (see that function's doc comment for
+/// the exact indicators), not a default-configuration call.
+fn python_xxe_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
+    let ts_lang: TsLanguage = tree_sitter_python::LANGUAGE.into();
+    let query_srcs = [
+        r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#match? @obj "^(ET|ElementTree|cElementTree)$")
+  (#match? @method "^(parse|fromstring|XML)$"))"#,
+        r#"(call
+  function: (attribute
+    object: (attribute
+      object: (attribute
+        object: (identifier) @mod1
+        attribute: (identifier) @mod2)
+      attribute: (identifier) @mod3)
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @mod1 "xml")
+  (#eq? @mod2 "etree")
+  (#eq? @mod3 "ElementTree")
+  (#match? @method "^(parse|fromstring|XML)$"))"#,
+        r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @obj "minidom")
+  (#match? @method "^(parse|parseString)$"))"#,
+        r#"(call
+  function: (attribute
+    object: (attribute
+      object: (attribute
+        object: (identifier) @mod1
+        attribute: (identifier) @mod2)
+      attribute: (identifier) @mod3)
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @mod1 "xml")
+  (#eq? @mod2 "dom")
+  (#eq? @mod3 "minidom")
+  (#match? @method "^(parse|parseString)$"))"#,
+        r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @obj "sax")
+  (#eq? @method "parse"))"#,
+        r#"(call
+  function: (attribute
+    object: (attribute
+      object: (identifier) @mod1
+      attribute: (identifier) @mod2)
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @mod1 "xml")
+  (#eq? @mod2 "sax")
+  (#eq? @method "parse"))"#,
+    ];
+
+    let mut findings = Vec::new();
+    for query_src in query_srcs {
+        let query = match Query::new(&ts_lang, query_src) {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+        let args_index = match query.capture_names().iter().position(|n| *n == "args") {
+            Some(i) => i,
+            None => continue,
+        };
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+        while let Some(m) = matches.next() {
+            for cap in m.captures {
+                if cap.index as usize != args_index {
+                    continue;
+                }
+                if has_unsafe_xml_config(cap.node, content) {
+                    findings.push(Finding {
+                        rule: "insecure-deserialize",
+                        reason: XXE_REASON,
+                    });
+                }
             }
         }
     }
@@ -756,6 +942,8 @@ pub fn scan(content: &str, lang: Lang) -> Vec<Finding> {
     if matches!(lang, Lang::Python) {
         findings.extend(python_yaml_load_findings(&tree, content));
         findings.extend(python_torch_load_findings(&tree, content));
+        findings.extend(python_numpy_load_findings(&tree, content));
+        findings.extend(python_xxe_findings(&tree, content));
         findings.extend(python_sql_string_interpolation_findings(&tree, content));
     }
     if matches!(lang, Lang::JavaScript | Lang::TypeScript) {
@@ -1279,6 +1467,18 @@ mod tests {
     }
 
     #[test]
+    fn python_flags_numpy_load_with_parenthesized_allow_pickle_true() {
+        // Greptile review round on #261's PR: allow_pickle=(True) is a
+        // parenthesized-but-functionally-identical bypass of the original
+        // `value: (true)` query, which only matched the bare literal shape.
+        let findings = scan("numpy.load(path, allow_pickle=(True))", Lang::Python);
+        assert!(
+            has_insecure_deserialize_finding(&findings),
+            "numpy.load with parenthesized allow_pickle=(True) must be flagged"
+        );
+    }
+
+    #[test]
     fn python_flags_torch_load_without_weights_only() {
         let findings = scan("torch.load(path)", Lang::Python);
         assert!(has_insecure_deserialize_finding(&findings));
@@ -1299,52 +1499,114 @@ mod tests {
         assert!(has_insecure_deserialize_finding(&findings));
     }
 
+    // XXE-prone XML parsing: narrowed (issue #261 review round) to only fire
+    // when the call is actually configured to enable unsafe entity/DTD
+    // resolution — Greptile reproduced that bare calls don't do this by
+    // default on Python 3.11, so the previous blanket-flag-every-bare-call
+    // behavior was a false positive. Each bare-call "ignores" test below is
+    // the regression coverage for that false positive; each "flags" test
+    // pairs it with an explicit unsafe-configuration indicator.
+
     #[test]
-    fn python_flags_et_parse() {
+    fn python_ignores_bare_et_parse() {
         let findings = scan("ET.parse(path)", Lang::Python);
+        assert!(
+            !has_insecure_deserialize_finding(&findings),
+            "bare ET.parse with default config is routine on modern Python 3 and must not be flagged"
+        );
+    }
+
+    #[test]
+    fn python_flags_et_parse_with_custom_xml_parser() {
+        let findings = scan(
+            "ET.parse(path, parser=XMLParser(resolve_entities=True))",
+            Lang::Python,
+        );
         assert!(has_insecure_deserialize_finding(&findings));
     }
 
     #[test]
-    fn python_flags_et_fromstring() {
+    fn python_ignores_bare_et_fromstring() {
         let findings = scan("ET.fromstring(data)", Lang::Python);
-        assert!(has_insecure_deserialize_finding(&findings));
+        assert!(!has_insecure_deserialize_finding(&findings));
     }
 
     #[test]
-    fn python_flags_elementtree_xml() {
+    fn python_ignores_bare_elementtree_xml() {
         let findings = scan("ElementTree.XML(data)", Lang::Python);
-        assert!(has_insecure_deserialize_finding(&findings));
+        assert!(!has_insecure_deserialize_finding(&findings));
     }
 
     #[test]
-    fn python_flags_full_dotted_elementtree_parse() {
+    fn python_ignores_bare_full_dotted_elementtree_parse() {
         let findings = scan("xml.etree.ElementTree.parse(path)", Lang::Python);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_full_dotted_elementtree_parse_with_custom_xml_parser() {
+        let findings = scan(
+            "xml.etree.ElementTree.parse(path, parser=XMLParser(resolve_entities=True))",
+            Lang::Python,
+        );
         assert!(has_insecure_deserialize_finding(&findings));
     }
 
     #[test]
-    fn python_flags_minidom_parse() {
+    fn python_ignores_bare_minidom_parse() {
         let findings = scan("minidom.parse(path)", Lang::Python);
-        assert!(has_insecure_deserialize_finding(&findings));
+        assert!(!has_insecure_deserialize_finding(&findings));
     }
 
     #[test]
-    fn python_flags_minidom_parse_string() {
+    fn python_ignores_bare_minidom_parse_string() {
         let findings = scan("minidom.parseString(data)", Lang::Python);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_minidom_parse_with_custom_xml_parser() {
+        let findings = scan(
+            "minidom.parse(path, parser=XMLParser(resolve_entities=True))",
+            Lang::Python,
+        );
         assert!(has_insecure_deserialize_finding(&findings));
     }
 
     #[test]
-    fn python_flags_sax_parse_alias() {
+    fn python_ignores_bare_full_dotted_minidom_parse() {
+        // Qualified form (`import xml.dom.minidom` then `xml.dom.minidom.parse`)
+        // — Greptile review round: the original rule only matched the bare
+        // `minidom` identifier form, missing this fully-qualified call chain.
+        let findings = scan("xml.dom.minidom.parse(path)", Lang::Python);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_full_dotted_minidom_parse_with_custom_xml_parser() {
+        let findings = scan(
+            "xml.dom.minidom.parse(path, parser=XMLParser(resolve_entities=True))",
+            Lang::Python,
+        );
+        assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_bare_full_dotted_minidom_parse_string() {
+        let findings = scan("xml.dom.minidom.parseString(data)", Lang::Python);
+        assert!(!has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_bare_sax_parse_alias() {
         let findings = scan("sax.parse(path, handler)", Lang::Python);
-        assert!(has_insecure_deserialize_finding(&findings));
+        assert!(!has_insecure_deserialize_finding(&findings));
     }
 
     #[test]
-    fn python_flags_full_dotted_xml_sax_parse() {
+    fn python_ignores_bare_full_dotted_xml_sax_parse() {
         let findings = scan("xml.sax.parse(path, handler)", Lang::Python);
-        assert!(has_insecure_deserialize_finding(&findings));
+        assert!(!has_insecure_deserialize_finding(&findings));
     }
 
     #[test]

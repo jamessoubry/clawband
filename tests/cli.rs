@@ -703,6 +703,17 @@ fn e2e_ast_guard_ignores_python_numpy_load_without_allow_pickle() {
 }
 
 #[test]
+fn e2e_ast_guard_flags_python_numpy_load_parenthesized_allow_pickle_true() {
+    // Greptile review round on #261's PR: allow_pickle=(True) — parenthesized
+    // — has a different AST shape than the bare `True` literal and bypassed
+    // the original query.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"numpy.load(path, allow_pickle=(True))"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
 fn e2e_ast_guard_flags_python_torch_load_without_weights_only() {
     let json =
         r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"torch.load(path)"}}"#;
@@ -719,34 +730,70 @@ fn e2e_ast_guard_ignores_python_torch_load_with_weights_only_true() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// XXE-prone XML parsing: narrowed (issue #261 review round) to only fire
+// when the call is explicitly configured to enable unsafe entity/DTD
+// resolution — Greptile reproduced that bare calls don't do this by default
+// on Python 3.11, so blanket-flagging every bare call was a false positive.
+
 #[test]
-fn e2e_ast_guard_flags_python_et_parse() {
+fn e2e_ast_guard_ignores_python_bare_et_parse() {
     let json =
         r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ET.parse(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_et_parse_with_custom_xml_parser() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ET.parse(path, parser=XMLParser(resolve_entities=True))"}}"#;
     let out = run(json, &[]);
     assert_eq!(decision(&out), Some("ask"), "{out}");
     assert!(out.contains("insecure-deserialize"), "{out}");
 }
 
 #[test]
-fn e2e_ast_guard_flags_python_full_dotted_elementtree_parse() {
+fn e2e_ast_guard_ignores_python_bare_full_dotted_elementtree_parse() {
     let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"xml.etree.ElementTree.parse(path)"}}"#;
     let out = run(json, &[]);
-    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert_eq!(decision(&out), None, "{out}");
 }
 
 #[test]
-fn e2e_ast_guard_flags_python_minidom_parse() {
+fn e2e_ast_guard_ignores_python_bare_minidom_parse() {
     let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"minidom.parse(path)"}}"#;
     let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_minidom_parse_with_custom_xml_parser() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"minidom.parse(path, parser=XMLParser(resolve_entities=True))"}}"#;
+    let out = run(json, &[]);
     assert_eq!(decision(&out), Some("ask"), "{out}");
 }
 
 #[test]
-fn e2e_ast_guard_flags_python_xml_sax_parse() {
-    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"xml.sax.parse(path, handler)"}}"#;
+fn e2e_ast_guard_ignores_python_bare_full_dotted_minidom_parse() {
+    // Qualified form (`import xml.dom.minidom` then `xml.dom.minidom.parse`)
+    // — Greptile review round: the original rule only matched the bare
+    // `minidom` identifier form, missing this fully-qualified call chain.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"xml.dom.minidom.parse(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_full_dotted_minidom_parse_with_custom_xml_parser() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"xml.dom.minidom.parse(path, parser=XMLParser(resolve_entities=True))"}}"#;
     let out = run(json, &[]);
     assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_bare_xml_sax_parse() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"xml.sax.parse(path, handler)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
 }
 
 #[test]
