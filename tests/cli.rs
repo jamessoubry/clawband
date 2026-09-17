@@ -636,6 +636,127 @@ fn e2e_ast_guard_ignores_vm_mention_in_comment() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// ── issue #261: unsafe-deserialization gap review ─────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_python_pickle_unpickler() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"pickle.Unpickler(f)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_cloudpickle_loads() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"cloudpickle.loads(data)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_shelve_open() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"shelve.open(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_yaml_unsafe_load() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"yaml.unsafe_load(data)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_joblib_load() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"joblib.load(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_pandas_read_pickle() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"pd.read_pickle(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_numpy_load_allow_pickle_true() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"numpy.load(path, allow_pickle=True)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_numpy_load_without_allow_pickle() {
+    // Required false-positive test from issue #261.
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"numpy.load(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_torch_load_without_weights_only() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"torch.load(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_torch_load_with_weights_only_true() {
+    // Required false-positive test from issue #261.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"torch.load(path, weights_only=True)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_et_parse() {
+    let json =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ET.parse(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-deserialize"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_full_dotted_elementtree_parse() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"xml.etree.ElementTree.parse(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_minidom_parse() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"minidom.parse(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_xml_sax_parse() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"xml.sax.parse(path, handler)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_defusedxml_parse() {
+    // Required false-positive test from issue #261.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"defusedxml.ElementTree.parse(path)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 // ── issue #255: tls-verify-disabled ───────────────────────────────────────
 
 #[test]
