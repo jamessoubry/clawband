@@ -65,16 +65,42 @@ pub enum Lang {
     /// (object literal property `rejectUnauthorized: false`), `dynamic-module-load`
     /// (`require`/`import()` with a non-string-literal argument),
     /// `sql-string-interpolation` (`.query`/`.execute` with a template-literal
-    /// argument containing `${...}` interpolation).
+    /// argument containing `${...}` interpolation), `xss-sink`
+    /// (`.innerHTML =`/`.outerHTML =` assignment, `.insertAdjacentHTML(...)`,
+    /// `document.write(...)`, and — since the default `tree-sitter-javascript`
+    /// grammar parses JSX out of the box, even in a plain `.js` file — the
+    /// `dangerouslySetInnerHTML` JSX attribute; see `Lang::Tsx`'s doc comment
+    /// for why `.tsx` needs a separate grammar variant for the JSX form of
+    /// this rule but `.js`/`.jsx` do not).
     JavaScript,
-    /// `.ts` / `.tsx` — `dynamic-eval` (`eval`/`Function`),
-    /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
+    /// `.ts` — `dynamic-eval` (`eval`/`Function`), `shell-invoking-subprocess`
+    /// (`.exec`/`.execSync`), `insecure-deserialize`
     /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
     /// (object literal property `rejectUnauthorized: false`), `dynamic-module-load`
     /// (`require`/`import()` with a non-string-literal argument),
     /// `sql-string-interpolation` (`.query`/`.execute` with a template-literal
-    /// argument containing `${...}` interpolation).
+    /// argument containing `${...}` interpolation), `xss-sink` (`.innerHTML =`/
+    /// `.outerHTML =` assignment, `.insertAdjacentHTML(...)`, `document.write(...)`
+    /// — but NOT the `dangerouslySetInnerHTML` JSX-attribute form, since plain
+    /// `.ts` files can't contain JSX syntax and `tree-sitter-typescript`'s
+    /// `LANGUAGE_TYPESCRIPT` grammar has no JSX node kinds at all; see
+    /// `Lang::Tsx` for the `.tsx` variant that does parse JSX).
     TypeScript,
+    /// `.tsx` — same rule set as `Lang::TypeScript` (all of `.ts`'s rules
+    /// apply verbatim, since `.tsx` is a superset of `.ts` syntax), PLUS the
+    /// `dangerouslySetInnerHTML` JSX-attribute form of `xss-sink`, which
+    /// `.ts` cannot have. This needs its own `Lang` variant (rather than
+    /// reusing `Lang::TypeScript` for both `.ts` and `.tsx` as clawband did
+    /// prior to issue #262) because `tree-sitter-typescript` ships JSX
+    /// support as a genuinely separate compiled grammar,
+    /// `tree_sitter_typescript::LANGUAGE_TSX` — confirmed empirically
+    /// (issue #262 investigation) that `LANGUAGE_TYPESCRIPT`'s
+    /// `node-types.json` has zero `jsx_*` node kinds, while `LANGUAGE_TSX`'s
+    /// does; a `jsx_attribute` tree-sitter query fails to even compile
+    /// (`Query::new` returns `Err`) against `LANGUAGE_TYPESCRIPT`, so
+    /// `dangerouslySetInnerHTML` is genuinely unreachable there and not just
+    /// unlikely to match syntactically.
+    Tsx,
 }
 
 /// Extensions this module can parse. Anything else returns `None` and the
@@ -86,7 +112,8 @@ pub fn detect_language(path: &str) -> Option<Lang> {
         "rs" => Some(Lang::Rust),
         "py" => Some(Lang::Python),
         "js" | "mjs" | "cjs" | "jsx" => Some(Lang::JavaScript),
-        "ts" | "tsx" => Some(Lang::TypeScript),
+        "ts" => Some(Lang::TypeScript),
+        "tsx" => Some(Lang::Tsx),
         _ => None,
     }
 }
@@ -97,6 +124,7 @@ fn ts_language(lang: &Lang) -> TsLanguage {
         Lang::Python => tree_sitter_python::LANGUAGE.into(),
         Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
     }
 }
 
@@ -151,39 +179,95 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
     let insecure_deserialize_reason = "insecure deserialization — this API can execute arbitrary code embedded in its input; if the input isn't fully trusted, use a data-only parser instead";
     let tls_verify_disabled_reason = "TLS certificate verification disabled — this accepts connections to servers with invalid/self-signed/expired certificates, defeating TLS's protection against MITM; should not ship to production";
     match lang {
-        Lang::JavaScript | Lang::TypeScript => vec![
-            (
-                "dynamic-eval",
-                r#"(call_expression function: (identifier) @fn (#match? @fn "^(eval|Function)$"))"#,
-                "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
-            ),
-            (
-                "shell-invoking-subprocess",
-                r#"(call_expression
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            let mut rules = vec![
+                (
+                    "dynamic-eval",
+                    r#"(call_expression function: (identifier) @fn (#match? @fn "^(eval|Function)$"))"#,
+                    "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
+                ),
+                (
+                    "shell-invoking-subprocess",
+                    r#"(call_expression
   function: (member_expression
     property: (property_identifier) @method)
   (#match? @method "^(exec|execSync)$"))"#,
-                shell_invoking_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call_expression
+                    shell_invoking_reason,
+                ),
+                (
+                    "insecure-deserialize",
+                    r#"(call_expression
   function: (member_expression
     object: (identifier) @obj
     property: (property_identifier) @method)
   (#eq? @obj "vm")
   (#match? @method "^(runInNewContext|runInThisContext|runInContext)$"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "tls-verify-disabled",
-                r#"(pair
+                    insecure_deserialize_reason,
+                ),
+                (
+                    "tls-verify-disabled",
+                    r#"(pair
   key: (property_identifier) @key
   value: (false)
   (#eq? @key "rejectUnauthorized"))"#,
-                tls_verify_disabled_reason,
-            ),
-        ],
+                    tls_verify_disabled_reason,
+                ),
+                (
+                    "xss-sink",
+                    r#"(assignment_expression
+  left: (member_expression
+    property: (property_identifier) @prop)
+  (#eq? @prop "innerHTML"))"#,
+                    "cross-site scripting (XSS) sink — assigning to innerHTML renders its value as live HTML/script; if the value isn't fully trusted, use textContent for plain text, or sanitize with a library like DOMPurify if HTML is genuinely needed",
+                ),
+                (
+                    "xss-sink",
+                    r#"(assignment_expression
+  left: (member_expression
+    property: (property_identifier) @prop)
+  (#eq? @prop "outerHTML"))"#,
+                    "cross-site scripting (XSS) sink — outerHTML assignment is equivalent to innerHTML for XSS purposes; use textContent or sanitize with a library like DOMPurify",
+                ),
+                (
+                    "xss-sink",
+                    r#"(call_expression
+  function: (member_expression
+    property: (property_identifier) @method)
+  (#eq? @method "insertAdjacentHTML"))"#,
+                    "cross-site scripting (XSS) sink — insertAdjacentHTML renders its argument as live HTML/script; if it isn't fully trusted, use insertAdjacentText() or sanitize with a library like DOMPurify",
+                ),
+                (
+                    "xss-sink",
+                    r#"(call_expression
+  function: (member_expression
+    object: (identifier) @obj
+    property: (property_identifier) @method)
+  (#eq? @obj "document")
+  (#eq? @method "write"))"#,
+                    "cross-site scripting (XSS) sink — document.write() with untrusted content injects and executes attacker-controlled HTML/script; use safe DOM methods like createElement()/appendChild() instead",
+                ),
+            ];
+            // `dangerouslySetInnerHTML` is a JSX attribute — a grammar
+            // construct that only `Lang::JavaScript` (default
+            // `tree-sitter-javascript` grammar, which parses JSX out of the
+            // box) and `Lang::Tsx` (dedicated `LANGUAGE_TSX` grammar) can
+            // even syntactically contain. Plain `Lang::TypeScript`'s
+            // `LANGUAGE_TYPESCRIPT` grammar has no `jsx_attribute` node kind
+            // at all, so including this query there would make `Query::new`
+            // fail (harmlessly skipped by `scan()`'s `Err(_) => continue`) —
+            // excluded here instead so the rule list documents what's
+            // actually reachable per-language rather than relying on that
+            // fallback. See `Lang::Tsx`'s doc comment for the empirical
+            // grammar-support check.
+            if !matches!(lang, Lang::TypeScript) {
+                rules.push((
+                    "xss-sink",
+                    r#"(jsx_attribute (property_identifier) @name (#eq? @name "dangerouslySetInnerHTML"))"#,
+                    "cross-site scripting (XSS) sink — React's dangerouslySetInnerHTML renders its __html value as raw HTML, executing attacker-controlled markup/script if the value isn't fully trusted; sanitize with a library like DOMPurify or avoid raw HTML rendering",
+                ));
+            }
+            rules
+        }
         Lang::Python => vec![
             (
                 "dynamic-eval",
@@ -946,7 +1030,7 @@ pub fn scan(content: &str, lang: Lang) -> Vec<Finding> {
         findings.extend(python_xxe_findings(&tree, content));
         findings.extend(python_sql_string_interpolation_findings(&tree, content));
     }
-    if matches!(lang, Lang::JavaScript | Lang::TypeScript) {
+    if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx) {
         findings.extend(js_dynamic_module_load_findings(&tree, content, &ts_lang));
         findings.extend(js_sql_string_interpolation_findings(
             &tree, content, &ts_lang,
@@ -2012,6 +2096,225 @@ mod tests {
     fn rust_has_no_sql_string_interpolation_rule() {
         let findings = scan(r#"fn main() { let x = 1; }"#, Lang::Rust);
         assert!(!has_sql_string_interpolation_finding(&findings));
+    }
+
+    // ── xss-sink (issue #262) ──
+    // No RHS/value narrowing here — the reference (security-guidance's
+    // innerHTML_xss/outerHTML_xss/insertAdjacentHTML_xss/document_write_xss/
+    // react_dangerously_set_html rules) flags every occurrence of these
+    // sinks via a plain substring match, gated only by file extension
+    // (path_filter), not by whether the assigned/passed value looks
+    // static or dynamic — so there is no narrower upstream behavior to
+    // match here, unlike e.g. `tls-verify-disabled`'s literal-`False`-only
+    // narrowing. AST matching still eliminates the comment/string-literal
+    // false positives a regex would hit, same as every other rule in this
+    // file.
+
+    fn has_xss_sink_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "xss-sink")
+    }
+
+    // .innerHTML =
+
+    #[test]
+    fn js_flags_inner_html_assignment() {
+        let findings = scan("el.innerHTML = userInput;", Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_inner_html_assignment_of_static_string() {
+        // No RHS narrowing (see section doc comment) — even an apparently
+        // static string literal assignment flags, matching the reference's
+        // unnarrowed substring behavior.
+        let findings = scan(r#"el.innerHTML = "<b>hi</b>";"#, Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_text_content_assignment() {
+        // Required false-positive test: textContent is the safe alternative
+        // and must never be flagged.
+        let findings = scan("el.textContent = userInput;", Lang::JavaScript);
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_inner_html_mention_in_comment() {
+        let findings = scan(
+            "// el.innerHTML = userInput; is bad\nfunction f(){return 1;}",
+            Lang::JavaScript,
+        );
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_inner_html_mention_in_string_literal() {
+        let findings = scan(r#"const s = "el.innerHTML = userInput";"#, Lang::JavaScript);
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_inner_html_assignment() {
+        let findings = scan("el.innerHTML = userInput;", Lang::TypeScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    // .outerHTML =
+
+    #[test]
+    fn js_flags_outer_html_assignment() {
+        let findings = scan("el.outerHTML = userInput;", Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_outer_html_mention_in_comment() {
+        let findings = scan(
+            "// el.outerHTML = userInput; is bad\nfunction f(){return 1;}",
+            Lang::JavaScript,
+        );
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_outer_html_assignment() {
+        let findings = scan("el.outerHTML = userInput;", Lang::TypeScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    // .insertAdjacentHTML(...)
+
+    #[test]
+    fn js_flags_insert_adjacent_html() {
+        let findings = scan(
+            "el.insertAdjacentHTML('beforeend', userInput);",
+            Lang::JavaScript,
+        );
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_insert_adjacent_text() {
+        // Required false-positive test: insertAdjacentText is the safe
+        // alternative and must never be flagged.
+        let findings = scan(
+            "el.insertAdjacentText('beforeend', userInput);",
+            Lang::JavaScript,
+        );
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_insert_adjacent_html_mention_in_comment() {
+        let findings = scan(
+            "// el.insertAdjacentHTML('beforeend', x) is bad\nfunction f(){return 1;}",
+            Lang::JavaScript,
+        );
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_insert_adjacent_html() {
+        let findings = scan(
+            "el.insertAdjacentHTML('beforeend', userInput);",
+            Lang::TypeScript,
+        );
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    // document.write(...)
+
+    #[test]
+    fn js_flags_document_write() {
+        let findings = scan("document.write(userInput);", Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_document_writeln() {
+        // document.writeln is a distinct method name; the query matches
+        // "write" exactly, not as a prefix.
+        let findings = scan("document.writeln(userInput);", Lang::JavaScript);
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_document_write_mention_in_comment() {
+        let findings = scan(
+            "// document.write(x) is bad\nfunction f(){return 1;}",
+            Lang::JavaScript,
+        );
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_document_write_mention_in_string_literal() {
+        let findings = scan(r#"const s = "document.write(x)";"#, Lang::JavaScript);
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_document_write() {
+        let findings = scan("document.write(userInput);", Lang::TypeScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    // dangerouslySetInnerHTML (JSX attribute — reachable in .js/.jsx via
+    // tree-sitter-javascript's built-in JSX support, and in .tsx via the
+    // dedicated LANGUAGE_TSX grammar; NOT reachable in plain .ts, which
+    // can't contain JSX syntax at all).
+
+    #[test]
+    fn js_flags_dangerously_set_inner_html_in_jsx() {
+        let findings = scan(
+            "const el = <div dangerouslySetInnerHTML={{__html: userInput}} />;",
+            Lang::JavaScript,
+        );
+        assert!(
+            has_xss_sink_finding(&findings),
+            "tree-sitter-javascript parses JSX by default even in a .js/.jsx file"
+        );
+    }
+
+    #[test]
+    fn tsx_flags_dangerously_set_inner_html() {
+        let findings = scan(
+            "const el = <div dangerouslySetInnerHTML={{__html: userInput}} />;",
+            Lang::Tsx,
+        );
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn ts_has_no_dangerously_set_inner_html_rule() {
+        // Plain .ts can't contain JSX syntax; LANGUAGE_TYPESCRIPT has no
+        // jsx_attribute node kind at all, so this is genuinely unreachable,
+        // not just an unlikely false negative. A bare mention of the
+        // identifier (not inside a JSX attribute) must not flag either.
+        let findings = scan("const dangerouslySetInnerHTML = true;", Lang::TypeScript);
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_dangerously_set_inner_html_mention_in_comment() {
+        let findings = scan(
+            "// dangerouslySetInnerHTML is bad\nfunction f(){return 1;}",
+            Lang::JavaScript,
+        );
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn python_has_no_xss_sink_rule() {
+        let findings = scan("eval(x)", Lang::Python);
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn rust_has_no_xss_sink_rule() {
+        let findings = scan(r#"fn main() { let x = 1; }"#, Lang::Rust);
+        assert!(!has_xss_sink_finding(&findings));
     }
 
     // ── rust-unsafe-block (issue #258) ──
