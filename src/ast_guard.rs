@@ -215,33 +215,106 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
                 (
                     "xss-sink",
                     r#"(assignment_expression
-  left: (member_expression
-    property: (property_identifier) @prop)
+  left: [
+    (member_expression
+      property: (property_identifier) @prop)
+    (subscript_expression
+      index: (string (string_fragment) @prop))
+  ]
   (#eq? @prop "innerHTML"))"#,
                     "cross-site scripting (XSS) sink — assigning to innerHTML renders its value as live HTML/script; if the value isn't fully trusted, use textContent for plain text, or sanitize with a library like DOMPurify if HTML is genuinely needed",
                 ),
                 (
                     "xss-sink",
+                    // `+=`/`||=`/etc. on innerHTML is the same sink as `=` —
+                    // this is an `augmented_assignment_expression` node, a
+                    // distinct grammar rule from `assignment_expression`
+                    // (confirmed against tree-sitter-javascript's grammar.js:
+                    // `augmented_assignment_expression` has its own `left`/
+                    // `operator`/`right` fields and its own `_augmented_assignment_lhs`
+                    // choice, which is why it needs its own query rather than
+                    // being covered by the plain-assignment pattern above).
+                    // Verified P1 Greptile finding on PR #299: `el.innerHTML
+                    // += attackerHtml` bypassed the guard entirely before
+                    // this rule existed.
+                    r#"(augmented_assignment_expression
+  left: [
+    (member_expression
+      property: (property_identifier) @prop)
+    (subscript_expression
+      index: (string (string_fragment) @prop))
+  ]
+  (#eq? @prop "innerHTML"))"#,
+                    "cross-site scripting (XSS) sink — compound-assigning (+=) to innerHTML is equivalent to a plain assignment for XSS purposes; if the value isn't fully trusted, use textContent for plain text, or sanitize with a library like DOMPurify if HTML is genuinely needed",
+                ),
+                (
+                    "xss-sink",
                     r#"(assignment_expression
-  left: (member_expression
-    property: (property_identifier) @prop)
+  left: [
+    (member_expression
+      property: (property_identifier) @prop)
+    (subscript_expression
+      index: (string (string_fragment) @prop))
+  ]
   (#eq? @prop "outerHTML"))"#,
                     "cross-site scripting (XSS) sink — outerHTML assignment is equivalent to innerHTML for XSS purposes; use textContent or sanitize with a library like DOMPurify",
                 ),
                 (
                     "xss-sink",
+                    // See the innerHTML `augmented_assignment_expression`
+                    // comment above — same node kind, same bypass shape,
+                    // just for outerHTML.
+                    r#"(augmented_assignment_expression
+  left: [
+    (member_expression
+      property: (property_identifier) @prop)
+    (subscript_expression
+      index: (string (string_fragment) @prop))
+  ]
+  (#eq? @prop "outerHTML"))"#,
+                    "cross-site scripting (XSS) sink — compound-assigning (+=) to outerHTML is equivalent to innerHTML for XSS purposes; use textContent or sanitize with a library like DOMPurify",
+                ),
+                (
+                    "xss-sink",
+                    // Covers both `el.insertAdjacentHTML(...)` (dot access,
+                    // `member_expression`) and `el["insertAdjacentHTML"](...)`
+                    // (computed/bracket access, `subscript_expression` — a
+                    // genuinely different grammar node from `member_expression`,
+                    // with its own `object`/`index` fields rather than
+                    // `object`/`property`; verified against
+                    // tree-sitter-javascript's grammar.js and node-types.json).
+                    // Verified P1 Greptile finding on PR #299: the bracket
+                    // form bypassed the guard entirely before this rule
+                    // covered it.
                     r#"(call_expression
-  function: (member_expression
-    property: (property_identifier) @method)
+  function: [
+    (member_expression
+      property: (property_identifier) @method)
+    (subscript_expression
+      index: (string (string_fragment) @method))
+  ]
   (#eq? @method "insertAdjacentHTML"))"#,
                     "cross-site scripting (XSS) sink — insertAdjacentHTML renders its argument as live HTML/script; if it isn't fully trusted, use insertAdjacentText() or sanitize with a library like DOMPurify",
                 ),
                 (
                     "xss-sink",
+                    // Covers `document.write(...)` and `document["write"](...)`
+                    // alike, but — same as the pre-existing dot-form rule —
+                    // deliberately scoped to the `document` object only
+                    // (`#eq? @obj "document"`), not `.write()`/`["write"]()`
+                    // on any arbitrary object; `foo["write"](x)` must not
+                    // flag. Verified P1 Greptile finding on PR #299:
+                    // `document["write"](attackerHtml)` bypassed the guard
+                    // entirely before this rule covered the bracket form.
                     r#"(call_expression
-  function: (member_expression
-    object: (identifier) @obj
-    property: (property_identifier) @method)
+  function: [
+    (member_expression
+      object: (identifier) @obj
+      property: (property_identifier) @method)
+    (subscript_expression
+      object: (identifier) @obj
+      index: (string (string_fragment) @method))
+  ]
   (#eq? @obj "document")
   (#eq? @method "write"))"#,
                     "cross-site scripting (XSS) sink — document.write() with untrusted content injects and executes attacker-controlled HTML/script; use safe DOM methods like createElement()/appendChild() instead",
@@ -2160,6 +2233,24 @@ mod tests {
         assert!(has_xss_sink_finding(&findings));
     }
 
+    #[test]
+    fn js_flags_inner_html_compound_assignment() {
+        // Verified P1 Greptile finding on PR #299: `+=` is an
+        // `augmented_assignment_expression`, a distinct grammar node from
+        // plain `assignment_expression`, and previously bypassed the guard.
+        let findings = scan("el.innerHTML += userInput;", Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_inner_html_bracket_assignment() {
+        // Verified P1 Greptile finding on PR #299: computed/bracket property
+        // access is a `subscript_expression`, a distinct grammar node from
+        // `member_expression`, and previously bypassed the guard.
+        let findings = scan(r#"el["innerHTML"] = userInput;"#, Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
     // .outerHTML =
 
     #[test]
@@ -2180,6 +2271,20 @@ mod tests {
     #[test]
     fn ts_flags_outer_html_assignment() {
         let findings = scan("el.outerHTML = userInput;", Lang::TypeScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_outer_html_compound_assignment() {
+        // Verified P1 Greptile finding on PR #299.
+        let findings = scan("el.outerHTML += userInput;", Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_outer_html_bracket_assignment() {
+        // Verified P1 Greptile finding on PR #299.
+        let findings = scan(r#"el["outerHTML"] = userInput;"#, Lang::JavaScript);
         assert!(has_xss_sink_finding(&findings));
     }
 
@@ -2223,6 +2328,18 @@ mod tests {
         assert!(has_xss_sink_finding(&findings));
     }
 
+    #[test]
+    fn js_flags_insert_adjacent_html_bracket_call() {
+        // Verified P1 Greptile finding on PR #299: computed-property call
+        // form (`subscript_expression` as the call's `function`) previously
+        // bypassed the guard entirely.
+        let findings = scan(
+            r#"el["insertAdjacentHTML"]("beforeend", userInput);"#,
+            Lang::JavaScript,
+        );
+        assert!(has_xss_sink_finding(&findings));
+    }
+
     // document.write(...)
 
     #[test]
@@ -2258,6 +2375,24 @@ mod tests {
     fn ts_flags_document_write() {
         let findings = scan("document.write(userInput);", Lang::TypeScript);
         assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_document_write_bracket_call() {
+        // Verified P1 Greptile finding on PR #299: `document["write"](...)`
+        // previously bypassed the guard entirely.
+        let findings = scan(r#"document["write"](userInput);"#, Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_bracket_write_on_other_object() {
+        // Negative case: the document.write rule is deliberately scoped to
+        // the `document` object, not any object with a `.write()`/`["write"]()`
+        // method — `foo["write"](x)` must not flag, mirroring the existing
+        // scoping of the dot-access form to `document` specifically.
+        let findings = scan(r#"foo["write"](userInput);"#, Lang::JavaScript);
+        assert!(!has_xss_sink_finding(&findings));
     }
 
     // dangerouslySetInnerHTML (JSX attribute — reachable in .js/.jsx via
