@@ -1133,6 +1133,25 @@ fn e2e_ast_guard_ignores_bracket_write_on_other_object() {
 }
 
 #[test]
+fn e2e_ast_guard_flags_js_window_document_write() {
+    // Second-opinion review finding on PR #299: `window.document.write(...)`
+    // previously bypassed the guard entirely.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"window.document.write(userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_window_document_write_on_other_outer_object() {
+    // Negative case: the window-qualified rule is scoped to exactly
+    // `window` — `someOtherWindow.document.write(x)` must not flag.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"someOtherWindow.document.write(userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
 fn e2e_ast_guard_flags_dangerously_set_inner_html_in_jsx() {
     // tree-sitter-javascript parses JSX by default, even in a .jsx file.
     let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.jsx","content":"const el = <div dangerouslySetInnerHTML={{__html: userInput}} />;"}}"#;

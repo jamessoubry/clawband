@@ -319,6 +319,53 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @method "write"))"#,
                     "cross-site scripting (XSS) sink — document.write() with untrusted content injects and executes attacker-controlled HTML/script; use safe DOM methods like createElement()/appendChild() instead",
                 ),
+                (
+                    "xss-sink",
+                    // Covers `window.document.write(...)` and its bracket
+                    // permutations (`window["document"].write(...)`,
+                    // `window.document["write"](...)`,
+                    // `window["document"]["write"](...)`). Some codebases
+                    // qualify `document` off `window` deliberately, to
+                    // disambiguate from a shadowed local `document`
+                    // variable — this must still be caught by the same rule
+                    // as bare `document.write(...)`. Deliberately requires
+                    // the outer object to be exactly `window`
+                    // (`#eq? @win "window"`), so `someOtherWindow.document
+                    // .write(x)` / `foo.document.write(x)` do NOT flag — this
+                    // rule is scoped to the `window.document` access path
+                    // specifically, mirroring how the bare-`document` rule
+                    // above is scoped to `document` specifically. Fixes a
+                    // gap found by second-opinion review on PR #299 (the
+                    // dot-form/bracket-form `document`-only rules above did
+                    // not cover this one extra hop of chained member access).
+                    r#"(call_expression
+  function: [
+    (member_expression
+      object: [
+        (member_expression
+          object: (identifier) @win
+          property: (property_identifier) @doc)
+        (subscript_expression
+          object: (identifier) @win
+          index: (string (string_fragment) @doc))
+      ]
+      property: (property_identifier) @method)
+    (subscript_expression
+      object: [
+        (member_expression
+          object: (identifier) @win
+          property: (property_identifier) @doc)
+        (subscript_expression
+          object: (identifier) @win
+          index: (string (string_fragment) @doc))
+      ]
+      index: (string (string_fragment) @method))
+  ]
+  (#eq? @win "window")
+  (#eq? @doc "document")
+  (#eq? @method "write"))"#,
+                    "cross-site scripting (XSS) sink — window.document.write() with untrusted content injects and executes attacker-controlled HTML/script; use safe DOM methods like createElement()/appendChild() instead",
+                ),
             ];
             // `dangerouslySetInnerHTML` is a JSX attribute — a grammar
             // construct that only `Lang::JavaScript` (default
@@ -2392,6 +2439,63 @@ mod tests {
         // method — `foo["write"](x)` must not flag, mirroring the existing
         // scoping of the dot-access form to `document` specifically.
         let findings = scan(r#"foo["write"](userInput);"#, Lang::JavaScript);
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_window_document_write() {
+        // Second-opinion review finding on PR #299: `window.document.write(...)`
+        // bypassed the guard entirely — the `document`-only dot/bracket rules
+        // required a bare `identifier` object equal to `"document"`, and
+        // qualifying `document` off `window` slipped through undetected.
+        let findings = scan("window.document.write(userInput);", Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_window_bracket_document_write() {
+        let findings = scan(r#"window["document"].write(userInput);"#, Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_window_document_bracket_write() {
+        let findings = scan(r#"window.document["write"](userInput);"#, Lang::JavaScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_window_bracket_document_bracket_write() {
+        let findings = scan(
+            r#"window["document"]["write"](userInput);"#,
+            Lang::JavaScript,
+        );
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_window_document_write() {
+        let findings = scan("window.document.write(userInput);", Lang::TypeScript);
+        assert!(has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_window_document_write_on_other_outer_object() {
+        // Negative case: the window-qualified rule must be scoped to exactly
+        // `window`, not any outer object named similarly — `someOtherWindow
+        // .document.write(x)` must not flag.
+        let findings = scan(
+            "someOtherWindow.document.write(userInput);",
+            Lang::JavaScript,
+        );
+        assert!(!has_xss_sink_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_non_document_write_off_window() {
+        // Negative case: `foo.document.write(x)` — the middle property isn't
+        // `document` — must not flag either.
+        let findings = scan("foo.document.write(userInput);", Lang::JavaScript);
         assert!(!has_xss_sink_finding(&findings));
     }
 
