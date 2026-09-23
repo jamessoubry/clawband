@@ -1001,6 +1001,184 @@ fn e2e_ast_guard_ignores_js_query_template_literal_no_interpolation() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// ── issue #262: xss-sink ────────────────────────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_js_inner_html_assignment() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"el.innerHTML = userInput;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_js_text_content_assignment() {
+    // Required false-positive test: textContent is the safe alternative.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"el.textContent = userInput;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_inner_html_mention_in_comment() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"// el.innerHTML = x; is bad\nfunction f(){return 1;}"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_inner_html_compound_assignment() {
+    // Verified P1 Greptile finding on PR #299: `+=` (augmented_assignment_expression)
+    // previously bypassed the guard entirely.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"el.innerHTML += userInput;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_inner_html_bracket_assignment() {
+    // Verified P1 Greptile finding on PR #299: `el["innerHTML"] = ...`
+    // (subscript_expression) previously bypassed the guard entirely.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"el[\"innerHTML\"] = userInput;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_ts_outer_html_assignment() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.ts","content":"el.outerHTML = userInput;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_outer_html_bracket_assignment() {
+    // Verified P1 Greptile finding on PR #299: `el["outerHTML"] = ...`
+    // previously bypassed the guard entirely.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"el[\"outerHTML\"] = userInput;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_insert_adjacent_html() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"el.insertAdjacentHTML('beforeend', userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_insert_adjacent_text() {
+    // Required false-positive test: insertAdjacentText is the safe alternative.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"el.insertAdjacentText('beforeend', userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_insert_adjacent_html_bracket_call() {
+    // Verified P1 Greptile finding on PR #299: `el["insertAdjacentHTML"](...)`
+    // (subscript_expression as the call's function) previously bypassed
+    // the guard entirely.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"el[\"insertAdjacentHTML\"](\"beforeend\", userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_document_write() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"document.write(userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_document_writeln() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"document.writeln(userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_document_write_mention_in_string_literal() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const s = \"document.write(x)\";"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_document_write_bracket_call() {
+    // Verified P1 Greptile finding on PR #299: `document["write"](...)`
+    // previously bypassed the guard entirely.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"document[\"write\"](userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_bracket_write_on_other_object() {
+    // Negative case: the document.write rule is scoped to the `document`
+    // object specifically — `foo["write"](x)` must not flag.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"foo[\"write\"](userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_window_document_write() {
+    // Second-opinion review finding on PR #299: `window.document.write(...)`
+    // previously bypassed the guard entirely.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"window.document.write(userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_window_document_write_on_other_outer_object() {
+    // Negative case: the window-qualified rule is scoped to exactly
+    // `window` — `someOtherWindow.document.write(x)` must not flag.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"someOtherWindow.document.write(userInput);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_dangerously_set_inner_html_in_jsx() {
+    // tree-sitter-javascript parses JSX by default, even in a .jsx file.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.jsx","content":"const el = <div dangerouslySetInnerHTML={{__html: userInput}} />;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_dangerously_set_inner_html_in_tsx() {
+    // .tsx needs the dedicated LANGUAGE_TSX grammar (plain LANGUAGE_TYPESCRIPT
+    // has no JSX support at all) — see ast_guard.rs's Lang::Tsx doc comment.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.tsx","content":"const el = <div dangerouslySetInnerHTML={{__html: userInput}} />;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("xss-sink"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ts_has_no_dangerously_set_inner_html_rule() {
+    // Plain .ts can't contain JSX syntax at all — a bare mention of the
+    // identifier outside a JSX attribute must not flag either.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.ts","content":"const dangerouslySetInnerHTML = true;"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 // ── issue #258: rust-unsafe-block ─────────────────────────────────────────
 
 #[test]
