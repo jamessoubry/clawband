@@ -1259,6 +1259,28 @@ mod tests {
     }
 
     #[test]
+    fn tsx_flags_new_function_call() {
+        // Regression coverage for Lang::Tsx specifically: it parses via the
+        // dedicated LANGUAGE_TSX grammar, a genuinely separate grammar from
+        // LANGUAGE_TYPESCRIPT, so a query that matches on one is not
+        // guaranteed to match on the other without this explicit check.
+        let findings = scan("const f = new Function(user_input);", Lang::Tsx);
+        assert!(
+            findings.iter().any(|f| f.rule == "dynamic-eval"),
+            "new Function(...) must be flagged under the Tsx grammar too"
+        );
+    }
+
+    #[test]
+    fn tsx_ignores_new_of_unrelated_constructor() {
+        let findings = scan("const d = new Date();", Lang::Tsx);
+        assert!(
+            !findings.iter().any(|f| f.rule == "dynamic-eval"),
+            "new Date() must not be flagged as dynamic-eval under the Tsx grammar"
+        );
+    }
+
+    #[test]
     fn js_ignores_new_of_unrelated_constructor() {
         // Required false-positive check: `new` on any other constructor must
         // not be swept in by the `new_expression` arm.
