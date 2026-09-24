@@ -403,6 +403,32 @@ fn e2e_ast_guard_flags_real_eval_call_in_js() {
 }
 
 #[test]
+fn e2e_ast_guard_flags_new_function_call() {
+    // issue #263: `new Function(...)` parses as a `new_expression` node, a
+    // different AST shape from the bare `Function(...)` `call_expression`
+    // the pre-existing dynamic-eval query matched — this was a genuine gap
+    // in the existing rule, fixed by extending its query rather than adding
+    // a separate rule.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const f = new Function(user_input);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "new Function(...) call must ask: {out}"
+    );
+    assert!(out.contains("dynamic-eval"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_new_date_call() {
+    // Required false-positive check: `new` on an unrelated constructor must
+    // not be swept in by the new_expression arm added for `new Function`.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const d = new Date();"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "new Date() must not ask: {out}");
+}
+
+#[test]
 fn e2e_ast_guard_ignores_eval_in_js_comment() {
     // The entire reason this module exists over regex: a comment mentioning
     // eval must not be flagged, unlike a naive text search would.

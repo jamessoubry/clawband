@@ -59,7 +59,8 @@ pub enum Lang {
     /// (`.execute`/`.executemany` with an f-string/`%`-format/`.format()`/
     /// `+`-concatenated argument).
     Python,
-    /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`),
+    /// `.js` / `.mjs` / `.cjs` / `.jsx` — `dynamic-eval` (`eval`/`Function`,
+    /// including the `new Function(...)` constructor-call form),
     /// `shell-invoking-subprocess` (`.exec`/`.execSync`), `insecure-deserialize`
     /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
     /// (object literal property `rejectUnauthorized: false`), `dynamic-module-load`
@@ -73,7 +74,8 @@ pub enum Lang {
     /// for why `.tsx` needs a separate grammar variant for the JSX form of
     /// this rule but `.js`/`.jsx` do not).
     JavaScript,
-    /// `.ts` — `dynamic-eval` (`eval`/`Function`), `shell-invoking-subprocess`
+    /// `.ts` — `dynamic-eval` (`eval`/`Function`, including the
+    /// `new Function(...)` constructor-call form), `shell-invoking-subprocess`
     /// (`.exec`/`.execSync`), `insecure-deserialize`
     /// (`vm.runInNewContext`/`runInThisContext`/`runInContext`), `tls-verify-disabled`
     /// (object literal property `rejectUnauthorized: false`), `dynamic-module-load`
@@ -183,7 +185,90 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
             let mut rules = vec![
                 (
                     "dynamic-eval",
-                    r#"(call_expression function: (identifier) @fn (#match? @fn "^(eval|Function)$"))"#,
+                    // Two distinct grammar shapes for the same danger:
+                    // `eval(x)`/`Function(x)` called as a bare function is a
+                    // `call_expression`; `new Function(x)` is a genuinely
+                    // different node kind, `new_expression`, with its own
+                    // `constructor`/`arguments` fields (confirmed against
+                    // tree-sitter-javascript's node-types.json — issue #263).
+                    // Before this fix the query only matched the
+                    // `call_expression` form, so `new Function(...)` — the
+                    // far more common way this constructor is actually
+                    // invoked in real code — slipped through entirely; this
+                    // was a genuine gap in the existing rule, not a
+                    // deliberately-scoped exclusion, so it's fixed here
+                    // rather than added as a separate rule. `eval` has no
+                    // `new eval(...)` form worth matching (it isn't a
+                    // constructor and `new eval()` throws at runtime), so
+                    // only `Function` needs the `new_expression` arm.
+                    //
+                    // Gotcha verified empirically while building this: the
+                    // two alternation branches below MUST use distinct
+                    // capture names (`@fn` vs `@ctor`). Reusing the same
+                    // capture name (`@fn`) in both branches of a top-level
+                    // `[ ... ]` alternation silently breaks matching for
+                    // BOTH branches — `cursor.matches()` stopped returning
+                    // the plain `eval(x)` call_expression match entirely,
+                    // not just the new branch — even though `Query::new`
+                    // compiles it without error. Caught by a pre-existing
+                    // regression test (`flags_real_eval_call_in_js`) that
+                    // would otherwise have silently regressed.
+                    r#"[
+  (call_expression function: (identifier) @fn (#match? @fn "^(eval|Function)$"))
+  (new_expression constructor: (identifier) @ctor (#eq? @ctor "Function"))
+]"#,
+                    "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
+                ),
+                (
+                    "dynamic-eval",
+                    // Second-opinion review finding on PR #301: `Function`
+                    // qualified off `window`/`globalThis`/`self` — the same
+                    // bypass class already fixed for `document.write` in
+                    // PR #299 (`js_flags_window_document_write`) — slipped
+                    // past both the bare-identifier `call_expression` branch
+                    // and the `new_expression` branch above, since both
+                    // require the callee/constructor to be a bare
+                    // `identifier` named `Function`, not a qualified member
+                    // access. Covers `window.Function(x)` /
+                    // `window["Function"](x)` (call form) — the `new`-prefixed
+                    // form is a separate entry below since `new_expression`
+                    // is a genuinely different node kind. `globalThis`/`self`
+                    // included since they're the other common ways code
+                    // reaches this same global scope in JS.
+                    r#"(call_expression
+  function: [
+    (member_expression
+      object: (identifier) @win
+      property: (property_identifier) @method)
+    (subscript_expression
+      object: (identifier) @win
+      index: (string (string_fragment) @method))
+  ]
+  (#match? @win "^(window|globalThis|self)$")
+  (#eq? @method "Function"))"#,
+                    "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
+                ),
+                (
+                    "dynamic-eval",
+                    // `new`-prefixed counterpart to the rule above: `new
+                    // window.Function(x)` / `new window["Function"](x)`.
+                    // `new_expression`'s `constructor` field accepts a
+                    // `member_expression`/`subscript_expression` via
+                    // tree-sitter-javascript's `primary_expression` supertype
+                    // (confirmed against node-types.json), so this is a
+                    // distinct query rather than reachable from the bare-
+                    // `identifier` `new_expression` branch above.
+                    r#"(new_expression
+  constructor: [
+    (member_expression
+      object: (identifier) @win
+      property: (property_identifier) @method)
+    (subscript_expression
+      object: (identifier) @win
+      index: (string (string_fragment) @method))
+  ]
+  (#match? @win "^(window|globalThis|self)$")
+  (#eq? @method "Function"))"#,
                     "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
                 ),
                 (
@@ -1191,6 +1276,142 @@ mod tests {
         assert!(
             findings.is_empty(),
             "eval mentioned in a string literal must not be flagged: this is the entire point of AST scanning over regex"
+        );
+    }
+
+    #[test]
+    fn js_flags_bare_function_call() {
+        // Confirms the pre-existing bare-`Function(...)` call_expression form
+        // still matches after the query was extended for `new_expression`
+        // (issue #263) — a regression check on the original shape.
+        let findings = scan("const f = Function(user_input);", Lang::JavaScript);
+        assert!(
+            findings.iter().any(|f| f.rule == "dynamic-eval"),
+            "bare Function(...) call must still be flagged"
+        );
+    }
+
+    #[test]
+    fn js_flags_new_function_call() {
+        // issue #263: `new Function(...)` parses as a `new_expression` node,
+        // a genuinely different AST shape than the `call_expression` the
+        // original dynamic-eval query matched — this was a real gap in the
+        // existing rule (not a new rule), fixed by extending the query.
+        let findings = scan("const f = new Function(user_input);", Lang::JavaScript);
+        assert!(
+            findings.iter().any(|f| f.rule == "dynamic-eval"),
+            "new Function(...) must be flagged: same danger as bare Function(...), different AST node kind"
+        );
+    }
+
+    #[test]
+    fn ts_flags_new_function_call() {
+        let findings = scan("const f = new Function(user_input);", Lang::TypeScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn tsx_flags_new_function_call() {
+        // Regression coverage for Lang::Tsx specifically: it parses via the
+        // dedicated LANGUAGE_TSX grammar, a genuinely separate grammar from
+        // LANGUAGE_TYPESCRIPT, so a query that matches on one is not
+        // guaranteed to match on the other without this explicit check.
+        let findings = scan("const f = new Function(user_input);", Lang::Tsx);
+        assert!(
+            findings.iter().any(|f| f.rule == "dynamic-eval"),
+            "new Function(...) must be flagged under the Tsx grammar too"
+        );
+    }
+
+    #[test]
+    fn tsx_ignores_new_of_unrelated_constructor() {
+        let findings = scan("const d = new Date();", Lang::Tsx);
+        assert!(
+            !findings.iter().any(|f| f.rule == "dynamic-eval"),
+            "new Date() must not be flagged as dynamic-eval under the Tsx grammar"
+        );
+    }
+
+    #[test]
+    fn js_flags_window_qualified_function_call() {
+        // Second-opinion review finding on PR #301: bare `window.Function(x)`
+        // bypassed dynamic-eval the same way bare `window.document.write(x)`
+        // bypassed xss-sink before PR #299's fix — same qualification-bypass
+        // class, different sink.
+        let findings = scan("window.Function(userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_flags_globalthis_qualified_function_call() {
+        let findings = scan("globalThis.Function(userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_flags_self_qualified_function_bracket_call() {
+        let findings = scan("self[\"Function\"](userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_flags_new_window_qualified_function_call() {
+        let findings = scan("new window.Function(userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_flags_new_window_qualified_function_bracket_call() {
+        let findings = scan("new window['Function'](userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_ignores_window_qualified_unrelated_method() {
+        // Must stay scoped to exactly `Function`, not any window-qualified call.
+        let findings = scan("window.alert(userInput);", Lang::JavaScript);
+        assert!(!findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_ignores_unrelated_object_qualified_function_call() {
+        // Must stay scoped to window/globalThis/self, not any arbitrary object.
+        let findings = scan("someOtherObj.Function(userInput);", Lang::JavaScript);
+        assert!(!findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn ts_flags_window_qualified_function_call() {
+        let findings = scan("window.Function(userInput);", Lang::TypeScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn tsx_flags_new_window_qualified_function_call() {
+        let findings = scan("new window.Function(userInput);", Lang::Tsx);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_ignores_new_of_unrelated_constructor() {
+        // Required false-positive check: `new` on any other constructor must
+        // not be swept in by the `new_expression` arm.
+        let findings = scan("const d = new Date();", Lang::JavaScript);
+        assert!(
+            !findings.iter().any(|f| f.rule == "dynamic-eval"),
+            "new Date() must not be flagged as dynamic-eval"
+        );
+    }
+
+    #[test]
+    fn js_ignores_new_function_mention_in_comment() {
+        let findings = scan(
+            "// new Function(x) would be bad\nfunction f(){return 1;}",
+            Lang::JavaScript,
+        );
+        assert!(
+            !findings.iter().any(|f| f.rule == "dynamic-eval"),
+            "new Function mentioned in a comment must not be flagged"
         );
     }
 
