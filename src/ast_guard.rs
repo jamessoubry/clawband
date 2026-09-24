@@ -220,6 +220,58 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
                     "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
                 ),
                 (
+                    "dynamic-eval",
+                    // Second-opinion review finding on PR #301: `Function`
+                    // qualified off `window`/`globalThis`/`self` — the same
+                    // bypass class already fixed for `document.write` in
+                    // PR #299 (`js_flags_window_document_write`) — slipped
+                    // past both the bare-identifier `call_expression` branch
+                    // and the `new_expression` branch above, since both
+                    // require the callee/constructor to be a bare
+                    // `identifier` named `Function`, not a qualified member
+                    // access. Covers `window.Function(x)` /
+                    // `window["Function"](x)` (call form) — the `new`-prefixed
+                    // form is a separate entry below since `new_expression`
+                    // is a genuinely different node kind. `globalThis`/`self`
+                    // included since they're the other common ways code
+                    // reaches this same global scope in JS.
+                    r#"(call_expression
+  function: [
+    (member_expression
+      object: (identifier) @win
+      property: (property_identifier) @method)
+    (subscript_expression
+      object: (identifier) @win
+      index: (string (string_fragment) @method))
+  ]
+  (#match? @win "^(window|globalThis|self)$")
+  (#eq? @method "Function"))"#,
+                    "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
+                ),
+                (
+                    "dynamic-eval",
+                    // `new`-prefixed counterpart to the rule above: `new
+                    // window.Function(x)` / `new window["Function"](x)`.
+                    // `new_expression`'s `constructor` field accepts a
+                    // `member_expression`/`subscript_expression` via
+                    // tree-sitter-javascript's `primary_expression` supertype
+                    // (confirmed against node-types.json), so this is a
+                    // distinct query rather than reachable from the bare-
+                    // `identifier` `new_expression` branch above.
+                    r#"(new_expression
+  constructor: [
+    (member_expression
+      object: (identifier) @win
+      property: (property_identifier) @method)
+    (subscript_expression
+      object: (identifier) @win
+      index: (string (string_fragment) @method))
+  ]
+  (#match? @win "^(window|globalThis|self)$")
+  (#eq? @method "Function"))"#,
+                    "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
+                ),
+                (
                     "shell-invoking-subprocess",
                     r#"(call_expression
   function: (member_expression
@@ -1278,6 +1330,66 @@ mod tests {
             !findings.iter().any(|f| f.rule == "dynamic-eval"),
             "new Date() must not be flagged as dynamic-eval under the Tsx grammar"
         );
+    }
+
+    #[test]
+    fn js_flags_window_qualified_function_call() {
+        // Second-opinion review finding on PR #301: bare `window.Function(x)`
+        // bypassed dynamic-eval the same way bare `window.document.write(x)`
+        // bypassed xss-sink before PR #299's fix — same qualification-bypass
+        // class, different sink.
+        let findings = scan("window.Function(userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_flags_globalthis_qualified_function_call() {
+        let findings = scan("globalThis.Function(userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_flags_self_qualified_function_bracket_call() {
+        let findings = scan("self[\"Function\"](userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_flags_new_window_qualified_function_call() {
+        let findings = scan("new window.Function(userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_flags_new_window_qualified_function_bracket_call() {
+        let findings = scan("new window['Function'](userInput);", Lang::JavaScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_ignores_window_qualified_unrelated_method() {
+        // Must stay scoped to exactly `Function`, not any window-qualified call.
+        let findings = scan("window.alert(userInput);", Lang::JavaScript);
+        assert!(!findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn js_ignores_unrelated_object_qualified_function_call() {
+        // Must stay scoped to window/globalThis/self, not any arbitrary object.
+        let findings = scan("someOtherObj.Function(userInput);", Lang::JavaScript);
+        assert!(!findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn ts_flags_window_qualified_function_call() {
+        let findings = scan("window.Function(userInput);", Lang::TypeScript);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
+    }
+
+    #[test]
+    fn tsx_flags_new_window_qualified_function_call() {
+        let findings = scan("new window.Function(userInput);", Lang::Tsx);
+        assert!(findings.iter().any(|f| f.rule == "dynamic-eval"));
     }
 
     #[test]
