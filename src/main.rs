@@ -7249,10 +7249,20 @@ fn main() {
             if let Some(lang) = ast_guard::detect_language(raw_path) {
                 let findings = ast_guard::scan(content, lang);
                 if !findings.is_empty() {
-                    let reasons: Vec<String> = findings
-                        .iter()
-                        .map(|f| format!("[{}] {}", f.rule, f.reason))
-                        .collect();
+                    // Dedup identical `[rule] reason` lines before joining:
+                    // a single Write can trip two different rule *matches*
+                    // that happen to carry the same shared reason string
+                    // (e.g. `verify=False` and `ssl._create_unverified_context()`
+                    // both use `tls_verify_disabled_reason` — Greptile review,
+                    // PR #305), which otherwise repeats the same warning
+                    // verbatim in the prompt with no added information.
+                    let mut reasons: Vec<String> = Vec::with_capacity(findings.len());
+                    for f in &findings {
+                        let line = format!("[{}] {}", f.rule, f.reason);
+                        if !reasons.contains(&line) {
+                            reasons.push(line);
+                        }
+                    }
                     let reason = format!(
                         "clawband: structural check flagged this write:\n{}",
                         reasons.join("\n")

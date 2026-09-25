@@ -914,6 +914,127 @@ fn e2e_ast_guard_ignores_rust_danger_accept_invalid_certs_false() {
     assert_eq!(decision(&out), None, "{out}");
 }
 
+// ── issue #264: insecure-crypto / additional tls-verify-disabled forms ────
+
+#[test]
+fn e2e_ast_guard_flags_js_crypto_create_cipher() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const c = crypto.createCipher('aes192', password);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-crypto"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_js_crypto_create_decipher() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const d = crypto.createDecipher('aes192', password);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-crypto"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_js_crypto_create_cipheriv() {
+    // Required false-positive test: the modern, non-deprecated createCipheriv
+    // (explicit IV, no unsalted single-hash KDF) must not be flagged.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"const c = crypto.createCipheriv('aes-256-gcm', key, iv);"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_js_crypto_create_cipher_mention_in_comment() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.js","content":"// crypto.createCipher is insecure\nfunction f(){return 1;}"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_aes_mode_ecb() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"cipher = AES.new(key, AES.MODE_ECB)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("insecure-crypto"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_aes_mode_cbc() {
+    // Required false-positive test: an authenticated/safer mode must not flag.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"cipher = AES.new(key, AES.MODE_GCM)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_mode_ecb_on_unrelated_object() {
+    // Required false-positive test: scoped to `AES.` specifically.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"x = SomeOtherEnum.MODE_ECB"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_ssl_create_unverified_context() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ctx = ssl._create_unverified_context()"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("tls-verify-disabled"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_create_unverified_context_on_unrelated_object() {
+    // Required false-positive test: scoped to the `ssl.` qualifier.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ctx = mymodule._create_unverified_context()"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_check_hostname_false_keyword_arg() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ctx.wrap_socket(sock, check_hostname=False)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("tls-verify-disabled"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_check_hostname_true_keyword_arg() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ctx.wrap_socket(sock, check_hostname=True)"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_flags_python_check_hostname_false_attribute_assignment() {
+    // Greptile review, PR #305: `ctx.check_hostname = False` is an attribute
+    // *assignment*, a different AST shape from the keyword-argument form
+    // above, and was passing through undetected before this fix.
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ctx.check_hostname = False"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("tls-verify-disabled"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_python_check_hostname_true_attribute_assignment() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"ctx.check_hostname = True"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_check_hostname_mention_in_comment() {
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"# ctx.check_hostname = False is bad\nprint(1)"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_check_hostname_mention_in_string_literal() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.py","content":"s = \"ctx.check_hostname = False\""}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
 // ── issue #256: dynamic-module-load ───────────────────────────────────────
 
 #[test]

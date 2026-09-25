@@ -488,10 +488,12 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
             // only (mirrors the `vm.runInNewContext` scoping above); the
             // string-literal cipher-algorithm form (e.g. `"aes-128-ecb"`
             // passed to `crypto.createCipheriv`) is a string *value*, not a
-            // code *structure*, and is intentionally left to clawband's
-            // existing regex layer rather than added as an AST rule here —
-            // see the issue #264 discussion for why AST matching is a poor
-            // fit for flagging string contents rather than syntax shapes.
+            // code *structure*, and is intentionally left unflagged here —
+            // no other clawband layer (regex or otherwise) currently covers
+            // it either, so this is a known, accepted gap, not a
+            // fallback-covered one; see the issue #264 discussion for why
+            // AST matching is a poor fit for flagging string contents rather
+            // than syntax shapes.
             rules.push((
                 "insecure-crypto",
                 r#"(call_expression
@@ -660,6 +662,28 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
       name: (identifier) @kw
       value: (false)))
   (#eq? @kw "check_hostname"))"#,
+                tls_verify_disabled_reason,
+            ),
+            (
+                "tls-verify-disabled",
+                // `ctx.check_hostname = False` — attribute *assignment*, a
+                // different AST shape (Python's `assignment` node, with an
+                // `attribute` node as its `left` field) from the
+                // `check_hostname=False` *keyword-argument* rule immediately
+                // above (Greptile review round, PR #305/issue #264): setting
+                // the attribute directly on an already-constructed
+                // `ssl.SSLContext` instance is an equally common and equally
+                // dangerous way to disable hostname verification, and was
+                // passing through undetected. Left unscoped by object name
+                // (matches any `.check_hostname` attribute assignment), same
+                // reasoning as the keyword-arg rule above: SSLContext
+                // instances are constructed and named in too many different
+                // ways to enumerate a fixed set of object names.
+                r#"(assignment
+  left: (attribute
+    attribute: (identifier) @attr)
+  right: (false)
+  (#eq? @attr "check_hostname"))"#,
                 tls_verify_disabled_reason,
             ),
             (
@@ -2258,6 +2282,45 @@ mod tests {
     #[test]
     fn python_ignores_check_hostname_mention_in_string_literal() {
         let findings = scan(r#"s = "check_hostname=False""#, Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    // ── tls-verify-disabled: check_hostname attribute assignment
+    // (Greptile review, PR #305) ──
+
+    #[test]
+    fn python_flags_check_hostname_attribute_assignment() {
+        let findings = scan("ctx.check_hostname = False", Lang::Python);
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_check_hostname_attribute_assignment_unscoped_object() {
+        // Unscoped by object name, mirroring the keyword-arg rule's own lack
+        // of a callee restriction — an unrelated object's `.check_hostname`
+        // attribute still flags.
+        let findings = scan("some_other_thing.check_hostname = False", Lang::Python);
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_check_hostname_attribute_assignment_true() {
+        let findings = scan("ctx.check_hostname = True", Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_check_hostname_attribute_assignment_mention_in_comment() {
+        let findings = scan(
+            "# ctx.check_hostname = False is bad\nprint(1)",
+            Lang::Python,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_check_hostname_attribute_assignment_mention_in_string_literal() {
+        let findings = scan(r#"s = "ctx.check_hostname = False""#, Lang::Python);
         assert!(!has_tls_verify_disabled_finding(&findings));
     }
 
