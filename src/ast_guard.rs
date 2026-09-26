@@ -496,10 +496,21 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
             // than syntax shapes.
             rules.push((
                 "insecure-crypto",
+                // Covers both `crypto.createCipher(...)` (dot access,
+                // `member_expression`) and `crypto["createCipher"](...)`
+                // (computed/bracket access, `subscript_expression` — see the
+                // innerHTML/outerHTML XSS rules above for why this needs its
+                // own alternative rather than being covered by the dot-access
+                // pattern alone).
                 r#"(call_expression
-  function: (member_expression
-    object: (identifier) @obj
-    property: (property_identifier) @method)
+  function: [
+    (member_expression
+      object: (identifier) @obj
+      property: (property_identifier) @method)
+    (subscript_expression
+      object: (identifier) @obj
+      index: (string (string_fragment) @method))
+  ]
   (#eq? @obj "crypto")
   (#match? @method "^(createCipher|createDecipher)$"))"#,
                 "insecure key derivation — crypto.createCipher()/createDecipher() derive the key from the passphrase with a single unsalted hash and were removed in Node 22; use crypto.createCipheriv()/createDecipheriv() with an explicit, properly-derived key and a random IV instead",
@@ -695,10 +706,13 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
                 // node shape used by python_yaml_load_findings's argument
                 // walk rather than the `call`-based shape every other rule
                 // in this vec uses. Deliberately requires the object to be
-                // exactly `AES` (`#eq? @obj "AES"`) rather than matching a
-                // bare `.MODE_ECB` on any object, mirroring how the JS
-                // `document.write` rule above requires the object to be
-                // exactly `document` — avoids flagging an unrelated
+                // one of PyCryptodome's block-cipher modules that expose the
+                // identical `MODE_ECB` constant (`AES`, `DES`, `DES3`,
+                // `Blowfish` — confirmed against PyCryptodome's docs, all four
+                // share the same `Crypto.Cipher._mode_ecb` constant) rather
+                // than matching a bare `.MODE_ECB` on any object, mirroring
+                // how the JS `document.write` rule above requires the object
+                // to be exactly `document` — avoids flagging an unrelated
                 // `SomeOtherEnum.MODE_ECB`-shaped access. The string-literal
                 // form (e.g. `Cipher.new(key, AES.MODE_ECB)` is fine, but
                 // `"aes-128-ecb"` passed as a mode string to a different
@@ -709,9 +723,9 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
                 r#"(attribute
   object: (identifier) @obj
   attribute: (identifier) @attr
-  (#eq? @obj "AES")
+  (#match? @obj "^(AES|DES|DES3|Blowfish)$")
   (#eq? @attr "MODE_ECB"))"#,
-                "insecure block cipher mode — AES in ECB mode encrypts identical plaintext blocks to identical ciphertext blocks, leaking structural information about the data (the classic \"ECB penguin\" problem); use an authenticated mode like AES-GCM instead",
+                "insecure block cipher mode — ECB mode encrypts identical plaintext blocks to identical ciphertext blocks, leaking structural information about the data (the classic \"ECB penguin\" problem); use an authenticated mode like AES-GCM instead",
             ),
         ],
         Lang::Rust => vec![
@@ -2455,8 +2469,62 @@ mod tests {
     }
 
     #[test]
+    fn js_flags_crypto_create_cipher_bracket_notation() {
+        // Second-opinion review finding (PR #305, 2026-09-26): the
+        // dot-access-only pattern let `crypto["createCipher"](...)` (bracket
+        // notation, a `subscript_expression`) bypass detection entirely.
+        let findings = scan(
+            r#"const c = crypto["createCipher"]("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_crypto_create_decipher_bracket_notation() {
+        let findings = scan(
+            r#"const c = crypto["createDecipher"]("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_create_cipher_bracket_notation_on_unrelated_object() {
+        let findings = scan(
+            r#"const c = myLib["createCipher"]("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
     fn python_flags_aes_mode_ecb() {
         let findings = scan("cipher = AES.new(key, AES.MODE_ECB)", Lang::Python);
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_des_mode_ecb() {
+        // Second-opinion review finding (PR #305, 2026-09-26): the rule was
+        // scoped to `AES` only, but PyCryptodome's `DES`, `DES3`, and
+        // `Blowfish` modules expose the identical `MODE_ECB` constant.
+        let findings = scan("cipher = DES.new(key, DES.MODE_ECB)", Lang::Python);
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_des3_mode_ecb() {
+        let findings = scan("cipher = DES3.new(key, DES3.MODE_ECB)", Lang::Python);
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_blowfish_mode_ecb() {
+        let findings = scan(
+            "cipher = Blowfish.new(key, Blowfish.MODE_ECB)",
+            Lang::Python,
+        );
         assert!(has_insecure_crypto_finding(&findings));
     }
 
