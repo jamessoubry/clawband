@@ -5512,3 +5512,58 @@ fn e2e_script_just_under_limit_scans_normally() {
         "script under the size limit must be scanned normally and catch the dangerous line: {out}"
     );
 }
+
+// ── heredoc-to-interpreter false positive on file extensions (issue #216) ──
+// Mirrors the unit tests in src/main.rs (`write_then_exec_heredoc_to_*` and
+// `heredoc_to_*_direct_stdin_pipe_still_denied`) at the CLI/e2e layer, per
+// Greptile review on PR #303.
+
+#[test]
+fn e2e_heredoc_to_sh_extension_benign_passes() {
+    // The exact reported false-positive shape: a `.sh` extension immediately
+    // before the heredoc opener must not be denied outright.
+    let out = run(
+        &bash("cat > /tmp/script.sh << 'EOF'\necho hello\nEOF\nbash /tmp/script.sh"),
+        &[],
+    );
+    assert_eq!(decision(&out), None, "benign heredoc-to-.sh-file: {out}");
+}
+
+#[test]
+fn e2e_heredoc_to_sh_extension_dangerous_content_still_denied() {
+    // Same shape, but with genuinely dangerous content in the heredoc — the
+    // fix must defer to the content scanner, not turn this into a blanket
+    // allow.
+    let out = run(
+        &bash("cat > /tmp/bad.sh << 'EOF'\nrm -rf /\nEOF\nbash /tmp/bad.sh"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "dangerous heredoc-to-.sh-file content must still be caught: {out}"
+    );
+}
+
+#[test]
+fn e2e_heredoc_to_sh_direct_stdin_pipe_still_denied() {
+    // The genuine danger this pattern exists for: piping heredoc content
+    // directly into an interpreter's stdin, with no file and no chance to
+    // scan, must still be denied outright.
+    let out = run(&bash("sh << EOF\necho hello\nEOF"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "direct sh << heredoc stdin pipe must still be denied: {out}"
+    );
+}
+
+#[test]
+fn e2e_heredoc_to_bash_direct_stdin_pipe_still_denied() {
+    let out = run(&bash("bash << EOF\nrm -rf /\nEOF"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "direct bash << heredoc stdin pipe must still be denied: {out}"
+    );
+}
