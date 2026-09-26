@@ -4175,6 +4175,70 @@ fn e2e_git_branch_delete_only_passes() {
     );
 }
 
+// ── git argument injection (--upload-pack/--receive-pack/--exec-path) ──────────
+
+#[test]
+fn e2e_git_upload_pack_asks() {
+    let out = run(
+        &bash("git clone --upload-pack='touch pwned' https://example.com/repo.git"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git --upload-pack must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_receive_pack_asks() {
+    let out = run(
+        &bash("git push --receive-pack='touch pwned' origin main"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git --receive-pack must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_exec_path_asks() {
+    let out = run(&bash("git --exec-path=/tmp/evil status"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git --exec-path must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_dash_capital_c_worktree_list_passes() {
+    // Regression: reported false-positive from a hand-rolled pattern that
+    // scoped these flags behind a `(-c|b)+` prefix, which case-insensitively
+    // (every builtin pattern is wrapped in (?i)) matched -C too.
+    let out = run(
+        &bash("git -C /some/path worktree list 2>&1 | grep verify"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        "git -C ... worktree list must not be blocked: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_dash_lowercase_c_config_passes() {
+    let out = run(&bash("git -c user.name=test status"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "git -c key=value config override must not be blocked: {out}"
+    );
+}
+
 #[test]
 fn e2e_pnpm_dlx_asks() {
     let out = run(&bash("pnpm dlx create-react-app ."), &[]);

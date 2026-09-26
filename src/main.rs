@@ -1166,6 +1166,31 @@ fn builtin_ask() -> Vec<Pattern> {
             "git remote mutate",
             r"\bgit\s+remote\s+(remove|rm|set-url|set-head|prune)\b",
         ),
+        // git argument injection — classic RCE vector: `--upload-pack=<cmd>` /
+        // `--receive-pack=<cmd>` passed to git clone/fetch/push cause git to
+        // invoke <cmd> instead of the expected git-upload-pack/git-receive-pack
+        // helper (the mechanism behind several historical git CVEs involving
+        // attacker-controlled remote "paths"/URLs); `--exec-path=<dir>` is the
+        // same class of risk — it changes where git looks for its own core
+        // helper binaries, so pointing it at an attacker-writable directory can
+        // substitute a trojanned binary for any subsequent git operation.
+        //
+        // Three independent patterns rather than one combined regex: `|` has
+        // the lowest precedence of any regex operator, so `A|B|C` in a single
+        // pattern is three fully independent top-level alternatives across the
+        // whole string, not "A, followed by (B or C)" — a real-world bug
+        // reported from a hand-rolled variant of this pattern that additionally
+        // tried to scope it behind a `(-c|b)+` prefix: since Pattern::builtin()
+        // wraps every pattern in `(?i)`, that `-c` branch case-insensitively
+        // matched `-C` too (a completely unrelated git flag — "run as if git
+        // was started in <path>" vs `-c`'s "pass a config override"), causing
+        // `git -C <path> worktree list | grep verify` to false-positive. None
+        // of the three real dangerous flags need any such prefix to be
+        // dangerous, so it's dropped entirely here — `git ... --upload-pack`
+        // is dangerous regardless of what other flags (if any) precede it.
+        ("git --upload-pack", r"\bgit\b.*--upload-pack\b"),
+        ("git --receive-pack", r"\bgit\b.*--receive-pack\b"),
+        ("git --exec-path", r"\bgit\b.*--exec-path\b"),
         // docker rm -f — force-removes a running container
         (
             "docker rm -f",
@@ -8043,6 +8068,55 @@ mod tests {
     fn git_branch_delete_only_passes() {
         // --delete without --force only fails if the branch is unmerged; not forced
         assert_eq!(decision("git branch --delete main"), None);
+    }
+
+    // ── git argument injection (--upload-pack/--receive-pack/--exec-path) ──────
+
+    #[test]
+    fn git_upload_pack_asks() {
+        assert_eq!(
+            decision("git clone --upload-pack='touch pwned' https://example.com/repo.git"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_receive_pack_asks() {
+        assert_eq!(
+            decision("git push --receive-pack='touch pwned' origin main"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_exec_path_asks() {
+        assert_eq!(
+            decision("git --exec-path=/tmp/evil status"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_dash_capital_c_worktree_list_passes() {
+        // Regression: a hand-rolled variant of this pattern scoped the dangerous
+        // flags behind a `(-c|b)+` prefix, which — combined with the (?i) every
+        // built-in pattern gets wrapped in — case-insensitively matched `-C`
+        // (an unrelated "run as if started in <path>" flag) too, false-positiving
+        // on this exact benign command. The fix drops that prefix entirely.
+        assert_eq!(
+            decision("git -C /some/path worktree list 2>&1 | grep verify"),
+            None
+        );
+    }
+
+    #[test]
+    fn git_dash_lowercase_c_config_passes() {
+        // `-c key=value` (git's own per-invocation config override) must also
+        // not be caught — neither -c nor -C have anything to do with the real
+        // danger here (the long-form --upload-pack/--receive-pack/--exec-path
+        // flags), which is exactly why the fix drops the prefix rather than
+        // trying to special-case -c vs -C.
+        assert_eq!(decision("git -c user.name=test status"), None);
     }
 
     #[test]
