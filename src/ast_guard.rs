@@ -55,7 +55,10 @@ pub enum Lang {
     /// external entities by default, so bare calls are routine and are not
     /// flagged — see the `python_xxe_findings` doc comment for the review
     /// finding this narrowed), `tls-verify-disabled` (any call with
-    /// keyword argument `verify=False`), `sql-string-interpolation`
+    /// keyword argument `verify=False`, `ssl._create_unverified_context()`,
+    /// or any call with keyword argument `check_hostname=False`),
+    /// `insecure-crypto` (`AES.MODE_ECB` attribute access, PyCryptodome/
+    /// PyCrypto), `sql-string-interpolation`
     /// (`.execute`/`.executemany` with an f-string/`%`-format/`.format()`/
     /// `+`-concatenated argument).
     Python,
@@ -72,7 +75,8 @@ pub enum Lang {
     /// grammar parses JSX out of the box, even in a plain `.js` file — the
     /// `dangerouslySetInnerHTML` JSX attribute; see `Lang::Tsx`'s doc comment
     /// for why `.tsx` needs a separate grammar variant for the JSX form of
-    /// this rule but `.js`/`.jsx` do not).
+    /// this rule but `.js`/`.jsx` do not), `insecure-crypto`
+    /// (`crypto.createCipher`/`createDecipher`).
     JavaScript,
     /// `.ts` — `dynamic-eval` (`eval`/`Function`, including the
     /// `new Function(...)` constructor-call form), `shell-invoking-subprocess`
@@ -86,7 +90,8 @@ pub enum Lang {
     /// — but NOT the `dangerouslySetInnerHTML` JSX-attribute form, since plain
     /// `.ts` files can't contain JSX syntax and `tree-sitter-typescript`'s
     /// `LANGUAGE_TYPESCRIPT` grammar has no JSX node kinds at all; see
-    /// `Lang::Tsx` for the `.tsx` variant that does parse JSX).
+    /// `Lang::Tsx` for the `.tsx` variant that does parse JSX), `insecure-crypto`
+    /// (`crypto.createCipher`/`createDecipher`).
     TypeScript,
     /// `.tsx` — same rule set as `Lang::TypeScript` (all of `.ts`'s rules
     /// apply verbatim, since `.tsx` is a superset of `.ts` syntax), PLUS the
@@ -133,8 +138,10 @@ fn ts_language(lang: &Lang) -> TsLanguage {
 /// Rule set. `dynamic-eval` was ported as-is from treeband;
 /// `shell-invoking-subprocess` (issue #253), `insecure-deserialize`
 /// (issue #254), `tls-verify-disabled` (issue #255), `dynamic-module-load`
-/// (issue #256), `sql-string-interpolation` (issue #257), and
-/// `rust-unsafe-block` (issue #258) were added directly in clawband. Each
+/// (issue #256), `sql-string-interpolation` (issue #257),
+/// `rust-unsafe-block` (issue #258), and `insecure-crypto`/additional
+/// `tls-verify-disabled` forms (issue #264) were added directly in
+/// clawband. Each
 /// rule is a tree-sitter query, not a regex — it matches AST structure, so
 /// `// eval(x)` in a comment or `"eval(x)"` in a string literal never
 /// matches, unlike a naive text search.
@@ -471,6 +478,43 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
                     "cross-site scripting (XSS) sink — React's dangerouslySetInnerHTML renders its __html value as raw HTML, executing attacker-controlled markup/script if the value isn't fully trusted; sanitize with a library like DOMPurify or avoid raw HTML rendering",
                 ));
             }
+            // insecure-crypto (issue #264): `crypto.createCipher(...)` /
+            // `crypto.createDecipher(...)` (Node) — removed entirely in
+            // Node 22, and even where still available they derive the key
+            // from the passphrase with a single unsalted MD5 hash instead
+            // of a proper KDF, and (for createCipher) always use a fixed/
+            // zero IV — both a weak-key-derivation and IV-reuse problem.
+            // Deliberately scoped to the `crypto.` member-expression form
+            // only (mirrors the `vm.runInNewContext` scoping above); the
+            // string-literal cipher-algorithm form (e.g. `"aes-128-ecb"`
+            // passed to `crypto.createCipheriv`) is a string *value*, not a
+            // code *structure*, and is intentionally left unflagged here —
+            // no other clawband layer (regex or otherwise) currently covers
+            // it either, so this is a known, accepted gap, not a
+            // fallback-covered one; see the issue #264 discussion for why
+            // AST matching is a poor fit for flagging string contents rather
+            // than syntax shapes.
+            rules.push((
+                "insecure-crypto",
+                // Covers both `crypto.createCipher(...)` (dot access,
+                // `member_expression`) and `crypto["createCipher"](...)`
+                // (computed/bracket access, `subscript_expression` — see the
+                // innerHTML/outerHTML XSS rules above for why this needs its
+                // own alternative rather than being covered by the dot-access
+                // pattern alone).
+                r#"(call_expression
+  function: [
+    (member_expression
+      object: (identifier) @obj
+      property: (property_identifier) @method)
+    (subscript_expression
+      object: (identifier) @obj
+      index: (string (string_fragment) @method))
+  ]
+  (#eq? @obj "crypto")
+  (#match? @method "^(createCipher|createDecipher)$"))"#,
+                "insecure key derivation — crypto.createCipher()/createDecipher() derive the key from the passphrase with a single unsalted hash and were removed in Node 22; use crypto.createCipheriv()/createDecipheriv() with an explicit, properly-derived key and a random IV instead",
+            ));
             rules
         }
         Lang::Python => vec![
@@ -593,6 +637,95 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
       value: (false)))
   (#eq? @kw "verify"))"#,
                 tls_verify_disabled_reason,
+            ),
+            (
+                "tls-verify-disabled",
+                // `ssl._create_unverified_context()` — a call expression, a
+                // different AST shape from the `verify=False` keyword-arg
+                // rule above (issue #264). Scoped to the `ssl.` module
+                // qualifier and this exact function name, mirroring how
+                // `os.system`/`os.popen` above are scoped to `os.` — this is
+                // the documented, deliberate way to disable TLS verification
+                // via the stdlib `ssl` module (as opposed to a merely
+                // similarly-named function on an unrelated object).
+                r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  (#eq? @obj "ssl")
+  (#eq? @method "_create_unverified_context"))"#,
+                tls_verify_disabled_reason,
+            ),
+            (
+                "tls-verify-disabled",
+                // `check_hostname=False` — same keyword-argument shape as
+                // `verify=False` above but a different keyword name; this
+                // disables hostname verification on an `ssl.SSLContext`
+                // (commonly paired with `_create_unverified_context`, but
+                // also settable directly on a context instance, hence not
+                // restricted to a specific callee — mirrors how the
+                // `verify=False` rule above intentionally doesn't restrict
+                // by callee either, since `requests`-style APIs are called
+                // in too many different ways to enumerate).
+                r#"(call
+  arguments: (argument_list
+    (keyword_argument
+      name: (identifier) @kw
+      value: (false)))
+  (#eq? @kw "check_hostname"))"#,
+                tls_verify_disabled_reason,
+            ),
+            (
+                "tls-verify-disabled",
+                // `ctx.check_hostname = False` — attribute *assignment*, a
+                // different AST shape (Python's `assignment` node, with an
+                // `attribute` node as its `left` field) from the
+                // `check_hostname=False` *keyword-argument* rule immediately
+                // above (Greptile review round, PR #305/issue #264): setting
+                // the attribute directly on an already-constructed
+                // `ssl.SSLContext` instance is an equally common and equally
+                // dangerous way to disable hostname verification, and was
+                // passing through undetected. Left unscoped by object name
+                // (matches any `.check_hostname` attribute assignment), same
+                // reasoning as the keyword-arg rule above: SSLContext
+                // instances are constructed and named in too many different
+                // ways to enumerate a fixed set of object names.
+                r#"(assignment
+  left: (attribute
+    attribute: (identifier) @attr)
+  right: (false)
+  (#eq? @attr "check_hostname"))"#,
+                tls_verify_disabled_reason,
+            ),
+            (
+                "insecure-crypto",
+                // `AES.MODE_ECB` (PyCryptodome/PyCrypto) — an `attribute`
+                // node (object/attribute fields), NOT a `call` — ECB mode is
+                // selected by passing this constant to `AES.new(...)`, not
+                // by calling anything itself, so this needs the different
+                // node shape used by python_yaml_load_findings's argument
+                // walk rather than the `call`-based shape every other rule
+                // in this vec uses. Deliberately requires the object to be
+                // one of PyCryptodome's block-cipher modules that expose the
+                // identical `MODE_ECB` constant (`AES`, `DES`, `DES3`,
+                // `Blowfish` — confirmed against PyCryptodome's docs, all four
+                // share the same `Crypto.Cipher._mode_ecb` constant) rather
+                // than matching a bare `.MODE_ECB` on any object, mirroring
+                // how the JS `document.write` rule above requires the object
+                // to be exactly `document` — avoids flagging an unrelated
+                // `SomeOtherEnum.MODE_ECB`-shaped access. The string-literal
+                // form (e.g. `Cipher.new(key, AES.MODE_ECB)` is fine, but
+                // `"aes-128-ecb"` passed as a mode string to a different
+                // crypto library) is a string *value*, not code *structure*,
+                // and is intentionally left out of scope here — same
+                // reasoning as the `crypto.createCipher` string-literal
+                // exclusion above.
+                r#"(attribute
+  object: (identifier) @obj
+  attribute: (identifier) @attr
+  (#match? @obj "^(AES|DES|DES3|Blowfish)$")
+  (#eq? @attr "MODE_ECB"))"#,
+                "insecure block cipher mode — ECB mode encrypts identical plaintext blocks to identical ciphertext blocks, leaking structural information about the data (the classic \"ECB penguin\" problem); use an authenticated mode like AES-GCM instead",
             ),
         ],
         Lang::Rust => vec![
@@ -2123,6 +2256,88 @@ mod tests {
         assert!(!has_tls_verify_disabled_finding(&findings));
     }
 
+    // ── tls-verify-disabled: ssl._create_unverified_context / check_hostname (issue #264) ──
+
+    #[test]
+    fn python_flags_ssl_create_unverified_context() {
+        let findings = scan("ctx = ssl._create_unverified_context()", Lang::Python);
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_create_unverified_context_on_unrelated_object() {
+        // Scoped to the `ssl.` qualifier specifically (issue #264) — a
+        // similarly-named method on an unrelated object must not flag.
+        let findings = scan("ctx = mymodule._create_unverified_context()", Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_ssl_create_unverified_context_mention_in_comment() {
+        let findings = scan(
+            "# ssl._create_unverified_context() is bad\nprint(1)",
+            Lang::Python,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_check_hostname_false() {
+        let findings = scan("ctx.wrap_socket(sock, check_hostname=False)", Lang::Python);
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_check_hostname_true() {
+        let findings = scan("ctx.wrap_socket(sock, check_hostname=True)", Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_check_hostname_mention_in_string_literal() {
+        let findings = scan(r#"s = "check_hostname=False""#, Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    // ── tls-verify-disabled: check_hostname attribute assignment
+    // (Greptile review, PR #305) ──
+
+    #[test]
+    fn python_flags_check_hostname_attribute_assignment() {
+        let findings = scan("ctx.check_hostname = False", Lang::Python);
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_check_hostname_attribute_assignment_unscoped_object() {
+        // Unscoped by object name, mirroring the keyword-arg rule's own lack
+        // of a callee restriction — an unrelated object's `.check_hostname`
+        // attribute still flags.
+        let findings = scan("some_other_thing.check_hostname = False", Lang::Python);
+        assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_check_hostname_attribute_assignment_true() {
+        let findings = scan("ctx.check_hostname = True", Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_check_hostname_attribute_assignment_mention_in_comment() {
+        let findings = scan(
+            "# ctx.check_hostname = False is bad\nprint(1)",
+            Lang::Python,
+        );
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_check_hostname_attribute_assignment_mention_in_string_literal() {
+        let findings = scan(r#"s = "ctx.check_hostname = False""#, Lang::Python);
+        assert!(!has_tls_verify_disabled_finding(&findings));
+    }
+
     #[test]
     fn js_flags_reject_unauthorized_false() {
         let findings = scan(
@@ -2178,6 +2393,166 @@ mod tests {
             Lang::TypeScript,
         );
         assert!(has_tls_verify_disabled_finding(&findings));
+    }
+
+    // ── insecure-crypto (issue #264) ──
+
+    fn has_insecure_crypto_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "insecure-crypto")
+    }
+
+    #[test]
+    fn js_flags_crypto_create_cipher() {
+        let findings = scan(
+            r#"const c = crypto.createCipher("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_crypto_create_decipher() {
+        let findings = scan(
+            r#"const c = crypto.createDecipher("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_create_cipheriv() {
+        // The safe replacement API must not be flagged — only the removed,
+        // insecure `createCipher`/`createDecipher` forms are in scope.
+        let findings = scan(
+            r#"const c = crypto.createCipheriv("aes-256-gcm", key, iv);"#,
+            Lang::JavaScript,
+        );
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_create_cipher_on_unrelated_object() {
+        // Scoped to the `crypto.` qualifier specifically (issue #264) — a
+        // similarly-named method on an unrelated object must not flag.
+        let findings = scan(
+            r#"const c = myLib.createCipher("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_create_cipher_mention_in_comment() {
+        let findings = scan(
+            "// crypto.createCipher(...) is insecure\nfunction f(){}",
+            Lang::JavaScript,
+        );
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_create_cipher_mention_in_string_literal() {
+        let findings = scan(
+            r#"const s = "crypto.createCipher(algo, password)";"#,
+            Lang::JavaScript,
+        );
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn ts_flags_crypto_create_cipher() {
+        let findings = scan(
+            r#"const c = crypto.createCipher("aes192", password);"#,
+            Lang::TypeScript,
+        );
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_crypto_create_cipher_bracket_notation() {
+        // Second-opinion review finding (PR #305, 2026-09-26): the
+        // dot-access-only pattern let `crypto["createCipher"](...)` (bracket
+        // notation, a `subscript_expression`) bypass detection entirely.
+        let findings = scan(
+            r#"const c = crypto["createCipher"]("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_flags_crypto_create_decipher_bracket_notation() {
+        let findings = scan(
+            r#"const c = crypto["createDecipher"]("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn js_ignores_create_cipher_bracket_notation_on_unrelated_object() {
+        let findings = scan(
+            r#"const c = myLib["createCipher"]("aes192", password);"#,
+            Lang::JavaScript,
+        );
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_aes_mode_ecb() {
+        let findings = scan("cipher = AES.new(key, AES.MODE_ECB)", Lang::Python);
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_des_mode_ecb() {
+        // Second-opinion review finding (PR #305, 2026-09-26): the rule was
+        // scoped to `AES` only, but PyCryptodome's `DES`, `DES3`, and
+        // `Blowfish` modules expose the identical `MODE_ECB` constant.
+        let findings = scan("cipher = DES.new(key, DES.MODE_ECB)", Lang::Python);
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_des3_mode_ecb() {
+        let findings = scan("cipher = DES3.new(key, DES3.MODE_ECB)", Lang::Python);
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_flags_blowfish_mode_ecb() {
+        let findings = scan(
+            "cipher = Blowfish.new(key, Blowfish.MODE_ECB)",
+            Lang::Python,
+        );
+        assert!(has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_aes_mode_cbc() {
+        let findings = scan("cipher = AES.new(key, AES.MODE_CBC, iv)", Lang::Python);
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_mode_ecb_on_unrelated_object() {
+        // Scoped to the `AES` object specifically (issue #264) — a
+        // similarly-named `.MODE_ECB` attribute on an unrelated object must
+        // not flag.
+        let findings = scan("x = SomeOtherEnum.MODE_ECB", Lang::Python);
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_aes_mode_ecb_mention_in_comment() {
+        let findings = scan("# AES.MODE_ECB is insecure\nprint(1)", Lang::Python);
+        assert!(!has_insecure_crypto_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_aes_mode_ecb_mention_in_string_literal() {
+        let findings = scan(r#"s = "AES.MODE_ECB""#, Lang::Python);
+        assert!(!has_insecure_crypto_finding(&findings));
     }
 
     #[test]
