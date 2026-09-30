@@ -1,5 +1,6 @@
 repo: jamessoubry/clawband
-deploy: cargo build --release && ~/.cargo/bin/clawband install
+deploy: cargo build --release
 label: backlog
 priority: [P0, P1, P2]
 pr_required: true
+haiku_tiering: false
