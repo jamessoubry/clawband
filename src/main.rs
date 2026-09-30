@@ -2355,6 +2355,16 @@ fn parse_branch_delete_targets(segment: &str) -> Option<Vec<String>> {
 /// `git push --force` with no remote/branch named, an ambiguous refspec) —
 /// callers fall back to the current-branch check in that case, since these
 /// forms push whatever the current branch's upstream resolves to.
+/// A token is a colon-refspec candidate (`<src>:<dst>`) if it contains a
+/// literal `:`, isn't itself a flag, and isn't a URL (`git://`, `https://`,
+/// etc. contain `:` too, but as part of the scheme, not a refspec).
+fn looks_like_colon_refspec(token: &str) -> bool {
+    if token.starts_with('-') || token.contains("://") {
+        return false;
+    }
+    token.contains(':')
+}
+
 fn parse_push_target_branch(segment: &str) -> Option<String> {
     let tokens: Vec<&str> = segment.split_whitespace().collect();
     let push_idx = tokens
@@ -2383,11 +2393,7 @@ fn parse_push_target_branch(segment: &str) -> Option<String> {
     // <src>:<branch>` (push src to a differently-named dst). Skip tokens
     // that look like a URL (`://`) so a remote URL containing a colon isn't
     // mistaken for a refspec.
-    if let Some(refspec) = rest
-        .iter()
-        .rev()
-        .find(|t| t.contains(':') && !t.starts_with('-') && !t.contains("://"))
-    {
+    if let Some(refspec) = rest.iter().rev().find(|t| looks_like_colon_refspec(t)) {
         return match refspec.split(':').nth(1) {
             Some(dst) if !dst.is_empty() => Some(dst.to_string()),
             _ => None, // trailing/ambiguous colon — fall back to current-branch check
@@ -6971,10 +6977,8 @@ fn check_command<'a>(
 
         // ── Deny tier (always runs, allow cannot suppress) ────────────────────
 
-        if let Some(reason) = check_force_push(segment) {
-            if !branch_scoped_exempt(segment) {
-                return Some(("deny", reason));
-            }
+        if let Some(reason) = check_force_push(segment).filter(|_| !branch_scoped_exempt(segment)) {
+            return Some(("deny", reason));
         }
 
         // For read-only / data-output commands (echo, grep, printf …) and pure
@@ -7072,27 +7076,28 @@ fn check_command<'a>(
 
             for &form in forms_for_ask {
                 for pat in ask_pats {
-                    if pat.matches(form) {
-                        // Branch-aware exemption (issue #315): these specific
-                        // labels gate on "which branch does this affect," not
-                        // the command shape alone — see branch_scoped_exempt's
-                        // doc comment for the fail-closed rules.
-                        if BRANCH_SCOPED_ASK_LABELS.contains(&pat.label.as_str())
-                            && branch_scoped_exempt(segment)
-                        {
-                            continue;
-                        }
-                        return Some((
-                            "ask",
-                            with_suggestion(
-                                format!(
-                                    "Review before running — '{}' matched in: {}\nTo always allow:\n  ! {} allow '{}'\n",
-                                    pat.label, segment, hook_command_string(), pat.re.as_str()
-                                ),
-                                &pat.label,
-                            ),
-                        ));
+                    if !pat.matches(form) {
+                        continue;
                     }
+                    // Branch-aware exemption (issue #315): these specific
+                    // labels gate on "which branch does this affect," not
+                    // the command shape alone — see branch_scoped_exempt's
+                    // doc comment for the fail-closed rules.
+                    let branch_exempt = BRANCH_SCOPED_ASK_LABELS.contains(&pat.label.as_str())
+                        && branch_scoped_exempt(segment);
+                    if branch_exempt {
+                        continue;
+                    }
+                    return Some((
+                        "ask",
+                        with_suggestion(
+                            format!(
+                                "Review before running — '{}' matched in: {}\nTo always allow:\n  ! {} allow '{}'\n",
+                                pat.label, segment, hook_command_string(), pat.re.as_str()
+                            ),
+                            &pat.label,
+                        ),
+                    ));
                 }
             }
 
