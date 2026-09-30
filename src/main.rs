@@ -1115,6 +1115,71 @@ fn builtin_deny() -> Vec<Pattern> {
 
 // ─── Built-in ask patterns ────────────────────────────────────────────────────
 
+/// git argument injection — classic RCE vector: `--upload-pack=<cmd>` /
+/// `--receive-pack=<cmd>` passed to git clone/fetch/push cause git to
+/// invoke <cmd> instead of the expected git-upload-pack/git-receive-pack
+/// helper (the mechanism behind several historical git CVEs involving
+/// attacker-controlled remote "paths"/URLs); `--exec-path=<dir>` is the
+/// same class of risk — it changes where git looks for its own core
+/// helper binaries, so pointing it at an attacker-writable directory can
+/// substitute a trojanned binary for any subsequent git operation.
+///
+/// Three independent patterns rather than one combined regex: `|` has
+/// the lowest precedence of any regex operator, so `A|B|C` in a single
+/// pattern is three fully independent top-level alternatives across the
+/// whole string, not "A, followed by (B or C)" — a real-world bug
+/// reported from a hand-rolled variant of this pattern that additionally
+/// tried to scope it behind a `(-c|b)+` prefix: since Pattern::builtin()
+/// wraps every pattern in `(?i)`, that `-c` branch case-insensitively
+/// matched `-C` too (a completely unrelated git flag — "run as if git
+/// was started in <path>" vs `-c`'s "pass a config override"), causing
+/// `git -C <path> worktree list | grep verify` to false-positive. None
+/// of the three real dangerous flags need any such prefix to be
+/// dangerous, so it's dropped entirely here — `git ... --upload-pack`
+/// is dangerous regardless of what other flags (if any) precede it.
+///
+/// `[^|;&]*` (not `.*`) between `git` and the flag: `.*` is greedy and
+/// unconstrained, so it can bridge across `|`/`;`/`&` and match a flag
+/// that belongs to a completely different command later in the same
+/// segment — e.g. `git log --oneline | grep --upload-pack` false-
+/// positived under `.*` because split_segments() deliberately does not
+/// split on bare `|` (pipe-to-interpreter detection elsewhere needs
+/// the whole pipeline in one segment) and `check_command`/is_allowed
+/// pipe-stage checks don't apply to ask/deny matching. Restricting the
+/// filler to "not a compound/pipe separator" keeps the pattern scoped
+/// to a single command while still matching arbitrary intervening git
+/// flags (`git -c foo.bar=baz clone --upload-pack=x` still matches).
+/// Found via third-party review of PR #307.
+fn git_argument_injection_ask_patterns() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("git --upload-pack", r"\bgit\b[^|;&]*--upload-pack\b"),
+        // `--exec` is an undocumented synonym for `--receive-pack` on
+        // `git push` (see git-push(1)): `git push --exec=<cmd>` runs <cmd>
+        // instead of git-receive-pack, identical RCE shape to
+        // `--receive-pack=<cmd>`. Folded into this pattern rather than a
+        // separate one since it's the exact same vulnerability class.
+        //
+        // No `\b` immediately before the alternation: the preceding filler
+        // usually ends right before a `-` (e.g. `push ` then `--exec`), and
+        // `-` is itself a non-word character, so a space-to-dash transition
+        // is NOT a `\b` boundary — a leading `\b` there silently prevented
+        // the whole pattern from ever matching. `--exec` requires a literal
+        // `=` (not just a trailing `\b`) so it doesn't also match the
+        // unrelated `--exec-path` flag (`--exec-path` is caught by its own
+        // dedicated pattern below).
+        (
+            "git --receive-pack",
+            r"\bgit\b[^|;&]*(?:--receive-pack\b|--exec=)",
+        ),
+        // Bare `git --exec-path` (no `=<dir>`) only prints the current
+        // exec-path setting and exits — read-only, per git(1). Only the
+        // `--exec-path=<dir>` form actually changes where git looks for its
+        // core helper binaries, so the pattern requires the `=` to avoid
+        // asking about a harmless introspection command.
+        ("git --exec-path", r"\bgit\b[^|;&]*--exec-path="),
+    ]
+}
+
 fn builtin_ask() -> Vec<Pattern> {
     let specs: &[(&str, &str)] = &[
         // eval — executes arbitrary strings; subshell-only idioms like
@@ -1166,66 +1231,6 @@ fn builtin_ask() -> Vec<Pattern> {
             "git remote mutate",
             r"\bgit\s+remote\s+(remove|rm|set-url|set-head|prune)\b",
         ),
-        // git argument injection — classic RCE vector: `--upload-pack=<cmd>` /
-        // `--receive-pack=<cmd>` passed to git clone/fetch/push cause git to
-        // invoke <cmd> instead of the expected git-upload-pack/git-receive-pack
-        // helper (the mechanism behind several historical git CVEs involving
-        // attacker-controlled remote "paths"/URLs); `--exec-path=<dir>` is the
-        // same class of risk — it changes where git looks for its own core
-        // helper binaries, so pointing it at an attacker-writable directory can
-        // substitute a trojanned binary for any subsequent git operation.
-        //
-        // Three independent patterns rather than one combined regex: `|` has
-        // the lowest precedence of any regex operator, so `A|B|C` in a single
-        // pattern is three fully independent top-level alternatives across the
-        // whole string, not "A, followed by (B or C)" — a real-world bug
-        // reported from a hand-rolled variant of this pattern that additionally
-        // tried to scope it behind a `(-c|b)+` prefix: since Pattern::builtin()
-        // wraps every pattern in `(?i)`, that `-c` branch case-insensitively
-        // matched `-C` too (a completely unrelated git flag — "run as if git
-        // was started in <path>" vs `-c`'s "pass a config override"), causing
-        // `git -C <path> worktree list | grep verify` to false-positive. None
-        // of the three real dangerous flags need any such prefix to be
-        // dangerous, so it's dropped entirely here — `git ... --upload-pack`
-        // is dangerous regardless of what other flags (if any) precede it.
-        //
-        // `[^|;&]*` (not `.*`) between `git` and the flag: `.*` is greedy and
-        // unconstrained, so it can bridge across `|`/`;`/`&` and match a flag
-        // that belongs to a completely different command later in the same
-        // segment — e.g. `git log --oneline | grep --upload-pack` false-
-        // positived under `.*` because split_segments() deliberately does not
-        // split on bare `|` (pipe-to-interpreter detection elsewhere needs
-        // the whole pipeline in one segment) and `check_command`/is_allowed
-        // pipe-stage checks don't apply to ask/deny matching. Restricting the
-        // filler to "not a compound/pipe separator" keeps the pattern scoped
-        // to a single command while still matching arbitrary intervening git
-        // flags (`git -c foo.bar=baz clone --upload-pack=x` still matches).
-        // Found via third-party review of PR #307.
-        ("git --upload-pack", r"\bgit\b[^|;&]*--upload-pack\b"),
-        // `--exec` is an undocumented synonym for `--receive-pack` on
-        // `git push` (see git-push(1)): `git push --exec=<cmd>` runs <cmd>
-        // instead of git-receive-pack, identical RCE shape to
-        // `--receive-pack=<cmd>`. Folded into this pattern rather than a
-        // separate one since it's the exact same vulnerability class.
-        //
-        // No `\b` immediately before the alternation: the preceding filler
-        // usually ends right before a `-` (e.g. `push ` then `--exec`), and
-        // `-` is itself a non-word character, so a space-to-dash transition
-        // is NOT a `\b` boundary — a leading `\b` there silently prevented
-        // the whole pattern from ever matching. `--exec` requires a literal
-        // `=` (not just a trailing `\b`) so it doesn't also match the
-        // unrelated `--exec-path` flag (`--exec-path` is caught by its own
-        // dedicated pattern below).
-        (
-            "git --receive-pack",
-            r"\bgit\b[^|;&]*(?:--receive-pack\b|--exec=)",
-        ),
-        // Bare `git --exec-path` (no `=<dir>`) only prints the current
-        // exec-path setting and exits — read-only, per git(1). Only the
-        // `--exec-path=<dir>` form actually changes where git looks for its
-        // core helper binaries, so the pattern requires the `=` to avoid
-        // asking about a harmless introspection command.
-        ("git --exec-path", r"\bgit\b[^|;&]*--exec-path="),
         // docker rm -f — force-removes a running container
         (
             "docker rm -f",
@@ -1488,7 +1493,11 @@ fn builtin_ask() -> Vec<Pattern> {
         // Pattern: redirect (> or >>) followed immediately by $( or backtick.
         ("redirect to subshell path", r">\s*(?:\$\(|\x60)"),
     ];
-    specs.iter().map(|(l, p)| Pattern::builtin(l, p)).collect()
+    specs
+        .iter()
+        .chain(git_argument_injection_ask_patterns())
+        .map(|(l, p)| Pattern::builtin(l, p))
+        .collect()
 }
 
 // ─── Built-in protected-ask patterns ─────────────────────────────────────────
@@ -6649,6 +6658,39 @@ fn check_encoded_payload<'a>(
     scan_decoded_content(&decoded, deny_pats, ask_pats)
 }
 
+/// A segment is "allowed" (suppresses the ASK tier only — DENY always fires)
+/// when any of its forms matches an allow pattern.
+///
+/// A segment containing a bare `|` needs a stricter check: `split_segments`
+/// deliberately does NOT split on `|` (see its doc comment — pipe-to-
+/// interpreter needs to stay in one segment for ask/deny matching), so a
+/// pipeline like `git status | git clone --upload-pack=...` reaches this
+/// point as a single segment. Matching the whole segment against an allow
+/// pattern anchored only at `^` (e.g. "git read-only") lets that anchor
+/// match the safe first stage and silently wave through whatever dangerous
+/// command follows the pipe — found via second-opinion review on PR #307
+/// (2026-09-26): `git status | git clone --upload-pack=...` was reaching
+/// ALLOW instead of the intended ASK. Requiring every pipe stage to
+/// independently match an allow pattern closes this without touching how
+/// `|` is handled anywhere else (ask/deny still match against the full,
+/// unsplit segment). Known-safe wrapper pipes (RTK's `git -C <dir> ...`,
+/// sqz's trailing `| sqz compress ...`, and the inline `| python3 -c "..."` /
+/// `| node -m ...` forms) are all already stripped upstream
+/// (`strip_rtk`/`strip_sqz`/`strip_safe_pipes`) before `check_command` ever
+/// sees the command, so they never reach this branch.
+fn segment_is_allowed(segment: &str, forms: &[&str], allow_pats: &[Pattern]) -> bool {
+    if segment.contains('|') {
+        split_pipe_stages(segment).iter().all(|stage| {
+            let stage = stage.trim();
+            !stage.is_empty() && allow_pats.iter().any(|p| p.matches(stage))
+        })
+    } else {
+        forms
+            .iter()
+            .any(|f| allow_pats.iter().any(|p| p.matches(f)))
+    }
+}
+
 // ─── Core check logic ────────────────────────────────────────────────────────
 // Returns Some(("deny"|"ask", reason)) or None for pass.
 // Does NOT perform script-file scanning (requires filesystem) or subshell checks.
@@ -6696,35 +6738,8 @@ fn check_command<'a>(
         let forms: &[&str] = &forms_vec;
 
         // allow_pats suppress the ASK tier only — DENY tier always fires.
-        // A segment is "allowed" when any of its forms matches an allow pattern.
-        //
-        // A segment containing a bare `|` needs a stricter check: `split_segments`
-        // deliberately does NOT split on `|` (see its doc comment — pipe-to-
-        // interpreter needs to stay in one segment for ask/deny matching), so a
-        // pipeline like `git status | git clone --upload-pack=...` reaches this
-        // point as a single segment. Matching the whole segment against an
-        // allow pattern anchored only at `^` (e.g. "git read-only") lets that
-        // anchor match the safe first stage and silently wave through whatever
-        // dangerous command follows the pipe — found via second-opinion review
-        // on PR #307 (2026-09-26): `git status | git clone --upload-pack=...`
-        // was reaching ALLOW instead of the intended ASK. Requiring every pipe
-        // stage to independently match an allow pattern closes this without
-        // touching how `|` is handled anywhere else (ask/deny still match
-        // against the full, unsplit segment). Known-safe wrapper pipes (RTK's
-        // `git -C <dir> ...`, sqz's trailing `| sqz compress ...`, and the
-        // inline `| python3 -c "..."` / `| node -m ...` forms) are all already
-        // stripped upstream (`strip_rtk`/`strip_sqz`/`strip_safe_pipes`) before
-        // this function ever sees the command, so they never reach this branch.
-        let is_allowed = if segment.contains('|') {
-            split_pipe_stages(segment).iter().all(|stage| {
-                let stage = stage.trim();
-                !stage.is_empty() && allow_pats.iter().any(|p| p.matches(stage))
-            })
-        } else {
-            forms
-                .iter()
-                .any(|f| allow_pats.iter().any(|p| p.matches(f)))
-        };
+        // See `segment_is_allowed`'s doc comment for the pipe-stage subtlety.
+        let is_allowed = segment_is_allowed(segment, forms, allow_pats);
 
         // ── Deny tier (always runs, allow cannot suppress) ────────────────────
 
