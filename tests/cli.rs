@@ -4296,6 +4296,210 @@ fn e2e_git_branch_delete_only_passes() {
     );
 }
 
+// ── git argument injection (--upload-pack/--receive-pack/--exec-path) ──────────
+
+#[test]
+fn e2e_git_upload_pack_asks() {
+    let out = run(
+        &bash("git clone --upload-pack='touch pwned' https://example.com/repo.git"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git --upload-pack must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_receive_pack_asks() {
+    let out = run(
+        &bash("git push --receive-pack='touch pwned' origin main"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git --receive-pack must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_exec_path_asks() {
+    let out = run(&bash("git --exec-path=/tmp/evil status"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git --exec-path must trigger ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_dash_capital_c_worktree_list_passes() {
+    // Regression: reported false-positive from a hand-rolled pattern that
+    // scoped these flags behind a `(-c|b)+` prefix, which case-insensitively
+    // (every builtin pattern is wrapped in (?i)) matched -C too.
+    let out = run(
+        &bash("git -C /some/path worktree list 2>&1 | grep verify"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        None,
+        "git -C ... worktree list must not be blocked: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_dash_lowercase_c_config_passes() {
+    let out = run(&bash("git -c user.name=test status"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "git -c key=value config override must not be blocked: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_upload_pack_pipe_bypass_asks() {
+    // Second-opinion review finding (PR #307, 2026-09-26): a read-only prefix
+    // before a `|` waved through whatever dangerous command followed it,
+    // since split_segments() doesn't split on bare `|`.
+    let out = run(
+        &bash("git status | git clone --upload-pack='touch pwned' https://evil.com/x.git"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git status | git clone --upload-pack=... must still ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_receive_pack_pipe_bypass_asks() {
+    let out = run(
+        &bash("git log | git push --receive-pack='touch pwned' origin main"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git log | git push --receive-pack=... must still ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_log_pipe_grep_still_passes() {
+    // Explicitly "allow" (not silent/None) is correct here: this hits a
+    // separate, pre-existing full-command allow.patterns match (only reached
+    // when check_command's deny/ask scan found nothing) that isn't part of
+    // this fix — it's benign since it only ever activates once nothing
+    // dangerous was already found. The unit-level `git_log_pipe_grep_still_passes`
+    // test in main.rs exercises check_command directly and correctly sees None.
+    let out = run(&bash("git log | grep foo"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        "a genuinely benign pipeline must not regress into ask: {out}"
+    );
+}
+
+// ── third-opinion review of PR #307 (Gemini/Antigravity) ───────────────────
+
+#[test]
+fn e2e_bare_ampersand_background_is_a_segment_delimiter() {
+    // Finding #1 (exploit repro from the review): a single `&` (background
+    // operator) was not a split_segments() delimiter, so the unanchored
+    // "git read-only" allow pattern matching the leading `git status` waved
+    // the whole unsplit segment through as allow, skipping the ask tier
+    // entirely for the dangerous `git clone --upload-pack=...` half.
+    let out = run(
+        &bash("git status & git clone --upload-pack='touch pwned' https://evil.com/x.git"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "bare & must not bypass the ask tier: {out}"
+    );
+}
+
+#[test]
+fn e2e_double_ampersand_still_splits_correctly() {
+    // Regression guard: adding bare `&` as a delimiter must not break `&&`
+    // matching as one two-char delimiter (no spurious empty segment).
+    let out = run(&bash("git status && git log"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("allow"),
+        "git status && git log must still pass through: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_upload_pack_pipe_grep_false_positive_passes() {
+    // Finding #2: unconstrained `.*` in the ask patterns bridged across `|`,
+    // so `grep --upload-pack` (an unrelated grep arg) false-positived.
+    let out = run(&bash("git log --oneline | grep --upload-pack"), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "grep --upload-pack must not trigger the git argument-injection ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_upload_pack_still_matches_with_intervening_flags() {
+    // Regression guard for #2: arbitrary git flags between `git` and the
+    // dangerous long-form flag must still be matched after `.*` -> `[^|;&]*`.
+    let out = run(
+        &bash("git -c foo.bar=baz clone --upload-pack=x https://evil.com/x.git"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git --upload-pack must still ask with intervening flags: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_exec_path_bare_form_passes() {
+    // Finding #3: bare `git --exec-path` (no `=<dir>`) only prints the
+    // current setting and exits — read-only, must not ask.
+    let out = run(&bash("git --exec-path"), &[]);
+    assert_ne!(
+        decision(&out),
+        Some("ask"),
+        "bare git --exec-path (no value) must not ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_exec_path_with_value_still_asks() {
+    // Regression guard for #3: `--exec-path=<dir>` must still ask.
+    let out = run(&bash("git --exec-path=/tmp/evil status"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git --exec-path=<dir> must still ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_git_push_exec_synonym_asks() {
+    // Finding #4: `--exec=<cmd>` is an undocumented synonym for
+    // `--receive-pack=<cmd>` on `git push` — same RCE shape, previously
+    // uncaught entirely.
+    let out = run(&bash("git push --exec='touch pwned' origin main"), &[]);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git push --exec=<cmd> must ask like --receive-pack=<cmd>: {out}"
+    );
+}
+
 #[test]
 fn e2e_pnpm_dlx_asks() {
     let out = run(&bash("pnpm dlx create-react-app ."), &[]);
