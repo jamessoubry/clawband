@@ -49,6 +49,12 @@ cargo test             # all tests must pass
 cargo clippy --all-targets -- -D warnings  # no warnings
 ```
 
+## CodeScene
+
+After changing code, run `code_health_review` on the changed files. If Code Health drops, fix the issues, run the review again, and use `code_health_score` to confirm the result. Before finishing, run `pre_commit_code_health_safeguard` and only stop when it passes.
+
+As of 2026-09-30, project baseline is Red Code (1.28/10 for `src/main.rs`) — mainly `main()` (cyclomatic complexity 80, threshold <9) and `check_command()` (complexity 36) having absorbed most of the rule-by-rule growth over time, plus a repeated 6-argument shape across the `install_*` functions that wants a shared struct. Don't let new work make this worse; genuine drive-by improvements to touched functions are welcome but not required — this isn't a mandate to refactor unrelated code while fixing something else.
+
 ## Commit & PR conventions
 
 - Branch: `feat/<slug>` for features, `fix/<slug>` for fixes
