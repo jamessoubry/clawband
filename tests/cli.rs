@@ -5,11 +5,40 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// A directory guaranteed NOT to be inside a git repository, shared across
+/// this whole test binary. The spawned clawband binary is a real release
+/// build (not `#[cfg(test)]`), so its own branch-aware exemption logic
+/// (issue #315) calls the real `git rev-parse --abbrev-ref HEAD` in
+/// whatever directory it's run from. Without pinning that to a non-repo
+/// directory, every e2e test would inherit the test *runner's* ambient cwd
+/// — this very crate, on whatever branch happens to be checked out — and
+/// silently exempt branch-scoped ask/deny patterns (`git reset --hard`,
+/// `git push --force`, etc.) depending on that unrelated, ever-changing
+/// state. A fresh tempdir has no `.git` at all, so `git rev-parse` fails
+/// there and the branch-aware logic correctly fails closed, preserving
+/// every pre-existing test's "always ask/deny" expectation.
+fn non_repo_scratch_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("scratch dir"))
+        .path()
+}
+
 /// Run the built clawband binary with `stdin`, returning (stdout, exit_ok).
 /// Optional env overrides are applied (e.g. HOME — used to point at a fake
-/// config dir for skip-flag / pattern-file tests).
+/// config dir for skip-flag / pattern-file tests). Runs in a fixed non-repo
+/// scratch directory by default — see `non_repo_scratch_dir()` — use
+/// `run_in_dir()` for tests that need to control git repo state.
 fn run(stdin: &str, env: &[(&str, &str)]) -> String {
+    run_in_dir(stdin, env, non_repo_scratch_dir())
+}
+
+/// Same as `run()` but lets the caller pick the working directory the
+/// spawned binary runs in — used by tests that need a real git repo (e.g.
+/// the branch-aware exemption tests in issue #315) checked out on a
+/// specific branch.
+fn run_in_dir(stdin: &str, env: &[(&str, &str)], dir: &std::path::Path) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_clawband"));
+    cmd.current_dir(dir);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -36,6 +65,7 @@ fn run(stdin: &str, env: &[(&str, &str)]) -> String {
 /// Same as `run()` but also returns stderr. Used to assert on warning messages.
 fn run_with_stderr(stdin: &str, env: &[(&str, &str)]) -> (String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_clawband"));
+    cmd.current_dir(non_repo_scratch_dir());
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4405,6 +4435,101 @@ fn e2e_git_log_pipe_grep_still_passes() {
     );
 }
 
+// ── Branch-aware exemption for destructive git commands (issue #315) ──────
+// Full end-to-end coverage against the real spawned binary + a real scratch
+// git repo, exercising the actual `git rev-parse` call — the unit tests in
+// main.rs cover the parsing/normalization logic in isolation, but only
+// these confirm the whole pipeline (hook JSON in, real git state read,
+// decision out) behaves correctly together.
+
+fn scratch_git_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("scratch git repo");
+    let run_git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {:?} failed", args);
+    };
+    run_git(&["init", "-q", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "test"]);
+    std::fs::write(dir.path().join("f.txt"), "hi").unwrap();
+    run_git(&["add", "f.txt"]);
+    run_git(&["commit", "-q", "-m", "init"]);
+    dir
+}
+
+#[test]
+fn e2e_branch_aware_current_branch_fallback_exempts_on_feature_branch() {
+    let repo = scratch_git_repo();
+    Command::new("git")
+        .args(["checkout", "-q", "-b", "feature-x"])
+        .current_dir(repo.path())
+        .status()
+        .unwrap();
+    let out = run_in_dir(&bash("git reset --hard"), &[], repo.path());
+    assert_eq!(
+        decision(&out),
+        None,
+        "git reset --hard on a feature branch must pass: {out}"
+    );
+}
+
+#[test]
+fn e2e_branch_aware_current_branch_fallback_gates_on_master() {
+    let repo = scratch_git_repo();
+    let out = run_in_dir(&bash("git reset --hard"), &[], repo.path());
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git reset --hard on master must still ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_branch_aware_explicit_target_master_force_push_denied_from_feature_branch() {
+    let repo = scratch_git_repo();
+    Command::new("git")
+        .args(["checkout", "-q", "-b", "feature-x"])
+        .current_dir(repo.path())
+        .status()
+        .unwrap();
+    // Closes the real gap this feature exists to close: being on a feature
+    // branch must NOT exempt a force-push whose explicit target is master.
+    let out = run_in_dir(&bash("git push --force origin master"), &[], repo.path());
+    assert_eq!(
+        decision(&out),
+        Some("deny"),
+        "force-push explicitly targeting master must stay denied even from a feature branch: {out}"
+    );
+}
+
+#[test]
+fn e2e_branch_aware_explicit_target_non_protected_exempt_from_master() {
+    let repo = scratch_git_repo();
+    // Sitting on master, but the force-push explicitly targets a different,
+    // non-protected branch — must be exempted despite the current checkout.
+    let out = run_in_dir(&bash("git push --force origin feature-x"), &[], repo.path());
+    assert_eq!(
+        decision(&out),
+        None,
+        "force-push explicitly targeting a non-protected branch must pass even from master: {out}"
+    );
+}
+
+#[test]
+fn e2e_branch_aware_fails_closed_outside_a_git_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_in_dir(&bash("git reset --hard"), &[], dir.path());
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "git reset --hard outside a git repo must fail closed (still ask): {out}"
+    );
+}
+
 // ── third-opinion review of PR #307 (Gemini/Antigravity) ───────────────────
 
 #[test]
@@ -4832,8 +4957,12 @@ fn e2e_chained_clean_script_passes() {
 #[test]
 fn e2e_shebang_python_script_without_extension_denied() {
     // File has no extension; shebang tells clawband it's Python — os.system must be denied.
-    // Use tempfile_in(".") so the file lives in CWD and ./filename is a valid relative path.
-    let mut f = tempfile::Builder::new().tempfile_in(".").unwrap();
+    // Create the file in the same scratch dir `run()` spawns the binary in
+    // (see `non_repo_scratch_dir()`) so `./filename` is a valid relative path
+    // from the spawned process's actual working directory.
+    let mut f = tempfile::Builder::new()
+        .tempfile_in(non_repo_scratch_dir())
+        .unwrap();
     writeln!(
         f,
         "#!/usr/bin/env python3\nimport os\nos.system('rm -rf /')"
@@ -4850,8 +4979,13 @@ fn e2e_shebang_python_script_without_extension_denied() {
 
 #[test]
 fn e2e_shebang_bash_script_without_extension_passes_clean() {
-    // Clean bash script with shebang but no extension — must pass.
-    let mut f = tempfile::Builder::new().tempfile_in(".").unwrap();
+    // Clean bash script with shebang but no extension — must pass. Created
+    // in the scratch dir `run()` spawns the binary in (see
+    // `non_repo_scratch_dir()`) so `./filename` actually resolves and this
+    // test exercises real script-content scanning, not "file not found".
+    let mut f = tempfile::Builder::new()
+        .tempfile_in(non_repo_scratch_dir())
+        .unwrap();
     writeln!(f, "#!/bin/bash\necho hello\nls -la").unwrap();
     let filename = f.path().file_name().unwrap().to_str().unwrap().to_string();
     let out = run(&bash(&format!("./{filename}")), &[]);

@@ -2245,6 +2245,188 @@ fn is_chained_script_invocation(segment: &str) -> bool {
 
 // ─── Git force push check ─────────────────────────────────────────────────────
 
+// ─── Branch-aware exemption for destructive git commands (issue #315) ────────
+// The ask/deny gates below on force-push, `reset --hard`, `branch -D`, etc.
+// exist to protect against irreversible history loss — but that risk is
+// almost entirely about `master`/`main` specifically. Rewriting history on a
+// throwaway feature branch you're actively iterating on is routine and safe;
+// the same command against `master` is genuinely destructive. This section
+// lets those specific patterns pass silently when the affected branch is
+// provably NOT `master`/`main`, while staying exactly as strict as before in
+// every other case (protected branch, or branch can't be determined).
+
+/// The labels (from `builtin_ask`'s specs and `check_force_push`'s own deny
+/// reason) that this exemption applies to. Deliberately excludes
+/// "git remote mutate" and "git tag mutate" — both are about tampering with
+/// remote endpoints or tags, not "which branch," so they stay unconditionally
+/// gated regardless of what branch you're on.
+const BRANCH_SCOPED_ASK_LABELS: &[&str] = &[
+    "git reset --hard/--keep/--merge",
+    "git checkout -- ",
+    "git stash drop",
+    "git stash clear",
+    "git clean",
+    "git push --delete",
+    "git restore",
+    "git branch -D",
+    "git push :<branch>",
+];
+
+fn is_protected_branch(name: &str) -> bool {
+    matches!(normalize_ref_name(name), "master" | "main")
+}
+
+/// Strips a leading `+` (git's force-refspec marker, e.g. `+main` or
+/// `+refs/heads/main`) and a leading `refs/heads/` (the fully-qualified ref
+/// form some refspecs use for the destination side, e.g.
+/// `src:refs/heads/main`), so callers can compare a parsed target name
+/// against a bare branch name regardless of which form the user wrote.
+fn normalize_ref_name(name: &str) -> &str {
+    name.trim_start_matches('+')
+        .trim_start_matches("refs/heads/")
+}
+
+/// Returns the current checked-out branch name via `git rev-parse
+/// --abbrev-ref HEAD`, or `None` if it can't be determined — not a git repo,
+/// detached HEAD (git prints the literal string "HEAD" in that case, which
+/// is deliberately treated the same as a hard failure here), non-UTF8
+/// output, or the `git` binary isn't runnable. Callers use this only for a
+/// safety-*relaxing* exemption, so they must fail closed (treat `None` as
+/// "this is a protected branch") rather than assume the absence of a branch
+/// name means anything is safe.
+///
+/// `cwd` lets tests point this at a scratch repo; production call sites pass
+/// `None`, which runs `git` in the hook process's own inherited working
+/// directory — the real project directory the command would actually run in.
+///
+/// In `#[cfg(test)]` builds, `cwd: None` deterministically returns `None`
+/// (fail closed) rather than falling back to the test runner's own ambient
+/// working directory — `cargo test` runs inside this very repo, so silently
+/// using its real, ever-changing current branch would make every existing
+/// branch-agnostic test (`git push --force`, `git reset --hard`, ...) pass
+/// or fail depending on which branch happened to be checked out when the
+/// suite ran, rather than on the behavior actually being tested. Tests that
+/// exercise branch detection itself pass an explicit scratch-repo `cwd`.
+fn current_git_branch(cwd: Option<&std::path::Path>) -> Option<String> {
+    #[cfg(test)]
+    cwd?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    Some(branch.to_string())
+}
+
+/// Parses `git branch -D <name...>` / `--delete --force <name...>` /
+/// `--force --delete <name...>` target branch names. Returns `None` if the
+/// segment isn't this command shape at all (caller should then try other
+/// parsers); returns `Some(vec![])` if it IS this shape but no branch name
+/// tokens could be extracted (fail-closed case — the caller must treat an
+/// empty vec as "can't confirm this is safe").
+fn parse_branch_delete_targets(segment: &str) -> Option<Vec<String>> {
+    let re = Regex::new(
+        r"(?i)\bgit\s+branch\s+(?:(?-i:-D)\b|--delete\s+--force\b|--force\s+--delete\b)\s*(.*)$",
+    )
+    .unwrap();
+    let caps = re.captures(segment)?;
+    let rest = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+    let names: Vec<String> = rest
+        .split_whitespace()
+        .filter(|t| !t.starts_with('-'))
+        .map(|s| s.to_string())
+        .collect();
+    Some(names)
+}
+
+/// Parses the destination branch name out of a `git push` invocation that
+/// matches one of the branch-scoped patterns (force-push, `--delete`, or a
+/// `:<branch>` colon-refspec). Returns `None` when the segment isn't a `git
+/// push` at all, or when a target can't be confidently extracted (bare
+/// `git push --force` with no remote/branch named, an ambiguous refspec) —
+/// callers fall back to the current-branch check in that case, since these
+/// forms push whatever the current branch's upstream resolves to.
+fn parse_push_target_branch(segment: &str) -> Option<String> {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let push_idx = tokens
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("git"))
+        .and_then(|gi| {
+            tokens[gi + 1..]
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case("push"))
+                .map(|pi| gi + 1 + pi)
+        })?;
+    let rest = &tokens[push_idx + 1..];
+
+    // `--delete <remote> <branch>` or `<remote> --delete <branch>` — the
+    // branch name is always the LAST non-flag token regardless of where the
+    // delete flag itself appears (the one before it is the remote name).
+    if rest
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("--delete") || *t == "-d")
+    {
+        let candidate = rest.iter().rev().find(|t| !t.starts_with('-'));
+        return candidate.map(|s| s.trim_start_matches(':').to_string());
+    }
+
+    // Colon refspec form: `<remote> :<branch>` (delete) or `<remote>
+    // <src>:<branch>` (push src to a differently-named dst). Skip tokens
+    // that look like a URL (`://`) so a remote URL containing a colon isn't
+    // mistaken for a refspec.
+    if let Some(refspec) = rest
+        .iter()
+        .rev()
+        .find(|t| t.contains(':') && !t.starts_with('-') && !t.contains("://"))
+    {
+        return match refspec.split(':').nth(1) {
+            Some(dst) if !dst.is_empty() => Some(dst.to_string()),
+            _ => None, // trailing/ambiguous colon — fall back to current-branch check
+        };
+    }
+
+    // Plain `<remote> <branch>` force-push with no colon: the last non-flag
+    // token is the branch name on the remote (implicit same-name push).
+    let non_flags: Vec<&&str> = rest.iter().filter(|t| !t.starts_with('-')).collect();
+    if non_flags.len() >= 2 {
+        return Some(non_flags[non_flags.len() - 1].to_string());
+    }
+
+    None
+}
+
+/// Returns true when a branch-scoped destructive git command (see
+/// `BRANCH_SCOPED_ASK_LABELS` and `check_force_push`) should be exempted
+/// from its ask/deny gate because the affected branch is confirmed to be
+/// something other than `master`/`main`. Fails closed on every ambiguous
+/// path: can't determine the current branch, can't parse an explicit
+/// target, or a `git branch -D` with multiple names where any one of them
+/// is protected.
+fn branch_scoped_exempt(segment: &str) -> bool {
+    if let Some(names) = parse_branch_delete_targets(segment) {
+        if names.is_empty() {
+            return false;
+        }
+        return names.iter().all(|n| !is_protected_branch(n));
+    }
+    if let Some(target) = parse_push_target_branch(segment) {
+        return !is_protected_branch(&target);
+    }
+    match current_git_branch(None) {
+        Some(branch) => !is_protected_branch(&branch),
+        None => false,
+    }
+}
+
 fn check_force_push(cmd: &str) -> Option<String> {
     // Only applies to git push commands
     if !Regex::new(r"(?i)\bgit\s+push\b").unwrap().is_match(cmd) {
@@ -6790,7 +6972,9 @@ fn check_command<'a>(
         // ── Deny tier (always runs, allow cannot suppress) ────────────────────
 
         if let Some(reason) = check_force_push(segment) {
-            return Some(("deny", reason));
+            if !branch_scoped_exempt(segment) {
+                return Some(("deny", reason));
+            }
         }
 
         // For read-only / data-output commands (echo, grep, printf …) and pure
@@ -6889,6 +7073,15 @@ fn check_command<'a>(
             for &form in forms_for_ask {
                 for pat in ask_pats {
                     if pat.matches(form) {
+                        // Branch-aware exemption (issue #315): these specific
+                        // labels gate on "which branch does this affect," not
+                        // the command shape alone — see branch_scoped_exempt's
+                        // doc comment for the fail-closed rules.
+                        if BRANCH_SCOPED_ASK_LABELS.contains(&pat.label.as_str())
+                            && branch_scoped_exempt(segment)
+                        {
+                            continue;
+                        }
                         return Some((
                             "ask",
                             with_suggestion(
@@ -8197,6 +8390,190 @@ mod tests {
         );
     }
 
+    // ── Branch-aware exemption for destructive git commands (issue #315) ──────
+    // `decision()`/`check_command` run with `current_git_branch(None)` fixed
+    // to fail-closed in test builds (see that function's doc comment), so
+    // every case below that relies on the *current-branch fallback* (rather
+    // than an explicit target parsed from the command) exercises the
+    // fail-closed path, not a real branch lookup — those are covered by the
+    // dedicated `current_git_branch`/`branch_scoped_exempt` unit tests below
+    // instead, which pass a real scratch-repo path.
+
+    #[test]
+    fn explicit_target_master_force_push_still_denied() {
+        assert_eq!(
+            decision("git push --force origin master"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn explicit_target_main_force_push_still_denied() {
+        assert_eq!(
+            decision("git push --force origin main"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn explicit_target_non_protected_force_push_exempt() {
+        assert_eq!(decision("git push --force origin feature-x"), None);
+        assert_eq!(decision("git push -f origin feature-x"), None);
+    }
+
+    #[test]
+    fn explicit_target_colon_refspec_non_protected_exempt() {
+        assert_eq!(decision("git push origin src:feature-x"), None);
+    }
+
+    #[test]
+    fn explicit_target_colon_refspec_master_denied() {
+        assert_eq!(
+            decision("git push --force origin src:master"),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn explicit_target_refs_heads_prefix_normalized() {
+        // A fully-qualified destination ref must be recognized the same as
+        // its bare form.
+        assert_eq!(
+            decision("git push --force origin src:refs/heads/master"),
+            Some("deny".into())
+        );
+        assert_eq!(
+            decision("git push --force origin src:refs/heads/feature-x"),
+            None
+        );
+    }
+
+    #[test]
+    fn branch_delete_multiple_targets_any_protected_stays_gated() {
+        // If ANY named branch in a multi-target delete is protected, the
+        // whole command stays gated — exempting it would let a protected
+        // branch slip through bundled with harmless ones.
+        assert_eq!(
+            decision("git branch -D feature-x master"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn branch_delete_multiple_non_protected_targets_exempt() {
+        assert_eq!(decision("git branch -D feature-x feature-y"), None);
+    }
+
+    #[test]
+    fn branch_scoped_labels_out_of_scope_patterns_unaffected() {
+        // git remote/tag mutation are deliberately NOT branch-scoped —
+        // they're about tampering with remote endpoints or tags, not "which
+        // branch," so they must stay gated regardless of any parseable name.
+        assert_eq!(decision("git remote remove origin"), Some("ask".into()));
+        assert_eq!(decision("git tag -d master"), Some("ask".into()));
+        assert_eq!(decision("git tag -d some-old-tag"), Some("ask".into()));
+    }
+
+    #[test]
+    fn is_protected_branch_matches_master_and_main_only() {
+        assert!(is_protected_branch("master"));
+        assert!(is_protected_branch("main"));
+        assert!(!is_protected_branch("feature-x"));
+        assert!(!is_protected_branch("masterful"));
+        assert!(!is_protected_branch("mainline"));
+    }
+
+    #[test]
+    fn normalize_ref_name_strips_plus_and_refs_heads_prefix() {
+        assert_eq!(normalize_ref_name("master"), "master");
+        assert_eq!(normalize_ref_name("+master"), "master");
+        assert_eq!(normalize_ref_name("refs/heads/master"), "master");
+        assert_eq!(normalize_ref_name("+refs/heads/master"), "master");
+    }
+
+    #[test]
+    fn parse_push_target_branch_plain_remote_and_branch() {
+        assert_eq!(
+            parse_push_target_branch("git push origin feature-x"),
+            Some("feature-x".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_push_target_branch_bare_force_push_returns_none() {
+        // No remote/branch named at all — caller falls back to current-branch.
+        assert_eq!(parse_push_target_branch("git push --force"), None);
+        assert_eq!(parse_push_target_branch("git push"), None);
+    }
+
+    #[test]
+    fn parse_push_target_branch_ignores_url_colon() {
+        // A remote URL's `://` must not be mistaken for a refspec colon.
+        assert_eq!(
+            parse_push_target_branch("git push https://example.com/repo.git feature-x"),
+            Some("feature-x".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_branch_delete_targets_not_applicable_for_unrelated_commands() {
+        assert_eq!(
+            parse_branch_delete_targets("git push origin feature-x"),
+            None
+        );
+        assert_eq!(parse_branch_delete_targets("git reset --hard"), None);
+    }
+
+    #[test]
+    fn parse_branch_delete_targets_extracts_all_names() {
+        assert_eq!(
+            parse_branch_delete_targets("git branch -D feature-x feature-y"),
+            Some(vec!["feature-x".to_string(), "feature-y".to_string()])
+        );
+    }
+
+    #[test]
+    fn current_git_branch_reads_real_repo_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q", "-b", "master"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "test"]);
+        std::fs::write(dir.path().join("f.txt"), "hi").unwrap();
+        run(&["add", "f.txt"]);
+        run(&["commit", "-q", "-m", "init"]);
+        assert_eq!(
+            current_git_branch(Some(dir.path())),
+            Some("master".to_string())
+        );
+        run(&["checkout", "-q", "-b", "feature-x"]);
+        assert_eq!(
+            current_git_branch(Some(dir.path())),
+            Some("feature-x".to_string())
+        );
+    }
+
+    #[test]
+    fn current_git_branch_none_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(current_git_branch(Some(dir.path())), None);
+    }
+
+    #[test]
+    fn current_git_branch_none_in_test_build_with_no_cwd_override() {
+        // See current_git_branch's doc comment: this is deliberate — it
+        // prevents the test suite's own ambient repo state (whatever branch
+        // clawband-work itself happens to be on) from leaking into
+        // branch-agnostic tests.
+        assert_eq!(current_git_branch(None), None);
+    }
+
     #[test]
     fn force_push_lease_still_ask() {
         // --force-with-lease is the safe alternative — must not be blocked
@@ -8247,7 +8624,22 @@ mod tests {
 
     #[test]
     fn git_branch_uppercase_d_asks() {
-        assert_eq!(decision("git branch -D mybranch"), Some("ask".into()));
+        // Named target is "master" — the branch-aware exemption (issue #315)
+        // keeps this gated since the deleted branch is protected regardless
+        // of which branch is currently checked out.
+        assert_eq!(decision("git branch -D master"), Some("ask".into()));
+    }
+
+    #[test]
+    fn git_branch_uppercase_d_non_protected_target_exempt() {
+        // Issue #315: deleting a branch that is NOT master/main is exempted
+        // from the ask gate — the named target is parsed directly from the
+        // command, independent of whatever branch happens to be checked out
+        // when the test runs (current_git_branch is fail-closed in test
+        // builds — see its doc comment — so this only passes because the
+        // explicit-target parser finds "mybranch" and confirms it isn't
+        // protected, not because of any ambient repo state).
+        assert_eq!(decision("git branch -D mybranch"), None);
     }
 
     #[test]
@@ -8608,19 +9000,30 @@ mod tests {
     }
 
     #[test]
-    fn git_push_colon_branch_asks() {
+    fn git_push_colon_branch_master_asks() {
+        // Issue #315: named target "master" stays gated.
+        assert_eq!(decision("git push origin :master"), Some("ask".into()));
+    }
+
+    #[test]
+    fn git_push_colon_branch_non_protected_target_exempt() {
+        // Issue #315: a non-protected named target is exempted.
+        assert_eq!(decision("git push origin :feature-branch"), None);
+    }
+
+    #[test]
+    fn git_push_delete_flag_master_asks() {
+        // Issue #315: named target "master" stays gated.
         assert_eq!(
-            decision("git push origin :feature-branch"),
+            decision("git push --delete origin master"),
             Some("ask".into())
         );
     }
 
     #[test]
-    fn git_push_delete_flag_asks() {
-        assert_eq!(
-            decision("git push --delete origin feature-branch"),
-            Some("ask".into())
-        );
+    fn git_push_delete_flag_non_protected_target_exempt() {
+        // Issue #315: a non-protected named target is exempted.
+        assert_eq!(decision("git push --delete origin feature-branch"), None);
     }
 
     // ── pass cases ─────────────────────────────────────────────────────────────
