@@ -1,0 +1,11 @@
+{
+  "usage": "Persist this file inside your repositories as .codescene/custom-quality-gates.json Enable/disable quality gates for specific paths. Rules are tried in order and the first rule that matches will apply. If no rule is matched, all quality gates are disabled. If you want to use a default set of gates specify a rule with matching_content-path **/* as the last rule.",
+  "rule_sets": [
+    {
+      "quality_gates": "clean_code_collective",
+      "quality_gates_doc": "Bare minimum + advisory rules (research-backed, opinionated checks for complexity/structure) — chosen specifically to catch technically-correct-but-overcomplicated code, since correctness-focused review (human or AI) doesn't reliably flag that. Not pay_down_tech_debt, since that tier also enforces custom Goals, which aren't configured yet.",
+      "matching_content_path": "**/*",
+      "matching_content_path_doc": "Single Rust project, no team split — one catch-all rule for the whole repo."
+    }
+  ]
+}
