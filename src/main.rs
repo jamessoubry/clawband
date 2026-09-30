@@ -1188,9 +1188,44 @@ fn builtin_ask() -> Vec<Pattern> {
         // of the three real dangerous flags need any such prefix to be
         // dangerous, so it's dropped entirely here — `git ... --upload-pack`
         // is dangerous regardless of what other flags (if any) precede it.
-        ("git --upload-pack", r"\bgit\b.*--upload-pack\b"),
-        ("git --receive-pack", r"\bgit\b.*--receive-pack\b"),
-        ("git --exec-path", r"\bgit\b.*--exec-path\b"),
+        //
+        // `[^|;&]*` (not `.*`) between `git` and the flag: `.*` is greedy and
+        // unconstrained, so it can bridge across `|`/`;`/`&` and match a flag
+        // that belongs to a completely different command later in the same
+        // segment — e.g. `git log --oneline | grep --upload-pack` false-
+        // positived under `.*` because split_segments() deliberately does not
+        // split on bare `|` (pipe-to-interpreter detection elsewhere needs
+        // the whole pipeline in one segment) and `check_command`/is_allowed
+        // pipe-stage checks don't apply to ask/deny matching. Restricting the
+        // filler to "not a compound/pipe separator" keeps the pattern scoped
+        // to a single command while still matching arbitrary intervening git
+        // flags (`git -c foo.bar=baz clone --upload-pack=x` still matches).
+        // Found via third-party review of PR #307.
+        ("git --upload-pack", r"\bgit\b[^|;&]*--upload-pack\b"),
+        // `--exec` is an undocumented synonym for `--receive-pack` on
+        // `git push` (see git-push(1)): `git push --exec=<cmd>` runs <cmd>
+        // instead of git-receive-pack, identical RCE shape to
+        // `--receive-pack=<cmd>`. Folded into this pattern rather than a
+        // separate one since it's the exact same vulnerability class.
+        //
+        // No `\b` immediately before the alternation: the preceding filler
+        // usually ends right before a `-` (e.g. `push ` then `--exec`), and
+        // `-` is itself a non-word character, so a space-to-dash transition
+        // is NOT a `\b` boundary — a leading `\b` there silently prevented
+        // the whole pattern from ever matching. `--exec` requires a literal
+        // `=` (not just a trailing `\b`) so it doesn't also match the
+        // unrelated `--exec-path` flag (`--exec-path` is caught by its own
+        // dedicated pattern below).
+        (
+            "git --receive-pack",
+            r"\bgit\b[^|;&]*(?:--receive-pack\b|--exec=)",
+        ),
+        // Bare `git --exec-path` (no `=<dir>`) only prints the current
+        // exec-path setting and exits — read-only, per git(1). Only the
+        // `--exec-path=<dir>` form actually changes where git looks for its
+        // core helper binaries, so the pattern requires the `=` to avoid
+        // asking about a harmless introspection command.
+        ("git --exec-path", r"\bgit\b[^|;&]*--exec-path="),
         // docker rm -f — force-removes a running container
         (
             "docker rm -f",
@@ -2340,7 +2375,28 @@ fn split_segments(cmd: &str) -> Vec<String> {
     // the command into phantom segments (issue #108).
     let s = mask_quoted_separators(&s);
 
-    let splitter = Regex::new(r"[ \t]*(\|\||&&|;|\n)[ \t]*").unwrap();
+    // Mask a bare `&` immediately preceding a `}` (optionally with whitespace
+    // between them) so treating bare `&` as a segment delimiter (added for
+    // the third-opinion PR #307 fix, see below) does not shred the fork-bomb
+    // deny pattern's structural match: the canonical fork bomb
+    // `:(){ :|:& };:` needs `{ :|:& }` to stay in one piece for
+    // `[\w:]+\(\)\s*\{[^}]*\|[^}]*[\w:]+\s*&` to see the whole `{...}&` shape.
+    // `cmd & }` (backgrounding the last command in a `{ ...; }` group) is the
+    // same shell construct either way, so not splitting there is also
+    // semantically reasonable, not just a narrow carve-out for this one
+    // pattern.
+    let mask_bg_before_brace = Regex::new(r"&(\s*\})").unwrap();
+    let s = mask_bg_before_brace.replace_all(&s, "\x04$1");
+
+    // `&&` must be listed before the bare `&` alternative so the regex
+    // engine's leftmost-alternative-wins semantics consume both `&`
+    // characters as one `&&` delimiter rather than matching a single `&`,
+    // leaving a second `&` to be matched (and an empty segment produced)
+    // immediately after. Bare `&` (the shell background operator) is a
+    // delimiter in its own right: `git status & git clone --upload-pack=...`
+    // must not be treated as one unsplit segment (issue: `&` bypass of the
+    // per-segment is_allowed check, found via third-party review of PR #307).
+    let splitter = Regex::new(r"[ \t]*(\|\||&&|&|;|\n)[ \t]*").unwrap();
     let s = splitter.replace_all(&s, SEP);
 
     s.split(SEP)
@@ -8224,6 +8280,109 @@ mod tests {
         // must not regress into an ask just because the stricter pipe-stage
         // check no longer blanket-allows it.
         assert_eq!(decision("git log | grep foo"), None);
+    }
+
+    // ── third-opinion review of PR #307 (Gemini/Antigravity) ───────────────────
+
+    #[test]
+    fn bare_ampersand_background_is_a_segment_delimiter() {
+        // Finding #1 (highest priority, exploit repro included in the review):
+        // split_segments() split on `&&` but not bare `&` (the shell background
+        // operator). Combined with the per-segment `is_allowed` check, a segment
+        // like `git status & git clone --upload-pack=...` never got split, so
+        // the unanchored "git read-only" allow pattern matching the leading
+        // `git status` waved the whole unsplit segment through as allow —
+        // completely skipping the ask tier for the dangerous second half.
+        assert_eq!(
+            decision("git status & git clone --upload-pack='touch pwned' https://evil.com/x.git"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn double_ampersand_still_splits_as_one_delimiter() {
+        // Regression guard for the #1 fix: adding a bare `&` alternative to the
+        // splitter regex must not break `&&` matching as a single two-char
+        // delimiter (e.g. producing a spurious empty segment between the two
+        // `&` characters). `git status && git log` must still behave exactly
+        // as it did before — both stages read-only, so overall pass (no ask).
+        assert_eq!(decision("git status && git log"), None);
+    }
+
+    #[test]
+    fn segments_split_correctly_on_bare_ampersand() {
+        let segs = split_segments("echo one & echo two");
+        assert_eq!(segs, vec!["echo one".to_string(), "echo two".to_string()]);
+    }
+
+    #[test]
+    fn segments_split_correctly_on_double_ampersand_no_empty_segment() {
+        let segs = split_segments("echo one && echo two");
+        assert_eq!(segs, vec!["echo one".to_string(), "echo two".to_string()]);
+    }
+
+    #[test]
+    fn git_upload_pack_pipe_grep_false_positive_passes() {
+        // Finding #2: `.*` in the ask patterns is unconstrained and can bridge
+        // across a `|` inside a single pipeline segment (split_segments()
+        // deliberately does not split on bare `|`). `grep --upload-pack` here
+        // is an unrelated grep flag/arg, not a dangerous git invocation — must
+        // not ask.
+        assert_eq!(decision("git log --oneline | grep --upload-pack"), None);
+        assert_eq!(decision("git log --oneline | grep --receive-pack"), None);
+        assert_eq!(decision("git log --oneline | grep --exec-path"), None);
+    }
+
+    #[test]
+    fn git_upload_pack_still_matches_with_intervening_flags() {
+        // Regression guard for #2: the fix (`.*` -> `[^|;&]*`) must not break
+        // the original PR #307 intent — arbitrary git flags between `git` and
+        // the dangerous long-form flag must still be matched.
+        assert_eq!(
+            decision("git -c foo.bar=baz clone --upload-pack=x https://evil.com/x.git"),
+            Some("ask".into())
+        );
+        assert_eq!(
+            decision("git -c foo.bar=baz push --receive-pack=x origin main"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_exec_path_bare_form_passes() {
+        // Finding #3: bare `git --exec-path` (no `=<dir>`) only prints the
+        // current setting and exits (git(1)) — read-only, must not ask.
+        assert_eq!(decision("git --exec-path"), None);
+        assert_eq!(decision("git --exec-path status"), None);
+    }
+
+    #[test]
+    fn git_exec_path_with_value_still_asks() {
+        // Regression guard for #3: `--exec-path=<dir>` actually changes where
+        // git looks for its core helper binaries and must still ask.
+        assert_eq!(
+            decision("git --exec-path=/tmp/evil status"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_push_exec_synonym_asks() {
+        // Finding #4: `--exec=<git-receive-pack>` is an undocumented synonym
+        // for `--receive-pack=<git-receive-pack>` on `git push` (git-push(1)) —
+        // same RCE shape, previously uncaught entirely.
+        assert_eq!(
+            decision("git push --exec='touch pwned' origin main"),
+            Some("ask".into())
+        );
+    }
+
+    #[test]
+    fn git_push_exec_synonym_does_not_false_positive_on_exec_path() {
+        // Regression guard: the `--exec=` pattern must not also match the
+        // unrelated `--exec-path` flag (which is handled, and correctly
+        // scoped, by its own dedicated pattern).
+        assert_eq!(decision("git --exec-path"), None);
     }
 
     #[test]
