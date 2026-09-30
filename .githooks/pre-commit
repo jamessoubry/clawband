@@ -1,0 +1,47 @@
+#!/bin/sh
+# CodeScene Code Health delta check — a deterministic quality gate that blocks
+# commits which would lower Code Health or introduce new unhealthy code.
+# Install once per clone: git config core.hooksPath .githooks
+#
+# Requires the `cs` CLI (https://codescene.io/docs/cli/index.html) and `jq`,
+# plus either `cs auth login` (interactive) or CS_ACCESS_TOKEN set
+# (non-interactive, e.g. an agent committing with no TTY attached). Soft-fails
+# (warns, exits 0) if either tool is missing rather than blocking every commit
+# on every clone that hasn't set them up yet — a clone with the tools
+# installed still enforces the gate for its own commits either way.
+export PATH="$HOME/.local/bin:$PATH"
+
+if ! command -v cs > /dev/null 2>&1; then
+  printf 'CodeScene health gate: cs is not installed — skipping (see https://codescene.io/docs/cli/index.html)\n' >&2
+  exit 0
+fi
+
+if ! command -v jq > /dev/null 2>&1; then
+  printf 'CodeScene health gate: jq is not installed — skipping\n' >&2
+  exit 0
+fi
+
+# Interactive (a human or an agent at a real terminal, who can act on
+# findings directly) gets cs's own rich UI. Non-interactive (no TTY — a
+# script or an agent's non-interactive commit) gets a scripted check against
+# the same delta data, pointing at the codescene MCP tool this project uses
+# for remediation.
+if (exec < /dev/tty) > /dev/null 2>&1; then
+  exec < /dev/tty
+  cs delta --interactive --staged
+  exit $?
+fi
+
+output=$(cs delta --output-format=json 2>/dev/null)
+
+degraded=$(printf '%s' "$output" | jq -r '
+  .[] | select(
+    (.["old-score"] == null and .["new-score"] != null) or
+    (.["old-score"] != null and .["new-score"] != null and .["new-score"] < .["old-score"])
+  ) | "  \(.name)  —  Code Health \(.["new-score"])/10"
+' 2>/dev/null)
+
+[ -z "$degraded" ] && { echo "CodeScene health gate OK"; exit 0; }
+
+printf 'CodeScene health gate failed:\n%s\n\nRun the `code_health_review` MCP tool on each failing file, then follow the\n`codescene:guiding-refactoring-with-code-health` skill to fix the issues.\n' "$degraded" >&2
+exit 1
