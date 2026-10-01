@@ -2262,12 +2262,7 @@ fn is_chained_script_invocation(segment: &str) -> bool {
 /// gated regardless of what branch you're on.
 const BRANCH_SCOPED_ASK_LABELS: &[&str] = &[
     "git reset --hard/--keep/--merge",
-    "git checkout -- ",
-    "git stash drop",
-    "git stash clear",
-    "git clean",
     "git push --delete",
-    "git restore",
     "git branch -D",
     "git push :<branch>",
 ];

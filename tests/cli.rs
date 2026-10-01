@@ -4488,6 +4488,57 @@ fn e2e_branch_aware_current_branch_fallback_gates_on_master() {
     );
 }
 
+// Second-opinion review finding on PR #316 (2026-09-30): checkout --, stash
+// drop/clear, clean, and restore don't touch committed branch history at
+// all — they discard uncommitted work, untracked files, or repo-global
+// stash entries, none of which the current-branch-is-not-master fallback
+// has any bearing on. These must keep asking regardless of branch.
+#[test]
+fn e2e_branch_aware_non_branch_risk_labels_still_ask_on_feature_branch() {
+    let repo = scratch_git_repo();
+    Command::new("git")
+        .args(["checkout", "-q", "-b", "feature-x"])
+        .current_dir(repo.path())
+        .status()
+        .unwrap();
+    std::fs::write(repo.path().join("f.txt"), "modified").unwrap();
+
+    let checkout_out = run_in_dir(&bash("git checkout -- f.txt"), &[], repo.path());
+    assert_eq!(
+        decision(&checkout_out),
+        Some("ask"),
+        "git checkout -- must still ask on a feature branch: {checkout_out}"
+    );
+
+    let stash_drop_out = run_in_dir(&bash("git stash drop"), &[], repo.path());
+    assert_eq!(
+        decision(&stash_drop_out),
+        Some("ask"),
+        "git stash drop must still ask on a feature branch: {stash_drop_out}"
+    );
+
+    let stash_clear_out = run_in_dir(&bash("git stash clear"), &[], repo.path());
+    assert_eq!(
+        decision(&stash_clear_out),
+        Some("ask"),
+        "git stash clear must still ask on a feature branch: {stash_clear_out}"
+    );
+
+    let clean_out = run_in_dir(&bash("git clean -fd"), &[], repo.path());
+    assert_eq!(
+        decision(&clean_out),
+        Some("ask"),
+        "git clean -fd must still ask on a feature branch: {clean_out}"
+    );
+
+    let restore_out = run_in_dir(&bash("git restore f.txt"), &[], repo.path());
+    assert_eq!(
+        decision(&restore_out),
+        Some("ask"),
+        "git restore must still ask on a feature branch: {restore_out}"
+    );
+}
+
 #[test]
 fn e2e_branch_aware_explicit_target_master_force_push_denied_from_feature_branch() {
     let repo = scratch_git_repo();
