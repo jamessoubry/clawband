@@ -108,6 +108,21 @@ pub enum Lang {
     /// `dangerouslySetInnerHTML` is genuinely unreachable there and not just
     /// unlikely to match syntactically.
     Tsx,
+    /// `.yml` / `.yaml` under a `.github/workflows/` directory only (issue
+    /// #265) — `github-actions-workflow` (untrusted GitHub Actions context
+    /// expression, e.g. `${{ github.event.issue.title }}`, interpolated
+    /// directly into a `run:` step's shell script body; the classic
+    /// command-injection pattern documented in GitHub's own security
+    /// hardening guide). Deliberately scoped to workflow files only, not
+    /// every `.yml`/`.yaml` in a repo — this rule is specific to GitHub
+    /// Actions' `${{ }}` expression syntax and job-step shape, not a general
+    /// YAML content check.
+    Yaml,
+    /// `.html` — `script-src-without-sri` (a `<script>` tag with an external
+    /// `http://`/`https://` `src` attribute but no `integrity` attribute,
+    /// i.e. missing Subresource Integrity — a local/relative `src` is exempt
+    /// since SRI only applies to externally-hosted scripts).
+    Html,
 }
 
 /// Extensions this module can parse. Anything else returns `None` and the
@@ -121,6 +136,8 @@ pub fn detect_language(path: &str) -> Option<Lang> {
         "js" | "mjs" | "cjs" | "jsx" => Some(Lang::JavaScript),
         "ts" => Some(Lang::TypeScript),
         "tsx" => Some(Lang::Tsx),
+        "html" => Some(Lang::Html),
+        "yml" | "yaml" if path.contains(".github/workflows/") => Some(Lang::Yaml),
         _ => None,
     }
 }
@@ -132,6 +149,8 @@ fn ts_language(lang: &Lang) -> TsLanguage {
         Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        Lang::Html => tree_sitter_html::LANGUAGE.into(),
     }
 }
 
@@ -728,6 +747,9 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
                 "insecure block cipher mode — ECB mode encrypts identical plaintext blocks to identical ciphertext blocks, leaking structural information about the data (the classic \"ECB penguin\" problem); use an authenticated mode like AES-GCM instead",
             ),
         ],
+        // Both are post-match-walk rules (see `post_match_walk_findings`),
+        // not plain query tuples.
+        Lang::Yaml | Lang::Html => vec![],
         Lang::Rust => vec![
             (
                 "shell-invoking-subprocess",
@@ -1334,6 +1356,194 @@ fn js_sql_string_interpolation_findings(
     findings
 }
 
+/// Compiles `query_src` against `ts_lang` and resolves `capture_name` to its
+/// capture index, collapsing the "query failed to compile" / "capture not
+/// found" pair of early-return branches every `*_findings` function in this
+/// module repeats into a single `let...else` at the call site — shared here
+/// (rather than only by the two new rules) purely to keep each new rule's
+/// own cyclomatic complexity down; pre-existing `*_findings` functions are
+/// left as-is since they're unchanged by issue #265.
+fn compile_query_with_capture(
+    ts_lang: &TsLanguage,
+    query_src: &str,
+    capture_name: &str,
+) -> Option<(Query, usize)> {
+    let query = Query::new(ts_lang, query_src).ok()?;
+    let index = query
+        .capture_names()
+        .iter()
+        .position(|n| *n == capture_name)?;
+    Some((query, index))
+}
+
+/// Returns true if `expr` (the text between `${{` and `}}`, already
+/// lowercased by the caller) references a GitHub Actions context that can
+/// carry attacker-controlled text — `github.event.*` (issue/PR/comment
+/// titles and bodies, commit messages, etc.) or `github.head_ref` (a PR's
+/// source branch name) — per GitHub's own documented script-injection
+/// hardening guidance. `github.event_name`/`github.sha`/etc. are fixed,
+/// workflow-controlled values and intentionally not matched here.
+fn is_untrusted_github_context(expr: &str) -> bool {
+    expr.contains("github.event") || expr.contains("github.head_ref")
+}
+
+/// Compiled once (the pattern is a fixed literal, not user input) rather
+/// than on every `yaml_github_actions_workflow_findings` call.
+fn github_interpolation_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\$\{\{\s*([^}]*?)\s*\}\}").expect("valid literal regex"))
+}
+
+/// Finds untrusted GitHub Actions context expressions (`${{ github.event...
+/// }}`, `${{ github.head_ref }}`) interpolated directly into a `run:` step's
+/// shell script body (issue #265) — the classic command-injection pattern:
+/// the expression is substituted into the script text verbatim *before* the
+/// shell ever runs, so an attacker-controlled issue/PR title containing
+/// shell metacharacters executes as code. The documented-safe fix is to pass
+/// the value through an `env:` entry first and reference it as a shell
+/// variable (`$TITLE`) instead — such a workflow has no `${{ }}` in the
+/// `run:` body at all, so it simply doesn't match this query's text scan.
+///
+/// A tree-sitter query can match a `run:` mapping pair's presence, but
+/// "scan this scalar's raw text for a substring pattern" isn't an AST
+/// structural condition at all — same reason `python_sql_string_interpolation_findings`
+/// inspects node text content with a plain string/regex check rather than a
+/// query predicate. `value: (_) @value` is used (rather than naming the
+/// exact scalar node kind) because a `run:` value can be a block scalar
+/// (`run: |`) or a plain/quoted flow scalar (`run: echo ...`) — distinct AST
+/// shapes with the same raw-text danger.
+fn yaml_github_actions_workflow_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
+    let ts_lang: TsLanguage = tree_sitter_yaml::LANGUAGE.into();
+    let query_src = r#"(block_mapping_pair
+  key: (flow_node (plain_scalar (string_scalar) @key))
+  value: (_) @value
+  (#eq? @key "run"))"#;
+    let Some((query, value_index)) = compile_query_with_capture(&ts_lang, query_src, "value")
+    else {
+        return vec![];
+    };
+    let interpolation = github_interpolation_regex();
+
+    let mut findings = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index as usize != value_index {
+                continue;
+            }
+            let Ok(text) = cap.node.utf8_text(content.as_bytes()) else {
+                continue;
+            };
+            let flagged = interpolation
+                .captures_iter(text)
+                .any(|c| is_untrusted_github_context(&c[1].to_lowercase()));
+            if flagged {
+                findings.push(Finding {
+                    rule: "github-actions-workflow",
+                    reason: "untrusted GitHub Actions context expression interpolated directly into a run: step's shell script — the value is substituted into the script text before the shell runs, so attacker-controlled content (an issue/PR title, branch name, etc.) executes as shell code; pass it through env: instead and reference it as a shell variable (e.g. $TITLE)",
+                });
+            }
+        }
+    }
+    findings
+}
+
+/// Returns the text content of an HTML `attribute` node's value — handling
+/// both the unquoted form (`attribute_value` as a direct child) and the
+/// quoted form (`attribute_value` nested inside `quoted_attribute_value`),
+/// since `tree-sitter-html`'s grammar represents these as genuinely
+/// different node shapes (confirmed against node-types.json) despite having
+/// the same meaning.
+fn html_attribute_value<'a>(attr: tree_sitter::Node, content: &'a str) -> Option<&'a str> {
+    let mut c = attr.walk();
+    for child in attr.named_children(&mut c) {
+        let value_node = match child.kind() {
+            "attribute_value" => Some(child),
+            "quoted_attribute_value" => child
+                .named_child(0)
+                .filter(|n| n.kind() == "attribute_value"),
+            _ => None,
+        };
+        if let Some(node) = value_node {
+            return node.utf8_text(content.as_bytes()).ok();
+        }
+    }
+    None
+}
+
+/// Walks a `<script>` tag's `start_tag` node for its `src` and `integrity`
+/// attributes — split out of `html_script_src_without_sri_findings` purely
+/// to keep that function's own cyclomatic/nesting complexity down; the
+/// query itself can't express "has attribute X but lacks attribute Y"
+/// directly, same shape as `python_yaml_load_findings`'s `Loader=` check.
+fn html_script_attrs<'a>(
+    start_tag: tree_sitter::Node,
+    content: &'a str,
+) -> (Option<&'a str>, bool) {
+    let mut src = None;
+    let mut has_integrity = false;
+    let mut c = start_tag.walk();
+    for attr in start_tag.named_children(&mut c) {
+        if attr.kind() != "attribute" {
+            continue;
+        }
+        let name = attr
+            .named_child(0)
+            .filter(|n| n.kind() == "attribute_name")
+            .and_then(|n| n.utf8_text(content.as_bytes()).ok());
+        match name {
+            Some("src") => src = html_attribute_value(attr, content),
+            Some("integrity") => has_integrity = true,
+            _ => {}
+        }
+    }
+    (src, has_integrity)
+}
+
+/// Finds `<script>` tags with an external `http://`/`https://` `src` but no
+/// `integrity` attribute — missing Subresource Integrity (issue #265). A
+/// local/relative `src` (no scheme) is exempt: SRI only protects against a
+/// compromised third-party host serving modified content, which doesn't
+/// apply to a script served by the same origin.
+///
+/// `tree-sitter-html`'s `attribute` node has no `name`/`value` fields (confirmed
+/// against node-types.json — just an unordered `attribute_name` +
+/// `attribute_value`/`quoted_attribute_value` child list), and "has a src
+/// attribute but lacks an integrity attribute" is an absence condition
+/// across sibling nodes a query can't express directly — same shape as
+/// `python_yaml_load_findings`'s `Loader=` check — so this matches each
+/// `script_element`'s `start_tag` generically and walks its attributes in
+/// Rust.
+fn html_script_src_without_sri_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
+    let ts_lang: TsLanguage = tree_sitter_html::LANGUAGE.into();
+    let query_src = r#"(script_element (start_tag) @tag)"#;
+    let Some((query, tag_index)) = compile_query_with_capture(&ts_lang, query_src, "tag") else {
+        return vec![];
+    };
+
+    let mut findings = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index as usize != tag_index {
+                continue;
+            }
+            let (src, has_integrity) = html_script_attrs(cap.node, content);
+            let is_external =
+                src.is_some_and(|s| s.starts_with("http://") || s.starts_with("https://"));
+            if is_external && !has_integrity {
+                findings.push(Finding {
+                    rule: "script-src-without-sri",
+                    reason: "externally-hosted <script> missing Subresource Integrity (integrity attribute) — if the remote host or CDN is ever compromised, it can serve modified script content that the browser will execute unverified; add an integrity=\"sha384-...\" attribute matching the expected file hash",
+                });
+            }
+        }
+    }
+    findings
+}
+
 /// Parses `content` as `lang` and runs the rule set against the AST.
 /// Returns an empty vec (never fails closed) if the content fails to parse —
 /// scanning augments clawband's existing checks, it doesn't gate on its own
@@ -1361,20 +1571,40 @@ pub fn scan(content: &str, lang: Lang) -> Vec<Finding> {
             findings.push(Finding { rule, reason });
         }
     }
-    if matches!(lang, Lang::Python) {
-        findings.extend(python_yaml_load_findings(&tree, content));
-        findings.extend(python_torch_load_findings(&tree, content));
-        findings.extend(python_numpy_load_findings(&tree, content));
-        findings.extend(python_xxe_findings(&tree, content));
-        findings.extend(python_sql_string_interpolation_findings(&tree, content));
-    }
-    if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx) {
-        findings.extend(js_dynamic_module_load_findings(&tree, content, &ts_lang));
-        findings.extend(js_sql_string_interpolation_findings(
-            &tree, content, &ts_lang,
-        ));
-    }
+    findings.extend(post_match_walk_findings(&lang, &tree, content, &ts_lang));
     findings
+}
+
+/// The "post-match walk" rules — ones a plain tree-sitter query predicate
+/// can't express (see each individual function's doc comment for why) and
+/// which are instead matched generically by `rules_for`'s query and then
+/// filtered by inspecting matched nodes in Rust. Split out of `scan()`
+/// purely to keep `scan()`'s own cyclomatic complexity down as new
+/// languages are added here.
+fn post_match_walk_findings(
+    lang: &Lang,
+    tree: &tree_sitter::Tree,
+    content: &str,
+    ts_lang: &TsLanguage,
+) -> Vec<Finding> {
+    match lang {
+        Lang::Python => {
+            let mut findings = python_yaml_load_findings(tree, content);
+            findings.extend(python_torch_load_findings(tree, content));
+            findings.extend(python_numpy_load_findings(tree, content));
+            findings.extend(python_xxe_findings(tree, content));
+            findings.extend(python_sql_string_interpolation_findings(tree, content));
+            findings
+        }
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            let mut findings = js_dynamic_module_load_findings(tree, content, ts_lang);
+            findings.extend(js_sql_string_interpolation_findings(tree, content, ts_lang));
+            findings
+        }
+        Lang::Yaml => yaml_github_actions_workflow_findings(tree, content),
+        Lang::Html => html_script_src_without_sri_findings(tree, content),
+        Lang::Rust => vec![],
+    }
 }
 
 #[cfg(test)]
@@ -3192,5 +3422,150 @@ mod tests {
     fn python_has_no_rust_unsafe_block_rule() {
         let findings = scan("eval(x)", Lang::Python);
         assert!(!has_rust_unsafe_block_finding(&findings));
+    }
+
+    // ── issue #265: github-actions-workflow (YAML) ──────────────────────
+
+    fn has_github_actions_workflow_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "github-actions-workflow")
+    }
+
+    #[test]
+    fn detect_language_scopes_yaml_to_workflows_dir() {
+        assert!(matches!(
+            detect_language(".github/workflows/ci.yml"),
+            Some(Lang::Yaml)
+        ));
+        assert!(matches!(
+            detect_language(".github/workflows/ci.yaml"),
+            Some(Lang::Yaml)
+        ));
+        // A plain .yml/.yaml file outside .github/workflows/ is out of
+        // scope for this rule — ast_guard augments clawband's existing
+        // checks for known-dangerous shapes, it doesn't become a general
+        // YAML linter.
+        assert!(detect_language("docker-compose.yml").is_none());
+        assert!(detect_language("config/settings.yaml").is_none());
+    }
+
+    #[test]
+    fn yaml_flags_untrusted_interpolation_in_run_block_scalar() {
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "untrusted github.event.* interpolated directly into run: must be flagged"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_untrusted_interpolation_in_single_line_run() {
+        let yaml = r#"
+on: pull_request
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github.head_ref }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(has_github_actions_workflow_finding(&findings));
+    }
+
+    #[test]
+    fn yaml_ignores_value_passed_through_env_first() {
+        // The documented-safe fix: the untrusted value goes through env:
+        // first and the run: body only ever references a shell variable,
+        // so there's no ${{ }} in the run: text at all.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - env:
+          TITLE: ${{ github.event.issue.title }}
+        run: |
+          echo "$TITLE"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            !has_github_actions_workflow_finding(&findings),
+            "a value passed through env: and referenced as a shell variable in run: must not be flagged"
+        );
+    }
+
+    #[test]
+    fn yaml_ignores_run_with_no_interpolation() {
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    steps:
+      - run: echo "hello world"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(!has_github_actions_workflow_finding(&findings));
+    }
+
+    #[test]
+    fn yaml_ignores_trusted_context_interpolation() {
+        // github.event_name/github.sha/github.run_id etc. are fixed,
+        // workflow-controlled values, not attacker-controlled input.
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github.sha }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(!has_github_actions_workflow_finding(&findings));
+    }
+
+    // ── issue #265: script-src-without-sri (HTML) ───────────────────────
+
+    fn has_script_src_without_sri_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "script-src-without-sri")
+    }
+
+    #[test]
+    fn html_flags_external_script_without_integrity() {
+        let html = r#"<script src="https://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(has_script_src_without_sri_finding(&findings));
+    }
+
+    #[test]
+    fn html_ignores_external_script_with_integrity() {
+        let html =
+            r#"<script src="https://cdn.example.com/lib.js" integrity="sha384-abc123"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            !has_script_src_without_sri_finding(&findings),
+            "a script with a correct integrity attribute must not be flagged"
+        );
+    }
+
+    #[test]
+    fn html_ignores_local_relative_script_src() {
+        let html = r#"<script src="/js/app.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            !has_script_src_without_sri_finding(&findings),
+            "SRI only matters for externally-hosted scripts, not same-origin/relative src"
+        );
+    }
+
+    #[test]
+    fn html_ignores_inline_script_with_no_src() {
+        let html = r#"<script>console.log("hi");</script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(!has_script_src_without_sri_finding(&findings));
     }
 }
