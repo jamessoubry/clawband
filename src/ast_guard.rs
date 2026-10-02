@@ -23,7 +23,7 @@ use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor};
 
 mod ast_guard_yaml_html;
 use ast_guard_yaml_html::{
-    html_script_src_without_sri_findings, yaml_github_actions_workflow_findings,
+    html_script_src_without_sri_findings, yaml_github_actions_workflow_findings, ParsedSource,
 };
 
 /// Shared XXE reason string — used both by the pre-narrowing doc trail and
@@ -1500,8 +1500,8 @@ fn post_match_walk_findings(
             findings.extend(js_sql_string_interpolation_findings(tree, content, ts_lang));
             findings
         }
-        Lang::Yaml => yaml_github_actions_workflow_findings(tree, content),
-        Lang::Html => html_script_src_without_sri_findings(tree, content),
+        Lang::Yaml => yaml_github_actions_workflow_findings(&ParsedSource { tree, content }),
+        Lang::Html => html_script_src_without_sri_findings(&ParsedSource { tree, content }),
         Lang::Rust => vec![],
     }
 }

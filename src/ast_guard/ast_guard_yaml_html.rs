@@ -8,6 +8,17 @@ use super::Finding;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language as TsLanguage, Query, QueryCursor};
 
+/// A parsed file's AST paired with its source text — bundles the two values
+/// every `*_findings` function in this module needs together (a tree-sitter
+/// query runs against the tree, but text extraction/regex-scanning needs the
+/// original bytes) into a single parameter object rather than two separate
+/// arguments, per CodeScene's "Introduce Parameter Object" guidance for a
+/// String Heavy Function Arguments finding.
+pub(super) struct ParsedSource<'a> {
+    pub(super) tree: &'a tree_sitter::Tree,
+    pub(super) content: &'a str,
+}
+
 /// Compiles `query_src` against `ts_lang` and resolves `capture_name` to its
 /// capture index, collapsing the "query failed to compile" / "capture not
 /// found" pair of early-return branches every `*_findings` function in this
@@ -64,10 +75,7 @@ fn github_interpolation_regex() -> &'static regex::Regex {
 /// exact scalar node kind) because a `run:` value can be a block scalar
 /// (`run: |`) or a plain/quoted flow scalar (`run: echo ...`) — distinct AST
 /// shapes with the same raw-text danger.
-pub(super) fn yaml_github_actions_workflow_findings(
-    tree: &tree_sitter::Tree,
-    content: &str,
-) -> Vec<Finding> {
+pub(super) fn yaml_github_actions_workflow_findings(source: &ParsedSource) -> Vec<Finding> {
     let ts_lang: TsLanguage = tree_sitter_yaml::LANGUAGE.into();
     let query_src = r#"(block_mapping_pair
   key: (flow_node (plain_scalar (string_scalar) @key))
@@ -78,10 +86,11 @@ pub(super) fn yaml_github_actions_workflow_findings(
         return vec![];
     };
     let interpolation = github_interpolation_regex();
+    let content = source.content;
 
     let mut findings = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    let mut matches = cursor.matches(&query, source.tree.root_node(), content.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
             if cap.index as usize != value_index {
@@ -170,19 +179,17 @@ fn html_script_attrs<'a>(
 /// `python_yaml_load_findings`'s `Loader=` check — so this matches each
 /// `script_element`'s `start_tag` generically and walks its attributes in
 /// Rust.
-pub(super) fn html_script_src_without_sri_findings(
-    tree: &tree_sitter::Tree,
-    content: &str,
-) -> Vec<Finding> {
+pub(super) fn html_script_src_without_sri_findings(source: &ParsedSource) -> Vec<Finding> {
     let ts_lang: TsLanguage = tree_sitter_html::LANGUAGE.into();
     let query_src = r#"(script_element (start_tag) @tag)"#;
     let Some((query, tag_index)) = compile_query_with_capture(&ts_lang, query_src, "tag") else {
         return vec![];
     };
+    let content = source.content;
 
     let mut findings = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    let mut matches = cursor.matches(&query, source.tree.root_node(), content.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
             if cap.index as usize != tag_index {
