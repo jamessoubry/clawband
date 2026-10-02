@@ -32,14 +32,20 @@ if (exec < /dev/tty) > /dev/null 2>&1; then
   exit $?
 fi
 
-output=$(cs delta --output-format=json 2>/dev/null)
+if ! output=$(cs delta --output-format=json 2>&1); then
+  printf 'CodeScene health gate: cs delta failed to run — skipping (not blocking commit)\n%s\n' "$output" >&2
+  exit 0
+fi
 
-degraded=$(printf '%s' "$output" | jq -r '
+if ! degraded=$(printf '%s' "$output" | jq -r '
   .[] | select(
     (.["old-score"] == null and .["new-score"] != null) or
     (.["old-score"] != null and .["new-score"] != null and .["new-score"] < .["old-score"])
   ) | "  \(.name)  —  Code Health \(.["new-score"])/10"
-' 2>/dev/null)
+' 2>&1); then
+  printf 'CodeScene health gate: failed to parse cs delta output — skipping (not blocking commit)\n%s\n' "$degraded" >&2
+  exit 0
+fi
 
 [ -z "$degraded" ] && { echo "CodeScene health gate OK"; exit 0; }
 
