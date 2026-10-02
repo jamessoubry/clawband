@@ -53,6 +53,8 @@ cargo clippy --all-targets -- -D warnings  # no warnings
 
 After changing code, run `code_health_review` on the changed files. If Code Health drops, fix the issues, run the review again, and use `code_health_score` to confirm the result. Before finishing, run `pre_commit_code_health_safeguard` and only stop when it passes.
 
+**Enforced locally too, not just as a manual step**: a pre-commit git hook (`.githooks/pre-commit`) runs `cs delta` before every commit and blocks it if any changed file's Code Health score drops. One-time setup per clone: `git config core.hooksPath .githooks`. Requires the `cs` CLI (`https://codescene.io/docs/cli/index.html`) and `jq`; soft-fails (warns, doesn't block) if either isn't installed rather than bricking commits on a clone that hasn't set them up. Interactive terminals get `cs`'s own UI (`cs delta --interactive`); non-interactive commits (e.g. an agent with no TTY) get a scripted JSON-based check pointing at the `code_health_review` MCP tool for remediation.
+
 As of 2026-09-30, project baseline is Red Code (1.28/10 for `src/main.rs`) — mainly `main()` (cyclomatic complexity 80, threshold <9) and `check_command()` (complexity 36) having absorbed most of the rule-by-rule growth over time, plus a repeated 6-argument shape across the `install_*` functions that wants a shared struct. Don't let new work make this worse; genuine drive-by improvements to touched functions are welcome but not required — this isn't a mandate to refactor unrelated code while fixing something else.
 
 ## Commit & PR conventions
