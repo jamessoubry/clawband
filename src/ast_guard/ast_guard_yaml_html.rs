@@ -165,7 +165,7 @@ pub(super) fn yaml_github_actions_workflow_findings(source: &ParsedSource) -> Ve
 /// since `tree-sitter-html`'s grammar represents these as genuinely
 /// different node shapes (confirmed against node-types.json) despite having
 /// the same meaning.
-fn html_attribute_value<'a>(attr: tree_sitter::Node, content: &'a str) -> Option<&'a str> {
+fn html_attribute_value<'a>(attr: tree_sitter::Node, source: &ParsedSource<'a>) -> Option<&'a str> {
     let mut c = attr.walk();
     for child in attr.named_children(&mut c) {
         let value_node = match child.kind() {
@@ -176,7 +176,7 @@ fn html_attribute_value<'a>(attr: tree_sitter::Node, content: &'a str) -> Option
             _ => None,
         };
         if let Some(node) = value_node {
-            return node.utf8_text(content.as_bytes()).ok();
+            return node.utf8_text(source.content.as_bytes()).ok();
         }
     }
     None
@@ -189,7 +189,7 @@ fn html_attribute_value<'a>(attr: tree_sitter::Node, content: &'a str) -> Option
 /// directly, same shape as `python_yaml_load_findings`'s `Loader=` check.
 fn html_script_attrs<'a>(
     start_tag: tree_sitter::Node,
-    content: &'a str,
+    source: &ParsedSource<'a>,
 ) -> (Option<&'a str>, bool) {
     let mut src = None;
     let mut has_integrity = false;
@@ -201,14 +201,24 @@ fn html_script_attrs<'a>(
         let name = attr
             .named_child(0)
             .filter(|n| n.kind() == "attribute_name")
-            .and_then(|n| n.utf8_text(content.as_bytes()).ok());
+            .and_then(|n| n.utf8_text(source.content.as_bytes()).ok());
         match name {
-            Some("src") => src = html_attribute_value(attr, content),
+            Some("src") => src = html_attribute_value(attr, source),
             Some("integrity") => has_integrity = true,
             _ => {}
         }
     }
     (src, has_integrity)
+}
+
+/// `true` if `src` points at a third-party origin (absolute `http://`/
+/// `https://`, or protocol-relative `//host/...`) rather than a local/
+/// relative path — split out purely to keep
+/// `html_script_src_without_sri_findings`'s own cyclomatic complexity under
+/// CodeScene's threshold (adding the protocol-relative check inline pushed
+/// it over).
+fn is_external_script_src(src: &str) -> bool {
+    src.starts_with("http://") || src.starts_with("https://") || src.starts_with("//")
 }
 
 /// Finds `<script>` tags with an external `http://`/`https://`/protocol-
@@ -245,10 +255,8 @@ pub(super) fn html_script_src_without_sri_findings(source: &ParsedSource) -> Vec
             if cap.index as usize != tag_index {
                 continue;
             }
-            let (src, has_integrity) = html_script_attrs(cap.node, content);
-            let is_external = src.is_some_and(|s| {
-                s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//")
-            });
+            let (src, has_integrity) = html_script_attrs(cap.node, source);
+            let is_external = src.is_some_and(is_external_script_src);
             if is_external && !has_integrity {
                 findings.push(Finding {
                     rule: "script-src-without-sri",
