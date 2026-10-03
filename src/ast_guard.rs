@@ -3427,6 +3427,61 @@ jobs:
         assert!(!has_github_actions_workflow_finding(&findings));
     }
 
+    #[test]
+    fn yaml_ignores_github_event_name_despite_substring_overlap() {
+        // Second-opinion review finding on PR #319: a bare substring check
+        // for "github.event" also matches "github.event_name" — a fixed,
+        // GitHub-controlled value this rule's own doc comment explicitly
+        // says is NOT meant to match. Must stay un-flagged.
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github.event_name }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            !has_github_actions_workflow_finding(&findings),
+            "github.event_name is a fixed value, not attacker-controlled — must not be flagged just because it shares a substring with github.event"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_untrusted_interpolation_still_works_alongside_event_name_fix() {
+        // Companion to the fix above: the real github.event.* case must
+        // still fire once the substring check is anchored on a real
+        // field-access boundary (`.`/`[`/end-of-expression).
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(has_github_actions_workflow_finding(&findings));
+    }
+
+    #[test]
+    fn yaml_flags_untrusted_inputs_interpolation() {
+        // Second-opinion review finding on PR #319: GitHub's own hardening
+        // docs list inputs.* on workflow_dispatch/pull_request_target as
+        // untrusted alongside github.head_ref, but it wasn't covered.
+        let yaml = r#"
+on: workflow_dispatch
+jobs:
+  build:
+    steps:
+      - run: echo "${{ inputs.foo }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "inputs.* interpolated directly into run: must be flagged — GitHub docs call it untrusted on workflow_dispatch/pull_request_target"
+        );
+    }
+
     // ── issue #265: script-src-without-sri (HTML) ───────────────────────
 
     fn has_script_src_without_sri_finding(findings: &[Finding]) -> bool {
@@ -3458,6 +3513,20 @@ jobs:
         assert!(
             !has_script_src_without_sri_finding(&findings),
             "SRI only matters for externally-hosted scripts, not same-origin/relative src"
+        );
+    }
+
+    #[test]
+    fn html_flags_protocol_relative_script_without_integrity() {
+        // Second-opinion review finding on PR #319: a protocol-relative
+        // src ("//host/...") loads from a third-party origin exactly like
+        // "https://host/..." does — SRI matters equally — but the original
+        // http://-/https://-only prefix check missed it.
+        let html = r#"<script src="//cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "a protocol-relative external script src without integrity must be flagged"
         );
     }
 

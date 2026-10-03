@@ -39,15 +39,61 @@ fn compile_query_with_capture(
     Some((query, index))
 }
 
-/// Returns true if `expr` (the text between `${{` and `}}`, already
-/// lowercased by the caller) references a GitHub Actions context that can
-/// carry attacker-controlled text — `github.event.*` (issue/PR/comment
-/// titles and bodies, commit messages, etc.) or `github.head_ref` (a PR's
-/// source branch name) — per GitHub's own documented script-injection
-/// hardening guidance. `github.event_name`/`github.sha`/etc. are fixed,
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Returns true if `expr` contains `base` as a real field-access root (e.g.
+/// `base.foo`, `base[0]`, or `base` alone) rather than merely as a substring
+/// of a longer identifier. Second-opinion review finding on PR #319:
+/// `expr.contains("github.event")` false-flagged `github.event_name` — a
+/// fixed, GitHub-controlled value this rule's own doc comment explicitly
+/// says is NOT meant to match — because a bare substring check can't tell
+/// "github.event." from "github.event_name". Checked directionally: the
+/// character immediately *after* the match must not continue an identifier
+/// (rules out `_name`/`_path` suffixes), and the character immediately
+/// *before* it must not continue one either (rules out matching the tail of
+/// some unrelated longer identifier). Scans every occurrence, not just the
+/// first, since `expr` can be an arbitrary expression like
+/// `toJson(github.event.issue.title)`.
+fn contains_field_access(expr: &str, base: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = expr[search_from..].find(base) {
+        let start = search_from + rel;
+        let end = start + base.len();
+        let end_is_boundary = expr[end..].chars().next().is_none_or(|c| !is_ident_char(c));
+        let start_is_boundary = expr[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        if end_is_boundary && start_is_boundary {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
+/// Returns true if `expr` (the text between `${{` and `}}`) references a
+/// GitHub Actions context that can carry attacker-controlled text —
+/// `github.event.*` (issue/PR/comment titles and bodies, commit messages,
+/// etc.), `github.head_ref` (a PR's source branch name), or `inputs.*` (a
+/// `workflow_dispatch`/`pull_request_target` trigger's user-supplied input
+/// values) — per GitHub's own documented script-injection hardening
+/// guidance. `github.event_name`/`github.sha`/etc. are fixed,
 /// workflow-controlled values and intentionally not matched here.
+///
+/// Second-opinion review finding on PR #319: `inputs.*` wasn't covered at
+/// all, despite GitHub's hardening docs listing it alongside `head_ref` as
+/// untrusted on those two trigger types. This rule doesn't track which
+/// trigger a given workflow uses, so `inputs.*` is flagged unconditionally —
+/// a deliberately conservative choice (a false positive on a safely-scoped
+/// `inputs.*` use costs a reviewed-and-dismissed finding; a false negative
+/// on an actually-unsafe one costs a real injection).
 fn is_untrusted_github_context(expr: &str) -> bool {
-    expr.contains("github.event") || expr.contains("github.head_ref")
+    contains_field_access(expr, "github.event")
+        || expr.contains("github.head_ref")
+        || contains_field_access(expr, "inputs")
 }
 
 /// Compiled once (the pattern is a fixed literal, not user input) rather
@@ -165,11 +211,15 @@ fn html_script_attrs<'a>(
     (src, has_integrity)
 }
 
-/// Finds `<script>` tags with an external `http://`/`https://` `src` but no
-/// `integrity` attribute — missing Subresource Integrity (issue #265). A
-/// local/relative `src` (no scheme) is exempt: SRI only protects against a
-/// compromised third-party host serving modified content, which doesn't
-/// apply to a script served by the same origin.
+/// Finds `<script>` tags with an external `http://`/`https://`/protocol-
+/// relative (`//host/...`) `src` but no `integrity` attribute — missing
+/// Subresource Integrity (issue #265). A local/relative `src` (no host) is
+/// exempt: SRI only protects against a compromised third-party host serving
+/// modified content, which doesn't apply to a script served by the same
+/// origin. Second-opinion review finding on PR #319: protocol-relative URLs
+/// (`src="//cdn.example.com/lib.js"`) load from a third-party origin exactly
+/// like `https://cdn.example.com/lib.js` does — SRI matters equally there —
+/// but the original `http://`/`https://`-only prefix check missed them.
 ///
 /// `tree-sitter-html`'s `attribute` node has no `name`/`value` fields (confirmed
 /// against node-types.json — just an unordered `attribute_name` +
@@ -196,8 +246,9 @@ pub(super) fn html_script_src_without_sri_findings(source: &ParsedSource) -> Vec
                 continue;
             }
             let (src, has_integrity) = html_script_attrs(cap.node, content);
-            let is_external =
-                src.is_some_and(|s| s.starts_with("http://") || s.starts_with("https://"));
+            let is_external = src.is_some_and(|s| {
+                s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//")
+            });
             if is_external && !has_integrity {
                 findings.push(Finding {
                     rule: "script-src-without-sri",
