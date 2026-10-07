@@ -366,11 +366,20 @@ fn html_script_attrs<'a>(
         // actual output — it preserves the source's original case verbatim,
         // doesn't normalize it), so `<script SRC=... INTEGRITY=...>` has
         // neither attribute recognized by a lowercase-literal match.
-        if name.is_some_and(|n| n.eq_ignore_ascii_case("src")) {
-            if !src_seen {
-                src = html_attribute_value(attr, source);
-                src_seen = true;
-            }
+        //
+        // CodeScene "Bumpy Road Ahead" finding: the `!src_seen`/
+        // `!integrity_seen` checks fold into each branch's own `if`
+        // condition (rather than a separate nested `if` inside each
+        // branch, as an earlier version of this had) specifically to keep
+        // nesting flat — a `slot.is_none()`-based "already set" check was
+        // tried instead and reverted: it can't distinguish "first
+        // occurrence had no value" (a bare `integrity` attribute) from
+        // "not seen yet", which would wrongly let a later duplicate's real
+        // hash override a bare first `integrity` attribute's correct
+        // (no-SRI) outcome.
+        if name.is_some_and(|n| n.eq_ignore_ascii_case("src")) && !src_seen {
+            src = html_attribute_value(attr, source);
+            src_seen = true;
         } else if name.is_some_and(|n| n.eq_ignore_ascii_case("integrity")) && !integrity_seen {
             integrity_value = html_attribute_value(attr, source);
             integrity_seen = true;

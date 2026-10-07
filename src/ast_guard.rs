@@ -3778,6 +3778,24 @@ jobs:
     }
 
     #[test]
+    fn html_flags_duplicate_integrity_keeping_first_bare_value() {
+        // Regression for a bug introduced and caught in-session while
+        // simplifying html_script_attrs's duplicate-attribute handling: a
+        // first-occurrence tracker based on "is the slot still None"
+        // can't tell a bare first `integrity` attribute (no value at all,
+        // so the slot is still None after processing it) apart from "not
+        // seen yet" — which would wrongly let a later duplicate's real
+        // hash win. A bare integrity attribute's "value" is effectively
+        // empty, so the first-wins rule here means no real SRI either way.
+        let html = r#"<script src="https://cdn.example.com/lib.js" integrity integrity="sha384-abc123"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "a bare first integrity attribute must win over a later duplicate's real hash, matching real HTML parsing"
+        );
+    }
+
+    #[test]
     fn html_flags_malformed_integrity_hash() {
         // Greptile review finding on PR #319: the original check only
         // asked whether the integrity attribute's value was non-empty —
