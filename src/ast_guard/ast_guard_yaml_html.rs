@@ -43,6 +43,22 @@ fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Strips a single layer of matching `"` or `'` quotes from a YAML scalar's
+/// raw source text (e.g. `"run"` -> `run`, `'run'` -> `run`), leaving a
+/// plain/unquoted scalar's text untouched. Used to compare a `key: (_)`
+/// capture's text against `"run"` regardless of which of YAML's three
+/// equivalent key-quoting styles a workflow author used.
+fn unquote_yaml_scalar(s: &str) -> &str {
+    let t = s.trim();
+    t.strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            t.strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+        .unwrap_or(t)
+}
+
 /// Returns true if `expr` contains `base` as a real field-access root (e.g.
 /// `base.foo`, `base[0]`, or `base` alone) rather than merely as a substring
 /// of a longer identifier. Second-opinion review finding on PR #319:
@@ -90,17 +106,40 @@ fn contains_field_access(expr: &str, base: &str) -> bool {
 /// a deliberately conservative choice (a false positive on a safely-scoped
 /// `inputs.*` use costs a reviewed-and-dismissed finding; a false negative
 /// on an actually-unsafe one costs a real injection).
+///
+/// Third-opinion review finding on PR #319: GitHub Actions expressions
+/// support index syntax (`github['event']`) as an alternative to dot
+/// access — the literal substring `github.event` never appears in
+/// `github['event']`, so the dot-only check above missed it entirely. (The
+/// `inputs`/`head_ref` checks don't need an equivalent bracket form here:
+/// `contains_field_access(expr, "inputs")` already matches `inputs['foo']`
+/// as a substring with an `inputs` root and a non-identifier boundary right
+/// after it, and `head_ref` is checked below.) `expr` is already
+/// lowercased by the caller, so only lowercase bracket forms need
+/// checking.
 fn is_untrusted_github_context(expr: &str) -> bool {
     contains_field_access(expr, "github.event")
         || expr.contains("github.head_ref")
+        || expr.contains("github['head_ref'")
+        || expr.contains("github[\"head_ref\"")
         || contains_field_access(expr, "inputs")
+        || expr.contains("github['event'")
+        || expr.contains("github[\"event\"")
 }
 
 /// Compiled once (the pattern is a fixed literal, not user input) rather
 /// than on every `yaml_github_actions_workflow_findings` call.
+///
+/// Third-opinion review finding on PR #319: the original `[^}]*?` body
+/// stops at the *first* `}`, so an expression with a single inner brace —
+/// `format('{0}', github.event.issue.title)`, `fromJSON('{"k":1}')` — never
+/// reaches a `\s*\}\}` and the whole interpolation goes unmatched. `(?s).*?`
+/// (non-greedy, `.` matches `\n` too) still stops at the first `}}` it
+/// finds, which is correct: GitHub Actions expressions can't themselves
+/// contain a literal `}}`, so the first one is always the real terminator.
 fn github_interpolation_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\$\{\{\s*([^}]*?)\s*\}\}").expect("valid literal regex"))
+    RE.get_or_init(|| regex::Regex::new(r"(?s)\$\{\{\s*(.*?)\s*\}\}").expect("valid literal regex"))
 }
 
 /// Finds untrusted GitHub Actions context expressions (`${{ github.event...
@@ -121,14 +160,35 @@ fn github_interpolation_regex() -> &'static regex::Regex {
 /// exact scalar node kind) because a `run:` value can be a block scalar
 /// (`run: |`) or a plain/quoted flow scalar (`run: echo ...`) — distinct AST
 /// shapes with the same raw-text danger.
+///
+/// Third-opinion review finding on PR #319: the original query only matched
+/// `block_mapping_pair key: (flow_node (plain_scalar (string_scalar) @key))`
+/// with an `#eq?` predicate against the literal `run` — so `"run":`
+/// (`key: (flow_node (double_quote_scalar))`) and `'run':` (`single_quote_scalar`)
+/// never matched the `plain_scalar` shape and bypassed detection entirely,
+/// and flow-mapping steps (`{ run: 'echo ...' }`, parsed as `flow_pair`
+/// inside `flow_mapping`, never `block_mapping_pair`) weren't matched by
+/// either grammar rule at all. Fixed by matching `key: (_) @key` generically
+/// on both `block_mapping_pair` and `flow_pair` (confirmed against
+/// `tree-sitter-yaml`'s actual parse output for both quoted-key and
+/// flow-mapping forms) and comparing the captured key's text — with
+/// surrounding quotes stripped — in Rust instead of via `#eq?`, which can
+/// only compare a node's literal source text and so can't itself see past
+/// the quote characters.
 pub(super) fn yaml_github_actions_workflow_findings(source: &ParsedSource) -> Vec<Finding> {
     let ts_lang: TsLanguage = tree_sitter_yaml::LANGUAGE.into();
-    let query_src = r#"(block_mapping_pair
-  key: (flow_node (plain_scalar (string_scalar) @key))
-  value: (_) @value
-  (#eq? @key "run"))"#;
-    let Some((query, value_index)) = compile_query_with_capture(&ts_lang, query_src, "value")
-    else {
+    let query_src = r#"
+(block_mapping_pair key: (_) @key value: (_) @value)
+(flow_pair key: (_) @key value: (_) @value)
+"#;
+    let Ok(query) = Query::new(&ts_lang, query_src) else {
+        return vec![];
+    };
+    let capture_names = query.capture_names();
+    let (Some(key_index), Some(value_index)) = (
+        capture_names.iter().position(|n| *n == "key"),
+        capture_names.iter().position(|n| *n == "value"),
+    ) else {
         return vec![];
     };
     let interpolation = github_interpolation_regex();
@@ -138,22 +198,29 @@ pub(super) fn yaml_github_actions_workflow_findings(source: &ParsedSource) -> Ve
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, source.tree.root_node(), content.as_bytes());
     while let Some(m) = matches.next() {
-        for cap in m.captures {
-            if cap.index as usize != value_index {
-                continue;
-            }
-            let Ok(text) = cap.node.utf8_text(content.as_bytes()) else {
-                continue;
-            };
-            let flagged = interpolation
-                .captures_iter(text)
-                .any(|c| is_untrusted_github_context(&c[1].to_lowercase()));
-            if flagged {
-                findings.push(Finding {
-                    rule: "github-actions-workflow",
-                    reason: "untrusted GitHub Actions context expression interpolated directly into a run: step's shell script — the value is substituted into the script text before the shell runs, so attacker-controlled content (an issue/PR title, branch name, etc.) executes as shell code; pass it through env: instead and reference it as a shell variable (e.g. $TITLE)",
-                });
-            }
+        let is_run_key = m
+            .captures
+            .iter()
+            .find(|c| c.index as usize == key_index)
+            .and_then(|c| c.node.utf8_text(content.as_bytes()).ok())
+            .is_some_and(|k| unquote_yaml_scalar(k).eq_ignore_ascii_case("run"));
+        if !is_run_key {
+            continue;
+        }
+        let Some(cap) = m.captures.iter().find(|c| c.index as usize == value_index) else {
+            continue;
+        };
+        let Ok(text) = cap.node.utf8_text(content.as_bytes()) else {
+            continue;
+        };
+        let flagged = interpolation
+            .captures_iter(text)
+            .any(|c| is_untrusted_github_context(&c[1].to_lowercase()));
+        if flagged {
+            findings.push(Finding {
+                rule: "github-actions-workflow",
+                reason: "untrusted GitHub Actions context expression interpolated directly into a run: step's shell script — the value is substituted into the script text before the shell runs, so attacker-controlled content (an issue/PR title, branch name, etc.) executes as shell code; pass it through env: instead and reference it as a shell variable (e.g. $TITLE)",
+            });
         }
     }
     findings
@@ -202,10 +269,19 @@ fn html_script_attrs<'a>(
             .named_child(0)
             .filter(|n| n.kind() == "attribute_name")
             .and_then(|n| n.utf8_text(source.content.as_bytes()).ok());
-        match name {
-            Some("src") => src = html_attribute_value(attr, source),
-            Some("integrity") => has_integrity = true,
-            _ => {}
+        // Third-opinion review finding on PR #319: HTML attribute names are
+        // case-insensitive per spec (confirmed against tree-sitter-html's
+        // actual output — it preserves the source's original case verbatim,
+        // doesn't normalize it), so `<script SRC=... INTEGRITY=...>` has
+        // neither attribute recognized by a lowercase-literal match. An
+        // `integrity` attribute with an empty or missing value supplies no
+        // actual hash to verify against, so it's treated the same as if the
+        // attribute were absent.
+        if name.is_some_and(|n| n.eq_ignore_ascii_case("src")) {
+            src = html_attribute_value(attr, source);
+        } else if name.is_some_and(|n| n.eq_ignore_ascii_case("integrity")) {
+            has_integrity =
+                html_attribute_value(attr, source).is_some_and(|v| !v.trim().is_empty());
         }
     }
     (src, has_integrity)
@@ -217,8 +293,13 @@ fn html_script_attrs<'a>(
 /// `html_script_src_without_sri_findings`'s own cyclomatic complexity under
 /// CodeScene's threshold (adding the protocol-relative check inline pushed
 /// it over).
+///
+/// Third-opinion review finding on PR #319: URL schemes are case-insensitive
+/// (`HTTPS://cdn.example.com/...` is just as external as `https://...`), so
+/// the original exact-prefix check missed any non-lowercase scheme.
 fn is_external_script_src(src: &str) -> bool {
-    src.starts_with("http://") || src.starts_with("https://") || src.starts_with("//")
+    let lower = src.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("//")
 }
 
 /// Finds `<script>` tags with an external `http://`/`https://`/protocol-

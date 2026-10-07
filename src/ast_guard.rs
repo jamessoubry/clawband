@@ -142,7 +142,17 @@ pub fn detect_language(path: &str) -> Option<Lang> {
         "ts" => Some(Lang::TypeScript),
         "tsx" => Some(Lang::Tsx),
         "html" => Some(Lang::Html),
-        "yml" | "yaml" if path.contains(".github/workflows/") => Some(Lang::Yaml),
+        // Third-opinion review finding on PR #319: a backslash-separated
+        // path (`.github\workflows\ci.yml`, as Claude Code's own tool_input
+        // can report on Windows) doesn't contain the forward-slash literal
+        // below, so the workflow rule was silently skipped there. Checking
+        // both separators is cheap and avoids depending on path
+        // normalization happening upstream of this call.
+        "yml" | "yaml"
+            if path.contains(".github/workflows/") || path.contains(".github\\workflows\\") =>
+        {
+            Some(Lang::Yaml)
+        }
         _ => None,
     }
 }
@@ -3348,6 +3358,17 @@ mod tests {
     }
 
     #[test]
+    fn detect_language_scopes_yaml_to_workflows_dir_backslash_path() {
+        // Third-opinion review finding on PR #319: a backslash-separated
+        // path (as Claude Code's tool_input can report on Windows) must
+        // not silently skip the workflow rule.
+        assert!(matches!(
+            detect_language(r".github\workflows\ci.yml"),
+            Some(Lang::Yaml)
+        ));
+    }
+
+    #[test]
     fn yaml_flags_untrusted_interpolation_in_run_block_scalar() {
         let yaml = r#"
 on: issues
@@ -3482,6 +3503,101 @@ jobs:
         );
     }
 
+    #[test]
+    fn yaml_flags_double_quoted_run_key() {
+        // Third-opinion review finding on PR #319: `"run":` parses as
+        // `key: (flow_node (double_quote_scalar))`, not the `plain_scalar`
+        // shape the original query required — bypassing detection entirely.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - "run": echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "a double-quoted run: key must not bypass detection"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_single_quoted_run_key() {
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - 'run': echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "a single-quoted run: key must not bypass detection"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_flow_mapping_run_step() {
+        // Third-opinion review finding on PR #319: a step written as a YAML
+        // flow mapping (`{ run: ... }`) parses as `flow_pair` inside
+        // `flow_mapping`, never `block_mapping_pair` — the original query
+        // only matched the latter.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - { run: 'echo "${{ github.event.issue.title }}"' }
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "a run: step written as a flow mapping must not bypass detection"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_bracket_index_github_event_access() {
+        // Third-opinion review finding on PR #319: GitHub Actions
+        // expressions support index syntax (github['event']) as well as
+        // dot syntax — the literal substring "github.event" never appears
+        // in "github['event']", so the dot-only check missed it.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github['event']['issue']['title'] }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "github['event'] index syntax must be flagged the same as github.event dot syntax"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_interpolation_with_inner_braces() {
+        // Third-opinion review finding on PR #319: the original regex's
+        // `[^}]*?` body stopped at the first `}`, so an expression with a
+        // single inner brace (format('{0}', ...)) never reached a closing
+        // `}}` and the whole interpolation was missed.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - run: echo "${{ format('{0}', github.event.issue.title) }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "an untrusted interpolation with an inner brace in the expression must still be flagged"
+        );
+    }
+
     // ── issue #265: script-src-without-sri (HTML) ───────────────────────
 
     fn has_script_src_without_sri_finding(findings: &[Finding]) -> bool {
@@ -3535,5 +3651,60 @@ jobs:
         let html = r#"<script>console.log("hi");</script>"#;
         let findings = scan(html, Lang::Html);
         assert!(!has_script_src_without_sri_finding(&findings));
+    }
+
+    #[test]
+    fn html_flags_uppercase_src_attribute() {
+        // Third-opinion review finding on PR #319: HTML attribute names are
+        // case-insensitive, but the original check compared against the
+        // lowercase literal "src" only, so an uppercase SRC= attribute
+        // bypassed detection entirely.
+        let html = r#"<script SRC="https://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "an uppercase SRC attribute must not bypass the external-script check"
+        );
+    }
+
+    #[test]
+    fn html_ignores_uppercase_integrity_attribute() {
+        // Companion to the uppercase SRC case: an uppercase INTEGRITY=
+        // attribute must still count as having SRI, not be treated as
+        // absent.
+        let html =
+            r#"<script src="https://cdn.example.com/lib.js" INTEGRITY="sha384-abc123"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            !has_script_src_without_sri_finding(&findings),
+            "an uppercase INTEGRITY attribute with a real hash must count as having SRI"
+        );
+    }
+
+    #[test]
+    fn html_flags_empty_integrity_attribute() {
+        // Third-opinion review finding on PR #319: integrity="" (or a bare
+        // integrity attribute with no value) supplies no actual hash to
+        // verify against, so it must be treated the same as a missing
+        // integrity attribute, not as SRI being present.
+        let html = r#"<script src="https://cdn.example.com/lib.js" integrity=""></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "an empty integrity attribute must not count as having real SRI"
+        );
+    }
+
+    #[test]
+    fn html_flags_uppercase_url_scheme() {
+        // Third-opinion review finding on PR #319: URL schemes are
+        // case-insensitive, but the original prefix check only recognized
+        // lowercase http://https://.
+        let html = r#"<script src="HTTPS://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "an uppercase HTTPS:// scheme must still be recognized as external"
+        );
     }
 }
