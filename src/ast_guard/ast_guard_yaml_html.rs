@@ -43,20 +43,83 @@ fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Strips a single layer of matching `"` or `'` quotes from a YAML scalar's
-/// raw source text (e.g. `"run"` -> `run`, `'run'` -> `run`), leaving a
-/// plain/unquoted scalar's text untouched. Used to compare a `key: (_)`
-/// capture's text against `"run"` regardless of which of YAML's three
-/// equivalent key-quoting styles a workflow author used.
-fn unquote_yaml_scalar(s: &str) -> &str {
-    let t = s.trim();
-    t.strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .or_else(|| {
-            t.strip_prefix('\'')
-                .and_then(|rest| rest.strip_suffix('\''))
-        })
-        .unwrap_or(t)
+/// Decodes a single `\xXX`/`\uXXXX`/`\UXXXXXXXX` escape (or a short table of
+/// fixed single-char escapes) starting right after the backslash in a YAML
+/// double-quoted scalar's raw text, returning the decoded `char` and how
+/// many source bytes (not counting the backslash itself) it consumed.
+/// Unrecognized escapes fall back to the escaped character literally (e.g.
+/// `\q` -> `q`), which is safe here: this is used only to recognize whether
+/// a key decodes to `run`, and under-decoding an obscure escape just means
+/// a (rare) missed match, never a wrong one.
+fn decode_yaml_escape(rest: &str) -> (char, usize) {
+    let hex_escape = |rest: &str, digits: usize| -> Option<(char, usize)> {
+        let hex = rest.get(..digits)?;
+        let code = u32::from_str_radix(hex, 16).ok()?;
+        Some((char::from_u32(code)?, digits))
+    };
+    match rest.chars().next() {
+        Some('x') => hex_escape(&rest[1..], 2).map(|(c, n)| (c, n + 1)),
+        Some('u') => hex_escape(&rest[1..], 4).map(|(c, n)| (c, n + 1)),
+        Some('U') => hex_escape(&rest[1..], 8).map(|(c, n)| (c, n + 1)),
+        Some('n') => Some(('\n', 1)),
+        Some('t') => Some(('\t', 1)),
+        Some('r') => Some(('\r', 1)),
+        Some('0') => Some(('\0', 1)),
+        Some(c) => Some((c, 1)),
+        None => None,
+    }
+    .unwrap_or_else(|| (rest.chars().next().unwrap_or('\\'), 1))
+}
+
+/// Decodes a YAML double-quoted scalar's escape sequences (confirmed via
+/// `tree-sitter-yaml`'s actual node text — a `double_quote_scalar` node's
+/// text is the raw source between and including the quote characters,
+/// escapes un-decoded) into the string it actually represents at the YAML
+/// level.
+///
+/// Third-opinion/Greptile review finding on PR #319: a key written as
+/// `"run"` is the YAML string `run` (the `u` escape decodes to
+/// `u`) but compares unequal to the literal text `run` unless the escapes
+/// are actually decoded — a real bypass of the quoted-key fix added earlier
+/// in this PR, since an attacker who can't use a literal `run` key due to
+/// detection can trivially spell it with an escape instead.
+fn decode_yaml_double_quoted(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let (decoded, consumed) = decode_yaml_escape(&inner[i + 1..]);
+        out.push(decoded);
+        for _ in 0..consumed {
+            chars.next();
+        }
+    }
+    out
+}
+
+/// Returns the YAML-level string value of a `key: (_)` capture's node —
+/// decoding quotes and escapes per YAML's three key-quoting styles (plain,
+/// single-quoted, double-quoted) — so comparing it against `"run"` can't be
+/// bypassed by a quoting or escaping trick a literal-text comparison would
+/// miss. `key_node` is the `flow_node` the query captures; its first named
+/// child is the actual scalar node, whose `kind()` says which style applies.
+fn yaml_scalar_value(key_node: tree_sitter::Node, content: &str) -> Option<String> {
+    let scalar = key_node.named_child(0)?;
+    let raw = scalar.utf8_text(content.as_bytes()).ok()?;
+    match scalar.kind() {
+        "double_quote_scalar" => {
+            let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+            Some(decode_yaml_double_quoted(inner))
+        }
+        "single_quote_scalar" => {
+            let inner = raw.strip_prefix('\'')?.strip_suffix('\'')?;
+            Some(inner.replace("''", "'"))
+        }
+        _ => Some(raw.trim().to_string()),
+    }
 }
 
 /// Returns true if `expr` contains `base` as a real field-access root (e.g.
@@ -202,8 +265,8 @@ pub(super) fn yaml_github_actions_workflow_findings(source: &ParsedSource) -> Ve
             .captures
             .iter()
             .find(|c| c.index as usize == key_index)
-            .and_then(|c| c.node.utf8_text(content.as_bytes()).ok())
-            .is_some_and(|k| unquote_yaml_scalar(k).eq_ignore_ascii_case("run"));
+            .and_then(|c| yaml_scalar_value(c.node, content))
+            .is_some_and(|k| k.eq_ignore_ascii_case("run"));
         if !is_run_key {
             continue;
         }
@@ -249,17 +312,46 @@ fn html_attribute_value<'a>(attr: tree_sitter::Node, source: &ParsedSource<'a>) 
     None
 }
 
+/// `true` if `value` contains at least one well-formed SRI hash token
+/// (`sha256-`/`sha384-`/`sha512-` followed by a non-empty base64-alphabet
+/// hash — multiple space-separated hashes are valid per the SRI spec; a
+/// browser uses whichever one it supports). Greptile review finding on PR
+/// #319: the original check only asked "is this attribute's value
+/// non-empty", so `integrity="garbage"` counted as protection despite
+/// supplying no real hash for the browser to verify against.
+fn is_valid_sri_hash(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        ["sha256-", "sha384-", "sha512-"].iter().any(|prefix| {
+            token
+                .strip_prefix(prefix)
+                .is_some_and(|hash| !hash.is_empty())
+        })
+    })
+}
+
 /// Walks a `<script>` tag's `start_tag` node for its `src` and `integrity`
 /// attributes — split out of `html_script_src_without_sri_findings` purely
 /// to keep that function's own cyclomatic/nesting complexity down; the
 /// query itself can't express "has attribute X but lacks attribute Y"
 /// directly, same shape as `python_yaml_load_findings`'s `Loader=` check.
+///
+/// Greptile review finding on PR #319: a tag with a *duplicate* `src` or
+/// `integrity` attribute was resolved to the *last* occurrence here, but
+/// HTML parsing keeps the *first* and ignores later duplicates outright
+/// (confirmed against actual browser behavior) — so a page with a safe
+/// first `integrity=""` followed by a second, real-looking
+/// `integrity="sha384-..."` was flagged as safe by this function while a
+/// real browser still treats the script as having no integrity check at
+/// all (and vice versa for `src`). Only the first occurrence of each
+/// attribute is honored below, matching that semantics exactly.
 fn html_script_attrs<'a>(
     start_tag: tree_sitter::Node,
     source: &ParsedSource<'a>,
 ) -> (Option<&'a str>, bool) {
     let mut src = None;
-    let mut has_integrity = false;
+    let mut src_seen = false;
+    let mut integrity_value = None;
+    let mut integrity_seen = false;
     let mut c = start_tag.walk();
     for attr in start_tag.named_children(&mut c) {
         if attr.kind() != "attribute" {
@@ -273,17 +365,18 @@ fn html_script_attrs<'a>(
         // case-insensitive per spec (confirmed against tree-sitter-html's
         // actual output — it preserves the source's original case verbatim,
         // doesn't normalize it), so `<script SRC=... INTEGRITY=...>` has
-        // neither attribute recognized by a lowercase-literal match. An
-        // `integrity` attribute with an empty or missing value supplies no
-        // actual hash to verify against, so it's treated the same as if the
-        // attribute were absent.
+        // neither attribute recognized by a lowercase-literal match.
         if name.is_some_and(|n| n.eq_ignore_ascii_case("src")) {
-            src = html_attribute_value(attr, source);
-        } else if name.is_some_and(|n| n.eq_ignore_ascii_case("integrity")) {
-            has_integrity =
-                html_attribute_value(attr, source).is_some_and(|v| !v.trim().is_empty());
+            if !src_seen {
+                src = html_attribute_value(attr, source);
+                src_seen = true;
+            }
+        } else if name.is_some_and(|n| n.eq_ignore_ascii_case("integrity")) && !integrity_seen {
+            integrity_value = html_attribute_value(attr, source);
+            integrity_seen = true;
         }
     }
+    let has_integrity = integrity_value.is_some_and(is_valid_sri_hash);
     (src, has_integrity)
 }
 
@@ -297,9 +390,65 @@ fn html_script_attrs<'a>(
 /// Third-opinion review finding on PR #319: URL schemes are case-insensitive
 /// (`HTTPS://cdn.example.com/...` is just as external as `https://...`), so
 /// the original exact-prefix check missed any non-lowercase scheme.
+///
+/// Greptile review finding on PR #319: `tree-sitter-html` returns an
+/// attribute value's *raw* source text, HTML character references
+/// un-decoded — `src="https&#58;//cdn.example.com/lib.js"` is, once a
+/// browser decodes `&#58;` to `:`, the exact same external HTTPS URL as the
+/// plain-spelled version, but the undecoded text doesn't start with
+/// `https://` and bypassed the check entirely. Decoded here before the
+/// prefix check so the two spellings are treated identically.
 fn is_external_script_src(src: &str) -> bool {
-    let lower = src.to_ascii_lowercase();
+    let decoded = decode_html_char_refs(src);
+    let lower = decoded.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("//")
+}
+
+/// Decodes HTML character references (`&#58;`, `&#x3A;`, and the five
+/// standard named entities) in `s` — the subset of HTML's character
+/// reference grammar relevant to URL scheme spoofing (a reference inside a
+/// `src` attribute decoding to `:` or `/`). Unrecognized/malformed
+/// references are left as-is rather than guessed at.
+fn decode_html_char_refs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after_amp = &rest[amp + 1..];
+        let Some(semi) = after_amp.find(';') else {
+            out.push('&');
+            rest = after_amp;
+            continue;
+        };
+        let entity = &after_amp[..semi];
+        let decoded_char = if let Some(numeric) = entity.strip_prefix('#') {
+            if let Some(hex) = numeric.strip_prefix('x').or(numeric.strip_prefix('X')) {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else {
+                numeric.parse::<u32>().ok().and_then(char::from_u32)
+            }
+        } else {
+            match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => None,
+            }
+        };
+        match decoded_char {
+            Some(c) => out.push(c),
+            None => {
+                out.push('&');
+                out.push_str(entity);
+                out.push(';');
+            }
+        }
+        rest = &after_amp[semi + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Finds `<script>` tags with an external `http://`/`https://`/protocol-

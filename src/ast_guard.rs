@@ -141,7 +141,9 @@ pub fn detect_language(path: &str) -> Option<Lang> {
         "js" | "mjs" | "cjs" | "jsx" => Some(Lang::JavaScript),
         "ts" => Some(Lang::TypeScript),
         "tsx" => Some(Lang::Tsx),
-        "html" => Some(Lang::Html),
+        // Greptile review finding on PR #319: ".htm" is an equally common
+        // real-world HTML extension that this rule silently skipped.
+        "html" | "htm" => Some(Lang::Html),
         // Third-opinion review finding on PR #319: a backslash-separated
         // path (`.github\workflows\ci.yml`, as Claude Code's own tool_input
         // can report on Windows) doesn't contain the forward-slash literal
@@ -3598,6 +3600,28 @@ jobs:
         );
     }
 
+    #[test]
+    fn yaml_flags_escaped_run_key() {
+        // Greptile review finding on PR #319: a double-quoted key can spell
+        // "run" using a \u escape (u decodes to 'u') instead of the
+        // literal characters — YAML decodes this to the string "run" at
+        // parse time, so a literal-text comparison against the quoted
+        // key's raw source bypassed the quoted-key fix added earlier in
+        // this PR.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - "run": echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "a run: key spelled with a YAML \\u escape must not bypass detection"
+        );
+    }
+
     // ── issue #265: script-src-without-sri (HTML) ───────────────────────
 
     fn has_script_src_without_sri_finding(findings: &[Finding]) -> bool {
@@ -3706,5 +3730,75 @@ jobs:
             has_script_src_without_sri_finding(&findings),
             "an uppercase HTTPS:// scheme must still be recognized as external"
         );
+    }
+
+    #[test]
+    fn html_flags_html_entity_encoded_scheme() {
+        // Greptile review finding on PR #319: tree-sitter-html returns an
+        // attribute value's raw, undecoded source text — src="https&#58;//..."
+        // decodes (per the HTML character-reference spec, and confirmed
+        // against actual browser behavior) to the same https:// URL as the
+        // plain-spelled version, but the undecoded text doesn't start with
+        // "https://" and bypassed the check.
+        let html = r#"<script src="https&#58;//cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "an HTML-entity-encoded https:// scheme must still be recognized as external"
+        );
+    }
+
+    #[test]
+    fn html_ignores_duplicate_src_keeping_first_local_value() {
+        // Greptile review finding on PR #319: a duplicate src attribute
+        // was resolved to the *last* occurrence, but HTML parsing (and
+        // real browsers) use the *first* and ignore later duplicates
+        // outright — so a safe first local src followed by a second,
+        // external-looking src was wrongly flagged.
+        let html = r#"<script src="/local/app.js" src="https://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            !has_script_src_without_sri_finding(&findings),
+            "the first (local) src attribute must win over a later duplicate, matching real HTML parsing"
+        );
+    }
+
+    #[test]
+    fn html_flags_duplicate_integrity_keeping_first_empty_value() {
+        // Companion to the above: a first integrity="" followed by a
+        // second, real-looking integrity="sha384-..." must still count as
+        // having no SRI, since a real browser ignores the second
+        // duplicate and uses the first (empty) value.
+        let html = r#"<script src="https://cdn.example.com/lib.js" integrity="" integrity="sha384-abc123"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "the first (empty) integrity attribute must win over a later duplicate, matching real HTML parsing"
+        );
+    }
+
+    #[test]
+    fn html_flags_malformed_integrity_hash() {
+        // Greptile review finding on PR #319: the original check only
+        // asked whether the integrity attribute's value was non-empty —
+        // integrity="garbage" supplies no real hash but counted as
+        // protection.
+        let html = r#"<script src="https://cdn.example.com/lib.js" integrity="garbage"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "a malformed (non-SRI-shaped) integrity value must not count as real protection"
+        );
+    }
+
+    #[test]
+    fn html_flags_external_script_without_integrity_htm_extension() {
+        // Greptile review finding on PR #319: language detection only
+        // matched ".html", silently skipping the equally common ".htm"
+        // extension.
+        assert!(matches!(detect_language("page.htm"), Some(Lang::Html)));
+        let html = r#"<script src="https://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(has_script_src_without_sri_finding(&findings));
     }
 }
