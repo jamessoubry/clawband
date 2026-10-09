@@ -1538,6 +1538,40 @@ fn e2e_log_redacts_secrets_from_command_preview() {
 }
 
 #[test]
+fn e2e_log_line_includes_version_field() {
+    // Issue #276: each ~/.clawband.log line must record the clawband version
+    // right after the timestamp and before the decision, e.g.
+    // "[<ts>] v3.14.0 DENY | <reason> | <command>".
+    use std::fs;
+    let home = std::env::temp_dir().join(format!("cb_log_version_e2e_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let h = home.to_str().unwrap();
+
+    let out = run(
+        &bash("docker system prune"),
+        &[("HOME", h), ("CLAWBAND_LOG", "1")],
+    );
+    assert_eq!(decision(&out), Some("deny"));
+
+    let log_path = home.join(".clawband.log");
+    let log_contents = fs::read_to_string(&log_path).expect("log file should exist");
+    let expected_version_token = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let line = log_contents.lines().next().expect("log should have a line");
+    let after_ts = line
+        .split(']')
+        .nth(1)
+        .expect("line should contain a timestamp bracket")
+        .trim_start();
+    assert!(
+        after_ts.starts_with(&format!("{expected_version_token} DENY")),
+        "expected version immediately after timestamp and before decision, got: {line}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn e2e_version_flag() {
     let out = run("", &[]); // stdin unused for --version path; invoke separately
     let _ = out;

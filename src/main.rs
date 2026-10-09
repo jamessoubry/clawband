@@ -629,8 +629,9 @@ fn log_action(decision: &str, reason: &str, command: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().append(true).create(true).open(path) {
         let _ = writeln!(
             f,
-            "[{}] {} | {} | {}",
+            "[{}] v{} {} | {} | {}",
             ts,
+            env!("CARGO_PKG_VERSION"),
             decision.to_uppercase(),
             reason,
             cmd_preview
@@ -12480,6 +12481,43 @@ mod tests {
         );
 
         // Cleanup
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn log_action_includes_version_field() {
+        // Issue #276: each logged line must record the clawband version right
+        // after the timestamp and before the decision, e.g.
+        // "[<ts>] v3.14.0 DENY | <reason> | <command>".
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("cb_log_version_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+
+        with_fake_home(&home, || {
+            log_action("deny", "some reason", "some command");
+        });
+
+        let log = home.join(".clawband.log");
+        let contents = fs::read_to_string(&log).expect("log file should exist");
+        let expected_version_token = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            contents.contains(&expected_version_token),
+            "log line should contain version token {expected_version_token}: {contents}"
+        );
+
+        // Version must sit right after the timestamp and before the decision.
+        let line = contents.lines().next().expect("log should have a line");
+        let after_ts = line
+            .split(']')
+            .nth(1)
+            .expect("line should contain a timestamp bracket")
+            .trim_start();
+        assert!(
+            after_ts.starts_with(&format!("{expected_version_token} DENY")),
+            "expected version immediately after timestamp and before decision, got: {line}"
+        );
+
         let _ = fs::remove_dir_all(&home);
     }
 
