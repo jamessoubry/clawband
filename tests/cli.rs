@@ -6083,3 +6083,54 @@ fn e2e_introspection_lookalike_binary_not_exempted() {
         "look-alike binary name must not be exempted: {out}"
     );
 }
+
+// ── issue #265: github-actions-workflow (YAML) ─────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_github_actions_untrusted_interpolation_in_run() {
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":".github/workflows/ci.yml","content":"on: issues\njobs:\n  build:\n    steps:\n      - run: echo \"${{ github.event.issue.title }}\"\n"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("github-actions-workflow"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_github_actions_value_passed_through_env() {
+    // The documented-safe fix: the untrusted value goes through env: first
+    // and run: only ever references it as a shell variable.
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":".github/workflows/ci.yml","content":"on: issues\njobs:\n  build:\n    steps:\n      - env:\n          TITLE: ${{ github.event.issue.title }}\n        run: echo \"$TITLE\"\n"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_yaml_outside_workflows_dir() {
+    // A .yml file outside .github/workflows/ is out of scope for this rule.
+    let json = r##"{"tool_name":"Write","tool_input":{"file_path":"docker-compose.yml","content":"jobs:\n  build:\n    steps:\n      - run: echo \"${{ github.event.issue.title }}\"\n"}}"##;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+// ── issue #265: script-src-without-sri (HTML) ──────────────────────────────
+
+#[test]
+fn e2e_ast_guard_flags_html_script_src_without_sri() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.html","content":"<script src=\"https://cdn.example.com/lib.js\"></script>"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), Some("ask"), "{out}");
+    assert!(out.contains("script-src-without-sri"), "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_html_script_src_with_integrity() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.html","content":"<script src=\"https://cdn.example.com/lib.js\" integrity=\"sha384-abc123\"></script>"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}
+
+#[test]
+fn e2e_ast_guard_ignores_html_script_local_src() {
+    let json = r#"{"tool_name":"Write","tool_input":{"file_path":"a.html","content":"<script src=\"/js/app.js\"></script>"}}"#;
+    let out = run(json, &[]);
+    assert_eq!(decision(&out), None, "{out}");
+}

@@ -21,6 +21,11 @@
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor};
 
+mod ast_guard_yaml_html;
+use ast_guard_yaml_html::{
+    html_script_src_without_sri_findings, yaml_github_actions_workflow_findings, ParsedSource,
+};
+
 /// Shared XXE reason string — used both by the pre-narrowing doc trail and
 /// by `python_xxe_findings`'s post-match walk (issue #261 review round).
 const XXE_REASON: &str = "XML external entity (XXE) injection — this call is explicitly configured to resolve external entities/DTDs, which can read local files or trigger SSRF/DoS; use defusedxml instead of a custom unsafe parser configuration";
@@ -108,6 +113,21 @@ pub enum Lang {
     /// `dangerouslySetInnerHTML` is genuinely unreachable there and not just
     /// unlikely to match syntactically.
     Tsx,
+    /// `.yml` / `.yaml` under a `.github/workflows/` directory only (issue
+    /// #265) — `github-actions-workflow` (untrusted GitHub Actions context
+    /// expression, e.g. `${{ github.event.issue.title }}`, interpolated
+    /// directly into a `run:` step's shell script body; the classic
+    /// command-injection pattern documented in GitHub's own security
+    /// hardening guide). Deliberately scoped to workflow files only, not
+    /// every `.yml`/`.yaml` in a repo — this rule is specific to GitHub
+    /// Actions' `${{ }}` expression syntax and job-step shape, not a general
+    /// YAML content check.
+    Yaml,
+    /// `.html` — `script-src-without-sri` (a `<script>` tag with an external
+    /// `http://`/`https://` `src` attribute but no `integrity` attribute,
+    /// i.e. missing Subresource Integrity — a local/relative `src` is exempt
+    /// since SRI only applies to externally-hosted scripts).
+    Html,
 }
 
 /// Extensions this module can parse. Anything else returns `None` and the
@@ -121,6 +141,20 @@ pub fn detect_language(path: &str) -> Option<Lang> {
         "js" | "mjs" | "cjs" | "jsx" => Some(Lang::JavaScript),
         "ts" => Some(Lang::TypeScript),
         "tsx" => Some(Lang::Tsx),
+        // Greptile review finding on PR #319: ".htm" is an equally common
+        // real-world HTML extension that this rule silently skipped.
+        "html" | "htm" => Some(Lang::Html),
+        // Third-opinion review finding on PR #319: a backslash-separated
+        // path (`.github\workflows\ci.yml`, as Claude Code's own tool_input
+        // can report on Windows) doesn't contain the forward-slash literal
+        // below, so the workflow rule was silently skipped there. Checking
+        // both separators is cheap and avoids depending on path
+        // normalization happening upstream of this call.
+        "yml" | "yaml"
+            if path.contains(".github/workflows/") || path.contains(".github\\workflows\\") =>
+        {
+            Some(Lang::Yaml)
+        }
         _ => None,
     }
 }
@@ -132,6 +166,8 @@ fn ts_language(lang: &Lang) -> TsLanguage {
         Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        Lang::Html => tree_sitter_html::LANGUAGE.into(),
     }
 }
 
@@ -168,28 +204,46 @@ fn ts_language(lang: &Lang) -> TsLanguage {
 /// #261's PR). `python_xxe_findings` is the same "post-match walk over the
 /// argument list" shape, used to require an explicit unsafe-configuration
 /// indicator before flagging XXE-prone XML parsing (see its doc comment).
+const SHELL_INVOKING_REASON: &str = "shell-invoking call — if any part of the command/argument is not a fixed literal, this is a command-injection surface; prefer exec'ing the program directly with an argv array";
+const INSECURE_DESERIALIZE_REASON: &str = "insecure deserialization — this API can execute arbitrary code embedded in its input; if the input isn't fully trusted, use a data-only parser instead";
+const TLS_VERIFY_DISABLED_REASON: &str = "TLS certificate verification disabled — this accepts connections to servers with invalid/self-signed/expired certificates, defeating TLS's protection against MITM; should not ship to production";
+
+// (rule_name, query, reason)
+//
+// IMPORTANT — predicate placement: `#eq?`/`#match?` predicates must be
+// written INSIDE the closing paren of the pattern node they scope to,
+// not after it. Placing them after (as a sibling of the top-level
+// pattern) silently turns them into unrelated, effectively-unconstrained
+// top-level patterns of their own — the query still compiles, but the
+// predicates are never actually applied, and the "structural" match
+// fires on any node satisfying the bare shape. Verified empirically
+// while building the shell-invoking-subprocess rule (issue #253): a
+// predicate-after-the-paren query matched 176 unrelated nodes in a
+// one-line test file. Every query below has been tested this way
+// (correct predicate placement, both true- and false-positive cases)
+// before being committed — see the PR description for the verification
+// matrix rather than re-deriving it from scratch when adding a new rule.
 fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
-    // (rule_name, query, reason)
-    //
-    // IMPORTANT — predicate placement: `#eq?`/`#match?` predicates must be
-    // written INSIDE the closing paren of the pattern node they scope to,
-    // not after it. Placing them after (as a sibling of the top-level
-    // pattern) silently turns them into unrelated, effectively-unconstrained
-    // top-level patterns of their own — the query still compiles, but the
-    // predicates are never actually applied, and the "structural" match
-    // fires on any node satisfying the bare shape. Verified empirically
-    // while building the shell-invoking-subprocess rule (issue #253): a
-    // predicate-after-the-paren query matched 176 unrelated nodes in a
-    // one-line test file. Every query below has been tested this way
-    // (correct predicate placement, both true- and false-positive cases)
-    // before being committed — see the PR description for the verification
-    // matrix rather than re-deriving it from scratch when adding a new rule.
-    let shell_invoking_reason = "shell-invoking call — if any part of the command/argument is not a fixed literal, this is a command-injection surface; prefer exec'ing the program directly with an argv array";
-    let insecure_deserialize_reason = "insecure deserialization — this API can execute arbitrary code embedded in its input; if the input isn't fully trusted, use a data-only parser instead";
-    let tls_verify_disabled_reason = "TLS certificate verification disabled — this accepts connections to servers with invalid/self-signed/expired certificates, defeating TLS's protection against MITM; should not ship to production";
     match lang {
-        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
-            let mut rules = vec![
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => javascript_rules(lang),
+        Lang::Python => python_rules(),
+        // Both are post-match-walk rules (see `post_match_walk_findings`),
+        // not plain query tuples.
+        Lang::Yaml | Lang::Html => vec![],
+        Lang::Rust => rust_rules(),
+    }
+}
+
+fn javascript_rules(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut rules = javascript_eval_rules();
+    rules.extend(javascript_injection_rules());
+    rules.extend(javascript_xss_rules(lang));
+    rules.extend(javascript_crypto_rules());
+    rules
+}
+
+fn javascript_eval_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
                 (
                     "dynamic-eval",
                     // Two distinct grammar shapes for the same danger:
@@ -278,32 +332,67 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @method "Function"))"#,
                     "dynamic code execution (eval/Function constructor) — can run attacker-controlled strings as code",
                 ),
-                (
-                    "shell-invoking-subprocess",
-                    r#"(call_expression
+    ]
+}
+
+fn javascript_injection_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "shell-invoking-subprocess",
+            r#"(call_expression
   function: (member_expression
     property: (property_identifier) @method)
   (#match? @method "^(exec|execSync)$"))"#,
-                    shell_invoking_reason,
-                ),
-                (
-                    "insecure-deserialize",
-                    r#"(call_expression
+            SHELL_INVOKING_REASON,
+        ),
+        (
+            "insecure-deserialize",
+            r#"(call_expression
   function: (member_expression
     object: (identifier) @obj
     property: (property_identifier) @method)
   (#eq? @obj "vm")
   (#match? @method "^(runInNewContext|runInThisContext|runInContext)$"))"#,
-                    insecure_deserialize_reason,
-                ),
-                (
-                    "tls-verify-disabled",
-                    r#"(pair
+            INSECURE_DESERIALIZE_REASON,
+        ),
+        (
+            "tls-verify-disabled",
+            r#"(pair
   key: (property_identifier) @key
   value: (false)
   (#eq? @key "rejectUnauthorized"))"#,
-                    tls_verify_disabled_reason,
-                ),
+            TLS_VERIFY_DISABLED_REASON,
+        ),
+    ]
+}
+
+fn javascript_xss_rules(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut rules = javascript_xss_html_assignment_rules();
+    rules.extend(javascript_xss_write_rules());
+    // `dangerouslySetInnerHTML` is a JSX attribute — a grammar
+    // construct that only `Lang::JavaScript` (default
+    // `tree-sitter-javascript` grammar, which parses JSX out of the
+    // box) and `Lang::Tsx` (dedicated `LANGUAGE_TSX` grammar) can
+    // even syntactically contain. Plain `Lang::TypeScript`'s
+    // `LANGUAGE_TYPESCRIPT` grammar has no `jsx_attribute` node kind
+    // at all, so including this query there would make `Query::new`
+    // fail (harmlessly skipped by `scan()`'s `Err(_) => continue`) —
+    // excluded here instead so the rule list documents what's
+    // actually reachable per-language rather than relying on that
+    // fallback. See `Lang::Tsx`'s doc comment for the empirical
+    // grammar-support check.
+    if !matches!(lang, Lang::TypeScript) {
+        rules.push((
+                    "xss-sink",
+                    r#"(jsx_attribute (property_identifier) @name (#eq? @name "dangerouslySetInnerHTML"))"#,
+                    "cross-site scripting (XSS) sink — React's dangerouslySetInnerHTML renders its __html value as raw HTML, executing attacker-controlled markup/script if the value isn't fully trusted; sanitize with a library like DOMPurify or avoid raw HTML rendering",
+                ));
+    }
+    rules
+}
+
+fn javascript_xss_html_assignment_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
                 (
                     "xss-sink",
                     r#"(assignment_expression
@@ -366,6 +455,11 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @prop "outerHTML"))"#,
                     "cross-site scripting (XSS) sink — compound-assigning (+=) to outerHTML is equivalent to innerHTML for XSS purposes; use textContent or sanitize with a library like DOMPurify",
                 ),
+    ]
+}
+
+fn javascript_xss_write_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
                 (
                     "xss-sink",
                     // Covers both `el.insertAdjacentHTML(...)` (dot access,
@@ -458,44 +552,29 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @method "write"))"#,
                     "cross-site scripting (XSS) sink — window.document.write() with untrusted content injects and executes attacker-controlled HTML/script; use safe DOM methods like createElement()/appendChild() instead",
                 ),
-            ];
-            // `dangerouslySetInnerHTML` is a JSX attribute — a grammar
-            // construct that only `Lang::JavaScript` (default
-            // `tree-sitter-javascript` grammar, which parses JSX out of the
-            // box) and `Lang::Tsx` (dedicated `LANGUAGE_TSX` grammar) can
-            // even syntactically contain. Plain `Lang::TypeScript`'s
-            // `LANGUAGE_TYPESCRIPT` grammar has no `jsx_attribute` node kind
-            // at all, so including this query there would make `Query::new`
-            // fail (harmlessly skipped by `scan()`'s `Err(_) => continue`) —
-            // excluded here instead so the rule list documents what's
-            // actually reachable per-language rather than relying on that
-            // fallback. See `Lang::Tsx`'s doc comment for the empirical
-            // grammar-support check.
-            if !matches!(lang, Lang::TypeScript) {
-                rules.push((
-                    "xss-sink",
-                    r#"(jsx_attribute (property_identifier) @name (#eq? @name "dangerouslySetInnerHTML"))"#,
-                    "cross-site scripting (XSS) sink — React's dangerouslySetInnerHTML renders its __html value as raw HTML, executing attacker-controlled markup/script if the value isn't fully trusted; sanitize with a library like DOMPurify or avoid raw HTML rendering",
-                ));
-            }
-            // insecure-crypto (issue #264): `crypto.createCipher(...)` /
-            // `crypto.createDecipher(...)` (Node) — removed entirely in
-            // Node 22, and even where still available they derive the key
-            // from the passphrase with a single unsalted MD5 hash instead
-            // of a proper KDF, and (for createCipher) always use a fixed/
-            // zero IV — both a weak-key-derivation and IV-reuse problem.
-            // Deliberately scoped to the `crypto.` member-expression form
-            // only (mirrors the `vm.runInNewContext` scoping above); the
-            // string-literal cipher-algorithm form (e.g. `"aes-128-ecb"`
-            // passed to `crypto.createCipheriv`) is a string *value*, not a
-            // code *structure*, and is intentionally left unflagged here —
-            // no other clawband layer (regex or otherwise) currently covers
-            // it either, so this is a known, accepted gap, not a
-            // fallback-covered one; see the issue #264 discussion for why
-            // AST matching is a poor fit for flagging string contents rather
-            // than syntax shapes.
-            rules.push((
+    ]
+}
+
+fn javascript_crypto_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![(
                 "insecure-crypto",
+                // insecure-crypto (issue #264): `crypto.createCipher(...)` /
+                // `crypto.createDecipher(...)` (Node) — removed entirely in
+                // Node 22, and even where still available they derive the key
+                // from the passphrase with a single unsalted MD5 hash instead
+                // of a proper KDF, and (for createCipher) always use a fixed/
+                // zero IV — both a weak-key-derivation and IV-reuse problem.
+                // Deliberately scoped to the `crypto.` member-expression form
+                // only (mirrors the `vm.runInNewContext` scoping above); the
+                // string-literal cipher-algorithm form (e.g. `"aes-128-ecb"`
+                // passed to `crypto.createCipheriv`) is a string *value*, not a
+                // code *structure*, and is intentionally left unflagged here —
+                // no other clawband layer (regex or otherwise) currently covers
+                // it either, so this is a known, accepted gap, not a
+                // fallback-covered one; see the issue #264 discussion for why
+                // AST matching is a poor fit for flagging string contents rather
+                // than syntax shapes.
+                //
                 // Covers both `crypto.createCipher(...)` (dot access,
                 // `member_expression`) and `crypto["createCipher"](...)`
                 // (computed/bracket access, `subscript_expression` — see the
@@ -514,10 +593,19 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @obj "crypto")
   (#match? @method "^(createCipher|createDecipher)$"))"#,
                 "insecure key derivation — crypto.createCipher()/createDecipher() derive the key from the passphrase with a single unsalted hash and were removed in Node 22; use crypto.createCipheriv()/createDecipheriv() with an explicit, properly-derived key and a random IV instead",
-            ));
-            rules
-        }
-        Lang::Python => vec![
+            )]
+}
+
+fn python_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut rules = python_eval_shell_rules();
+    rules.extend(python_deserialize_rules());
+    rules.extend(python_tls_rules());
+    rules.extend(python_crypto_rules());
+    rules
+}
+
+fn python_eval_shell_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
             (
                 "dynamic-eval",
                 r#"(call function: (identifier) @fn (#match? @fn "^(eval|exec)$"))"#,
@@ -536,7 +624,7 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @obj "subprocess")
   (#match? @method "^(run|call|Popen|check_call|check_output)$")
   (#eq? @kw "shell"))"#,
-                shell_invoking_reason,
+                SHELL_INVOKING_REASON,
             ),
             (
                 "shell-invoking-subprocess",
@@ -548,155 +636,184 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#match? @method "^(system|popen)$"))"#,
                 "shell-invoking call — os.system()/os.popen() always run through a shell; if any part of the command is not a fixed literal, this is a command-injection surface",
             ),
-            (
-                "insecure-deserialize",
-                r#"(call
+    ]
+}
+
+fn python_deserialize_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut rules = python_pickle_deserialize_rules();
+    rules.extend(python_other_deserialize_rules());
+    rules
+}
+
+fn python_pickle_deserialize_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    let insecure_deserialize_reason = INSECURE_DESERIALIZE_REASON;
+    vec![
+        (
+            "insecure-deserialize",
+            r#"(call
   function: (attribute
     object: (identifier) @obj
     attribute: (identifier) @method)
   (#eq? @obj "pickle")
   (#match? @method "^(load|loads)$"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
+            insecure_deserialize_reason,
+        ),
+        (
+            "insecure-deserialize",
+            r#"(call
   function: (attribute
     object: (identifier) @obj
     attribute: (identifier) @method)
   (#eq? @obj "marshal")
   (#eq? @method "loads"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
+            insecure_deserialize_reason,
+        ),
+        (
+            "insecure-deserialize",
+            r#"(call
   function: (attribute
     object: (identifier) @obj
     attribute: (identifier) @method)
   (#eq? @obj "pickle")
   (#eq? @method "Unpickler"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
+            insecure_deserialize_reason,
+        ),
+        (
+            "insecure-deserialize",
+            r#"(call
   function: (attribute
     object: (identifier) @obj
     attribute: (identifier) @method)
   (#match? @obj "^(cPickle|cloudpickle|dill)$")
   (#match? @method "^(load|loads)$"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
-  function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method)
-  (#eq? @obj "shelve")
-  (#eq? @method "open"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
-  function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method)
-  (#eq? @obj "yaml")
-  (#eq? @method "unsafe_load"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
+            insecure_deserialize_reason,
+        ),
+        (
+            "insecure-deserialize",
+            r#"(call
   function: (attribute
     object: (identifier) @obj
     attribute: (identifier) @method)
   (#eq? @obj "joblib")
   (#eq? @method "load"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "insecure-deserialize",
-                r#"(call
+            insecure_deserialize_reason,
+        ),
+        (
+            "insecure-deserialize",
+            r#"(call
   function: (attribute
     object: (identifier) @obj
     attribute: (identifier) @method)
   (#match? @obj "^(pandas|pd)$")
   (#eq? @method "read_pickle"))"#,
-                insecure_deserialize_reason,
-            ),
-            (
-                "tls-verify-disabled",
-                r#"(call
+            insecure_deserialize_reason,
+        ),
+    ]
+}
+
+fn python_other_deserialize_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    let insecure_deserialize_reason = INSECURE_DESERIALIZE_REASON;
+    vec![
+        (
+            "insecure-deserialize",
+            r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  (#eq? @obj "shelve")
+  (#eq? @method "open"))"#,
+            insecure_deserialize_reason,
+        ),
+        (
+            "insecure-deserialize",
+            r#"(call
+  function: (attribute
+    object: (identifier) @obj
+    attribute: (identifier) @method)
+  (#eq? @obj "yaml")
+  (#eq? @method "unsafe_load"))"#,
+            insecure_deserialize_reason,
+        ),
+    ]
+}
+
+fn python_tls_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    let tls_verify_disabled_reason = TLS_VERIFY_DISABLED_REASON;
+    vec![
+        (
+            "tls-verify-disabled",
+            r#"(call
   arguments: (argument_list
     (keyword_argument
       name: (identifier) @kw
       value: (false)))
   (#eq? @kw "verify"))"#,
-                tls_verify_disabled_reason,
-            ),
-            (
-                "tls-verify-disabled",
-                // `ssl._create_unverified_context()` — a call expression, a
-                // different AST shape from the `verify=False` keyword-arg
-                // rule above (issue #264). Scoped to the `ssl.` module
-                // qualifier and this exact function name, mirroring how
-                // `os.system`/`os.popen` above are scoped to `os.` — this is
-                // the documented, deliberate way to disable TLS verification
-                // via the stdlib `ssl` module (as opposed to a merely
-                // similarly-named function on an unrelated object).
-                r#"(call
+            tls_verify_disabled_reason,
+        ),
+        (
+            "tls-verify-disabled",
+            // `ssl._create_unverified_context()` — a call expression, a
+            // different AST shape from the `verify=False` keyword-arg
+            // rule above (issue #264). Scoped to the `ssl.` module
+            // qualifier and this exact function name, mirroring how
+            // `os.system`/`os.popen` above are scoped to `os.` — this is
+            // the documented, deliberate way to disable TLS verification
+            // via the stdlib `ssl` module (as opposed to a merely
+            // similarly-named function on an unrelated object).
+            r#"(call
   function: (attribute
     object: (identifier) @obj
     attribute: (identifier) @method)
   (#eq? @obj "ssl")
   (#eq? @method "_create_unverified_context"))"#,
-                tls_verify_disabled_reason,
-            ),
-            (
-                "tls-verify-disabled",
-                // `check_hostname=False` — same keyword-argument shape as
-                // `verify=False` above but a different keyword name; this
-                // disables hostname verification on an `ssl.SSLContext`
-                // (commonly paired with `_create_unverified_context`, but
-                // also settable directly on a context instance, hence not
-                // restricted to a specific callee — mirrors how the
-                // `verify=False` rule above intentionally doesn't restrict
-                // by callee either, since `requests`-style APIs are called
-                // in too many different ways to enumerate).
-                r#"(call
+            tls_verify_disabled_reason,
+        ),
+        (
+            "tls-verify-disabled",
+            // `check_hostname=False` — same keyword-argument shape as
+            // `verify=False` above but a different keyword name; this
+            // disables hostname verification on an `ssl.SSLContext`
+            // (commonly paired with `_create_unverified_context`, but
+            // also settable directly on a context instance, hence not
+            // restricted to a specific callee — mirrors how the
+            // `verify=False` rule above intentionally doesn't restrict
+            // by callee either, since `requests`-style APIs are called
+            // in too many different ways to enumerate).
+            r#"(call
   arguments: (argument_list
     (keyword_argument
       name: (identifier) @kw
       value: (false)))
   (#eq? @kw "check_hostname"))"#,
-                tls_verify_disabled_reason,
-            ),
-            (
-                "tls-verify-disabled",
-                // `ctx.check_hostname = False` — attribute *assignment*, a
-                // different AST shape (Python's `assignment` node, with an
-                // `attribute` node as its `left` field) from the
-                // `check_hostname=False` *keyword-argument* rule immediately
-                // above (Greptile review round, PR #305/issue #264): setting
-                // the attribute directly on an already-constructed
-                // `ssl.SSLContext` instance is an equally common and equally
-                // dangerous way to disable hostname verification, and was
-                // passing through undetected. Left unscoped by object name
-                // (matches any `.check_hostname` attribute assignment), same
-                // reasoning as the keyword-arg rule above: SSLContext
-                // instances are constructed and named in too many different
-                // ways to enumerate a fixed set of object names.
-                r#"(assignment
+            tls_verify_disabled_reason,
+        ),
+        (
+            "tls-verify-disabled",
+            // `ctx.check_hostname = False` — attribute *assignment*, a
+            // different AST shape (Python's `assignment` node, with an
+            // `attribute` node as its `left` field) from the
+            // `check_hostname=False` *keyword-argument* rule immediately
+            // above (Greptile review round, PR #305/issue #264): setting
+            // the attribute directly on an already-constructed
+            // `ssl.SSLContext` instance is an equally common and equally
+            // dangerous way to disable hostname verification, and was
+            // passing through undetected. Left unscoped by object name
+            // (matches any `.check_hostname` attribute assignment), same
+            // reasoning as the keyword-arg rule above: SSLContext
+            // instances are constructed and named in too many different
+            // ways to enumerate a fixed set of object names.
+            r#"(assignment
   left: (attribute
     attribute: (identifier) @attr)
   right: (false)
   (#eq? @attr "check_hostname"))"#,
-                tls_verify_disabled_reason,
-            ),
+            tls_verify_disabled_reason,
+        ),
+    ]
+}
+
+fn python_crypto_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
             (
                 "insecure-crypto",
                 // `AES.MODE_ECB` (PyCryptodome/PyCrypto) — an `attribute`
@@ -727,8 +844,13 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
   (#eq? @attr "MODE_ECB"))"#,
                 "insecure block cipher mode — ECB mode encrypts identical plaintext blocks to identical ciphertext blocks, leaking structural information about the data (the classic \"ECB penguin\" problem); use an authenticated mode like AES-GCM instead",
             ),
-        ],
-        Lang::Rust => vec![
+    ]
+}
+
+fn rust_rules() -> Vec<(&'static str, &'static str, &'static str)> {
+    let shell_invoking_reason = SHELL_INVOKING_REASON;
+    let tls_verify_disabled_reason = TLS_VERIFY_DISABLED_REASON;
+    vec![
             (
                 "shell-invoking-subprocess",
                 r#"(call_expression
@@ -762,8 +884,7 @@ fn rules_for(lang: &Lang) -> Vec<(&'static str, &'static str, &'static str)> {
                 r#"(unsafe_block)"#,
                 "unsafe block — not necessarily wrong, but worth a human review pass; unsafe code bypasses Rust's memory-safety guarantees",
             ),
-        ],
-    }
+    ]
 }
 
 /// Finds `yaml.load(...)` calls (specifically `load`, never `safe_load` —
@@ -1361,20 +1482,40 @@ pub fn scan(content: &str, lang: Lang) -> Vec<Finding> {
             findings.push(Finding { rule, reason });
         }
     }
-    if matches!(lang, Lang::Python) {
-        findings.extend(python_yaml_load_findings(&tree, content));
-        findings.extend(python_torch_load_findings(&tree, content));
-        findings.extend(python_numpy_load_findings(&tree, content));
-        findings.extend(python_xxe_findings(&tree, content));
-        findings.extend(python_sql_string_interpolation_findings(&tree, content));
-    }
-    if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx) {
-        findings.extend(js_dynamic_module_load_findings(&tree, content, &ts_lang));
-        findings.extend(js_sql_string_interpolation_findings(
-            &tree, content, &ts_lang,
-        ));
-    }
+    findings.extend(post_match_walk_findings(&lang, &tree, content, &ts_lang));
     findings
+}
+
+/// The "post-match walk" rules — ones a plain tree-sitter query predicate
+/// can't express (see each individual function's doc comment for why) and
+/// which are instead matched generically by `rules_for`'s query and then
+/// filtered by inspecting matched nodes in Rust. Split out of `scan()`
+/// purely to keep `scan()`'s own cyclomatic complexity down as new
+/// languages are added here.
+fn post_match_walk_findings(
+    lang: &Lang,
+    tree: &tree_sitter::Tree,
+    content: &str,
+    ts_lang: &TsLanguage,
+) -> Vec<Finding> {
+    match lang {
+        Lang::Python => {
+            let mut findings = python_yaml_load_findings(tree, content);
+            findings.extend(python_torch_load_findings(tree, content));
+            findings.extend(python_numpy_load_findings(tree, content));
+            findings.extend(python_xxe_findings(tree, content));
+            findings.extend(python_sql_string_interpolation_findings(tree, content));
+            findings
+        }
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            let mut findings = js_dynamic_module_load_findings(tree, content, ts_lang);
+            findings.extend(js_sql_string_interpolation_findings(tree, content, ts_lang));
+            findings
+        }
+        Lang::Yaml => yaml_github_actions_workflow_findings(&ParsedSource { tree, content }),
+        Lang::Html => html_script_src_without_sri_findings(&ParsedSource { tree, content }),
+        Lang::Rust => vec![],
+    }
 }
 
 #[cfg(test)]
@@ -3192,5 +3333,490 @@ mod tests {
     fn python_has_no_rust_unsafe_block_rule() {
         let findings = scan("eval(x)", Lang::Python);
         assert!(!has_rust_unsafe_block_finding(&findings));
+    }
+
+    // ── issue #265: github-actions-workflow (YAML) ──────────────────────
+
+    fn has_github_actions_workflow_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "github-actions-workflow")
+    }
+
+    #[test]
+    fn detect_language_scopes_yaml_to_workflows_dir() {
+        assert!(matches!(
+            detect_language(".github/workflows/ci.yml"),
+            Some(Lang::Yaml)
+        ));
+        assert!(matches!(
+            detect_language(".github/workflows/ci.yaml"),
+            Some(Lang::Yaml)
+        ));
+        // A plain .yml/.yaml file outside .github/workflows/ is out of
+        // scope for this rule — ast_guard augments clawband's existing
+        // checks for known-dangerous shapes, it doesn't become a general
+        // YAML linter.
+        assert!(detect_language("docker-compose.yml").is_none());
+        assert!(detect_language("config/settings.yaml").is_none());
+    }
+
+    #[test]
+    fn detect_language_scopes_yaml_to_workflows_dir_backslash_path() {
+        // Third-opinion review finding on PR #319: a backslash-separated
+        // path (as Claude Code's tool_input can report on Windows) must
+        // not silently skip the workflow rule.
+        assert!(matches!(
+            detect_language(r".github\workflows\ci.yml"),
+            Some(Lang::Yaml)
+        ));
+    }
+
+    #[test]
+    fn yaml_flags_untrusted_interpolation_in_run_block_scalar() {
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "untrusted github.event.* interpolated directly into run: must be flagged"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_untrusted_interpolation_in_single_line_run() {
+        let yaml = r#"
+on: pull_request
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github.head_ref }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(has_github_actions_workflow_finding(&findings));
+    }
+
+    #[test]
+    fn yaml_ignores_value_passed_through_env_first() {
+        // The documented-safe fix: the untrusted value goes through env:
+        // first and the run: body only ever references a shell variable,
+        // so there's no ${{ }} in the run: text at all.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - env:
+          TITLE: ${{ github.event.issue.title }}
+        run: |
+          echo "$TITLE"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            !has_github_actions_workflow_finding(&findings),
+            "a value passed through env: and referenced as a shell variable in run: must not be flagged"
+        );
+    }
+
+    #[test]
+    fn yaml_ignores_run_with_no_interpolation() {
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    steps:
+      - run: echo "hello world"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(!has_github_actions_workflow_finding(&findings));
+    }
+
+    #[test]
+    fn yaml_ignores_trusted_context_interpolation() {
+        // github.event_name/github.sha/github.run_id etc. are fixed,
+        // workflow-controlled values, not attacker-controlled input.
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github.sha }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(!has_github_actions_workflow_finding(&findings));
+    }
+
+    #[test]
+    fn yaml_ignores_github_event_name_despite_substring_overlap() {
+        // Second-opinion review finding on PR #319: a bare substring check
+        // for "github.event" also matches "github.event_name" — a fixed,
+        // GitHub-controlled value this rule's own doc comment explicitly
+        // says is NOT meant to match. Must stay un-flagged.
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github.event_name }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            !has_github_actions_workflow_finding(&findings),
+            "github.event_name is a fixed value, not attacker-controlled — must not be flagged just because it shares a substring with github.event"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_untrusted_interpolation_still_works_alongside_event_name_fix() {
+        // Companion to the fix above: the real github.event.* case must
+        // still fire once the substring check is anchored on a real
+        // field-access boundary (`.`/`[`/end-of-expression).
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(has_github_actions_workflow_finding(&findings));
+    }
+
+    #[test]
+    fn yaml_flags_untrusted_inputs_interpolation() {
+        // Second-opinion review finding on PR #319: GitHub's own hardening
+        // docs list inputs.* on workflow_dispatch/pull_request_target as
+        // untrusted alongside github.head_ref, but it wasn't covered.
+        let yaml = r#"
+on: workflow_dispatch
+jobs:
+  build:
+    steps:
+      - run: echo "${{ inputs.foo }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "inputs.* interpolated directly into run: must be flagged — GitHub docs call it untrusted on workflow_dispatch/pull_request_target"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_double_quoted_run_key() {
+        // Third-opinion review finding on PR #319: `"run":` parses as
+        // `key: (flow_node (double_quote_scalar))`, not the `plain_scalar`
+        // shape the original query required — bypassing detection entirely.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - "run": echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "a double-quoted run: key must not bypass detection"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_single_quoted_run_key() {
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - 'run': echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "a single-quoted run: key must not bypass detection"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_flow_mapping_run_step() {
+        // Third-opinion review finding on PR #319: a step written as a YAML
+        // flow mapping (`{ run: ... }`) parses as `flow_pair` inside
+        // `flow_mapping`, never `block_mapping_pair` — the original query
+        // only matched the latter.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - { run: 'echo "${{ github.event.issue.title }}"' }
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "a run: step written as a flow mapping must not bypass detection"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_bracket_index_github_event_access() {
+        // Third-opinion review finding on PR #319: GitHub Actions
+        // expressions support index syntax (github['event']) as well as
+        // dot syntax — the literal substring "github.event" never appears
+        // in "github['event']", so the dot-only check missed it.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - run: echo "${{ github['event']['issue']['title'] }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "github['event'] index syntax must be flagged the same as github.event dot syntax"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_interpolation_with_inner_braces() {
+        // Third-opinion review finding on PR #319: the original regex's
+        // `[^}]*?` body stopped at the first `}`, so an expression with a
+        // single inner brace (format('{0}', ...)) never reached a closing
+        // `}}` and the whole interpolation was missed.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - run: echo "${{ format('{0}', github.event.issue.title) }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "an untrusted interpolation with an inner brace in the expression must still be flagged"
+        );
+    }
+
+    #[test]
+    fn yaml_flags_escaped_run_key() {
+        // Greptile review finding on PR #319: a double-quoted key can spell
+        // "run" using a \u escape (u decodes to 'u') instead of the
+        // literal characters — YAML decodes this to the string "run" at
+        // parse time, so a literal-text comparison against the quoted
+        // key's raw source bypassed the quoted-key fix added earlier in
+        // this PR.
+        let yaml = r#"
+on: issues
+jobs:
+  build:
+    steps:
+      - "run": echo "${{ github.event.issue.title }}"
+"#;
+        let findings = scan(yaml, Lang::Yaml);
+        assert!(
+            has_github_actions_workflow_finding(&findings),
+            "a run: key spelled with a YAML \\u escape must not bypass detection"
+        );
+    }
+
+    // ── issue #265: script-src-without-sri (HTML) ───────────────────────
+
+    fn has_script_src_without_sri_finding(findings: &[Finding]) -> bool {
+        findings.iter().any(|f| f.rule == "script-src-without-sri")
+    }
+
+    #[test]
+    fn html_flags_external_script_without_integrity() {
+        let html = r#"<script src="https://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(has_script_src_without_sri_finding(&findings));
+    }
+
+    #[test]
+    fn html_ignores_external_script_with_integrity() {
+        let html =
+            r#"<script src="https://cdn.example.com/lib.js" integrity="sha384-abc123"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            !has_script_src_without_sri_finding(&findings),
+            "a script with a correct integrity attribute must not be flagged"
+        );
+    }
+
+    #[test]
+    fn html_ignores_local_relative_script_src() {
+        let html = r#"<script src="/js/app.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            !has_script_src_without_sri_finding(&findings),
+            "SRI only matters for externally-hosted scripts, not same-origin/relative src"
+        );
+    }
+
+    #[test]
+    fn html_flags_protocol_relative_script_without_integrity() {
+        // Second-opinion review finding on PR #319: a protocol-relative
+        // src ("//host/...") loads from a third-party origin exactly like
+        // "https://host/..." does — SRI matters equally — but the original
+        // http://-/https://-only prefix check missed it.
+        let html = r#"<script src="//cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "a protocol-relative external script src without integrity must be flagged"
+        );
+    }
+
+    #[test]
+    fn html_ignores_inline_script_with_no_src() {
+        let html = r#"<script>console.log("hi");</script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(!has_script_src_without_sri_finding(&findings));
+    }
+
+    #[test]
+    fn html_flags_uppercase_src_attribute() {
+        // Third-opinion review finding on PR #319: HTML attribute names are
+        // case-insensitive, but the original check compared against the
+        // lowercase literal "src" only, so an uppercase SRC= attribute
+        // bypassed detection entirely.
+        let html = r#"<script SRC="https://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "an uppercase SRC attribute must not bypass the external-script check"
+        );
+    }
+
+    #[test]
+    fn html_ignores_uppercase_integrity_attribute() {
+        // Companion to the uppercase SRC case: an uppercase INTEGRITY=
+        // attribute must still count as having SRI, not be treated as
+        // absent.
+        let html =
+            r#"<script src="https://cdn.example.com/lib.js" INTEGRITY="sha384-abc123"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            !has_script_src_without_sri_finding(&findings),
+            "an uppercase INTEGRITY attribute with a real hash must count as having SRI"
+        );
+    }
+
+    #[test]
+    fn html_flags_empty_integrity_attribute() {
+        // Third-opinion review finding on PR #319: integrity="" (or a bare
+        // integrity attribute with no value) supplies no actual hash to
+        // verify against, so it must be treated the same as a missing
+        // integrity attribute, not as SRI being present.
+        let html = r#"<script src="https://cdn.example.com/lib.js" integrity=""></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "an empty integrity attribute must not count as having real SRI"
+        );
+    }
+
+    #[test]
+    fn html_flags_uppercase_url_scheme() {
+        // Third-opinion review finding on PR #319: URL schemes are
+        // case-insensitive, but the original prefix check only recognized
+        // lowercase http://https://.
+        let html = r#"<script src="HTTPS://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "an uppercase HTTPS:// scheme must still be recognized as external"
+        );
+    }
+
+    #[test]
+    fn html_flags_html_entity_encoded_scheme() {
+        // Greptile review finding on PR #319: tree-sitter-html returns an
+        // attribute value's raw, undecoded source text — src="https&#58;//..."
+        // decodes (per the HTML character-reference spec, and confirmed
+        // against actual browser behavior) to the same https:// URL as the
+        // plain-spelled version, but the undecoded text doesn't start with
+        // "https://" and bypassed the check.
+        let html = r#"<script src="https&#58;//cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "an HTML-entity-encoded https:// scheme must still be recognized as external"
+        );
+    }
+
+    #[test]
+    fn html_ignores_duplicate_src_keeping_first_local_value() {
+        // Greptile review finding on PR #319: a duplicate src attribute
+        // was resolved to the *last* occurrence, but HTML parsing (and
+        // real browsers) use the *first* and ignore later duplicates
+        // outright — so a safe first local src followed by a second,
+        // external-looking src was wrongly flagged.
+        let html = r#"<script src="/local/app.js" src="https://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            !has_script_src_without_sri_finding(&findings),
+            "the first (local) src attribute must win over a later duplicate, matching real HTML parsing"
+        );
+    }
+
+    #[test]
+    fn html_flags_duplicate_integrity_keeping_first_empty_value() {
+        // Companion to the above: a first integrity="" followed by a
+        // second, real-looking integrity="sha384-..." must still count as
+        // having no SRI, since a real browser ignores the second
+        // duplicate and uses the first (empty) value.
+        let html = r#"<script src="https://cdn.example.com/lib.js" integrity="" integrity="sha384-abc123"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "the first (empty) integrity attribute must win over a later duplicate, matching real HTML parsing"
+        );
+    }
+
+    #[test]
+    fn html_flags_duplicate_integrity_keeping_first_bare_value() {
+        // Regression for a bug introduced and caught in-session while
+        // simplifying html_script_attrs's duplicate-attribute handling: a
+        // first-occurrence tracker based on "is the slot still None"
+        // can't tell a bare first `integrity` attribute (no value at all,
+        // so the slot is still None after processing it) apart from "not
+        // seen yet" — which would wrongly let a later duplicate's real
+        // hash win. A bare integrity attribute's "value" is effectively
+        // empty, so the first-wins rule here means no real SRI either way.
+        let html = r#"<script src="https://cdn.example.com/lib.js" integrity integrity="sha384-abc123"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "a bare first integrity attribute must win over a later duplicate's real hash, matching real HTML parsing"
+        );
+    }
+
+    #[test]
+    fn html_flags_malformed_integrity_hash() {
+        // Greptile review finding on PR #319: the original check only
+        // asked whether the integrity attribute's value was non-empty —
+        // integrity="garbage" supplies no real hash but counted as
+        // protection.
+        let html = r#"<script src="https://cdn.example.com/lib.js" integrity="garbage"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(
+            has_script_src_without_sri_finding(&findings),
+            "a malformed (non-SRI-shaped) integrity value must not count as real protection"
+        );
+    }
+
+    #[test]
+    fn html_flags_external_script_without_integrity_htm_extension() {
+        // Greptile review finding on PR #319: language detection only
+        // matched ".html", silently skipping the equally common ".htm"
+        // extension.
+        assert!(matches!(detect_language("page.htm"), Some(Lang::Html)));
+        let html = r#"<script src="https://cdn.example.com/lib.js"></script>"#;
+        let findings = scan(html, Lang::Html);
+        assert!(has_script_src_without_sri_finding(&findings));
     }
 }
