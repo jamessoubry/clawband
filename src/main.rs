@@ -629,13 +629,51 @@ fn log_action(decision: &str, reason: &str, command: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().append(true).create(true).open(path) {
         let _ = writeln!(
             f,
-            "[{}] {} | {} | {}",
+            "[{}] v{} {} | {} | {}",
             ts,
+            env!("CARGO_PKG_VERSION"),
             decision.to_uppercase(),
             reason,
             cmd_preview
         );
     }
+}
+
+/// Classify a `~/.clawband.log` line by its decision marker ("DENY", "ASK",
+/// or "SKIP"), robust to the optional version token (`v3.25.1`) that newer
+/// log lines carry between the timestamp `]` and the decision word:
+///   old format: `[<ts>] DENY | <reason> | <command>`
+///   new format: `[<ts>] v3.25.1 DENY | <reason> | <command>`
+/// Returns `None` for malformed lines or lines where the word only appears
+/// elsewhere (e.g. inside the reason/command fields).
+/// Skip a leading version token like "v3.25.1" if present at the start of
+/// `after_ts`, returning the remainder with leading whitespace trimmed.
+fn strip_version_token(after_ts: &str) -> &str {
+    match after_ts.split_once(char::is_whitespace) {
+        Some((tok, rest))
+            if tok.starts_with('v') && tok.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) =>
+        {
+            rest.trim_start()
+        }
+        _ => after_ts,
+    }
+}
+
+const LOG_LINE_MARKERS: &[(&str, &str)] = &[
+    ("DENY", "DENY"),
+    ("PROTECTED-ASK", "ASK"),
+    ("AST-ASK", "ASK"),
+    ("ASK", "ASK"),
+    ("SKIP", "SKIP"),
+];
+
+fn classify_log_line(line: &str) -> Option<&'static str> {
+    let after_ts = line.split_once(']')?.1.trim_start();
+    let after_version = strip_version_token(after_ts);
+    LOG_LINE_MARKERS.iter().find_map(|(word, category)| {
+        let rest = after_version.strip_prefix(word)?;
+        rest.trim_start().starts_with('|').then_some(*category)
+    })
 }
 
 // ─── Repeated-ask suggestion ─────────────────────────────────────────────────
@@ -4784,12 +4822,10 @@ fn cmd_log(args: &[String]) {
         total
     );
     for line in &lines {
-        let coloured = if line.contains("] DENY |") || line.contains("] SKIP |") {
-            format!("{red}{line}{r}")
-        } else if line.contains("] ASK |") {
-            format!("{y}{line}{r}")
-        } else {
-            line.to_string()
+        let coloured = match classify_log_line(line) {
+            Some("DENY") | Some("SKIP") => format!("{red}{line}{r}"),
+            Some("ASK") => format!("{y}{line}{r}"),
+            _ => line.to_string(),
         };
         println!("  {coloured}");
     }
@@ -5571,17 +5607,15 @@ fn cmd_stats() {
         fs::read_to_string(&log_path)
             .unwrap_or_default()
             .lines()
-            .fold((0u64, 0u64, 0u64), |(d, a, s), line| {
-                if line.contains("] DENY |") {
-                    (d + 1, a, s)
-                } else if line.contains("] ASK |") {
-                    (d, a + 1, s)
-                } else if line.contains("] SKIP |") {
-                    (d, a, s + 1)
-                } else {
-                    (d, a, s)
-                }
-            })
+            .fold(
+                (0u64, 0u64, 0u64),
+                |(d, a, s), line| match classify_log_line(line) {
+                    Some("DENY") => (d + 1, a, s),
+                    Some("ASK") => (d, a + 1, s),
+                    Some("SKIP") => (d, a, s + 1),
+                    _ => (d, a, s),
+                },
+            )
     } else {
         (0u64, 0u64, 0u64)
     };
@@ -12481,6 +12515,125 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn log_action_includes_version_field() {
+        // Issue #276: each logged line must record the clawband version right
+        // after the timestamp and before the decision, e.g.
+        // "[<ts>] v3.14.0 DENY | <reason> | <command>".
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("cb_log_version_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+
+        with_fake_home(&home, || {
+            log_action("deny", "some reason", "some command");
+        });
+
+        let log = home.join(".clawband.log");
+        let contents = fs::read_to_string(&log).expect("log file should exist");
+        let expected_version_token = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            contents.contains(&expected_version_token),
+            "log line should contain version token {expected_version_token}: {contents}"
+        );
+
+        // Version must sit right after the timestamp and before the decision.
+        let line = contents.lines().next().expect("log should have a line");
+        let after_ts = line
+            .split(']')
+            .nth(1)
+            .expect("line should contain a timestamp bracket")
+            .trim_start();
+        assert!(
+            after_ts.starts_with(&format!("{expected_version_token} DENY")),
+            "expected version immediately after timestamp and before decision, got: {line}"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn classify_log_line_matches_old_format() {
+        assert_eq!(
+            classify_log_line("[1700000000] DENY | some reason | rm -rf /"),
+            Some("DENY")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] ASK | some reason | git reset --hard"),
+            Some("ASK")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] SKIP | some reason | some command"),
+            Some("SKIP")
+        );
+    }
+
+    #[test]
+    fn classify_log_line_matches_new_versioned_format() {
+        assert_eq!(
+            classify_log_line("[1700000000] v3.25.1 DENY | some reason | rm -rf /"),
+            Some("DENY")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] v3.25.1 ASK | some reason | git reset --hard"),
+            Some("ASK")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] v3.25.1 SKIP | some reason | some command"),
+            Some("SKIP")
+        );
+    }
+
+    #[test]
+    fn classify_log_line_ignores_decision_word_elsewhere_on_line() {
+        // The word "DENY" appearing in the reason/command fields must not be
+        // mistaken for the decision marker.
+        assert_eq!(
+            classify_log_line("[1700000000] ASK | would otherwise DENY | echo DENY"),
+            Some("ASK")
+        );
+        // Malformed line with no recognizable decision marker at all.
+        assert_eq!(classify_log_line("[1700000000] not a real line"), None);
+    }
+
+    #[test]
+    fn classify_log_line_handles_mixed_log() {
+        let log = "[1700000000] DENY | old reason | rm -rf /\n\
+             [1700000001] v3.25.1 ASK | new reason | git reset --hard\n\
+             [1700000002] SKIP | old reason | some command\n\
+             [1700000003] v3.25.1 SKIP | new reason | some other command\n";
+        let (mut d, mut a, mut s) = (0u64, 0u64, 0u64);
+        for line in log.lines() {
+            match classify_log_line(line) {
+                Some("DENY") => d += 1,
+                Some("ASK") => a += 1,
+                Some("SKIP") => s += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((d, a, s), (1, 1, 2));
+    }
+
+    #[test]
+    fn classify_log_line_recognizes_protected_ask_and_ast_ask() {
+        assert_eq!(
+            classify_log_line("[1700000000] PROTECTED-ASK | some reason | rm -rf ~/.ssh"),
+            Some("ASK")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] AST-ASK | some reason | eval(user_input)"),
+            Some("ASK")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] v3.25.1 PROTECTED-ASK | some reason | rm -rf ~/.ssh"),
+            Some("ASK")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] v3.25.1 AST-ASK | some reason | eval(user_input)"),
+            Some("ASK")
+        );
     }
 
     include!("redact_secrets_test.rs");
