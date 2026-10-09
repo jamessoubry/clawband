@@ -657,10 +657,14 @@ fn classify_log_line(line: &str) -> Option<&'static str> {
         }
         _ => after_ts,
     };
-    for word in ["DENY", "ASK", "SKIP"] {
+    for word in ["DENY", "PROTECTED-ASK", "AST-ASK", "ASK", "SKIP"] {
         if let Some(rest) = after_version.strip_prefix(word) {
             if rest.trim_start().starts_with('|') {
-                return Some(word);
+                return Some(if word == "PROTECTED-ASK" || word == "AST-ASK" {
+                    "ASK"
+                } else {
+                    word
+                });
             }
         }
     }
@@ -12605,6 +12609,26 @@ mod tests {
             }
         }
         assert_eq!((d, a, s), (1, 1, 2));
+    }
+
+    #[test]
+    fn classify_log_line_recognizes_protected_ask_and_ast_ask() {
+        assert_eq!(
+            classify_log_line("[1700000000] PROTECTED-ASK | some reason | rm -rf ~/.ssh"),
+            Some("ASK")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] AST-ASK | some reason | eval(user_input)"),
+            Some("ASK")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] v3.25.1 PROTECTED-ASK | some reason | rm -rf ~/.ssh"),
+            Some("ASK")
+        );
+        assert_eq!(
+            classify_log_line("[1700000000] v3.25.1 AST-ASK | some reason | eval(user_input)"),
+            Some("ASK")
+        );
     }
 
     include!("redact_secrets_test.rs");
