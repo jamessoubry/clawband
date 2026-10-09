@@ -646,29 +646,34 @@ fn log_action(decision: &str, reason: &str, command: &str) {
 ///   new format: `[<ts>] v3.25.1 DENY | <reason> | <command>`
 /// Returns `None` for malformed lines or lines where the word only appears
 /// elsewhere (e.g. inside the reason/command fields).
-fn classify_log_line(line: &str) -> Option<&'static str> {
-    let after_ts = line.split_once(']')?.1.trim_start();
-    // Skip a leading version token like "v3.25.1" if present.
-    let after_version = match after_ts.split_once(char::is_whitespace) {
+/// Skip a leading version token like "v3.25.1" if present at the start of
+/// `after_ts`, returning the remainder with leading whitespace trimmed.
+fn strip_version_token(after_ts: &str) -> &str {
+    match after_ts.split_once(char::is_whitespace) {
         Some((tok, rest))
             if tok.starts_with('v') && tok.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) =>
         {
             rest.trim_start()
         }
         _ => after_ts,
-    };
-    for word in ["DENY", "PROTECTED-ASK", "AST-ASK", "ASK", "SKIP"] {
-        if let Some(rest) = after_version.strip_prefix(word) {
-            if rest.trim_start().starts_with('|') {
-                return Some(if word == "PROTECTED-ASK" || word == "AST-ASK" {
-                    "ASK"
-                } else {
-                    word
-                });
-            }
-        }
     }
-    None
+}
+
+const LOG_LINE_MARKERS: &[(&str, &str)] = &[
+    ("DENY", "DENY"),
+    ("PROTECTED-ASK", "ASK"),
+    ("AST-ASK", "ASK"),
+    ("ASK", "ASK"),
+    ("SKIP", "SKIP"),
+];
+
+fn classify_log_line(line: &str) -> Option<&'static str> {
+    let after_ts = line.split_once(']')?.1.trim_start();
+    let after_version = strip_version_token(after_ts);
+    LOG_LINE_MARKERS.iter().find_map(|(word, category)| {
+        let rest = after_version.strip_prefix(word)?;
+        rest.trim_start().starts_with('|').then_some(*category)
+    })
 }
 
 // ─── Repeated-ask suggestion ─────────────────────────────────────────────────
