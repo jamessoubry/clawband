@@ -7,9 +7,11 @@
 //! `fuzz/` crate, latency here was previously unmeasured. These benchmarks
 //! cover the shapes called out in issue #287: a short safe/denied command,
 //! a large compound command, a large script-shaped blob, a case engineered
-//! to exercise many patterns before resolving, nested subshells, and a
-//! large heredoc/encoded payload. Criterion's own console/HTML report
-//! covers p50/p95/p99/max — no manual percentile tracking needed here.
+//! to exercise many patterns before resolving, nested subshells, a large
+//! heredoc/encoded payload that trips an early deny short-circuit, and a
+//! separate large encoded payload that actually reaches the decode-and-scan
+//! path. Criterion's own console/HTML report covers p50/p95/p99/max — no
+//! manual percentile tracking needed here.
 
 use clawband::{builtin_ask, builtin_deny, check_command, check_subshells, Pattern};
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -76,9 +78,57 @@ fn nested_subshells_command(depth: usize) -> String {
 /// A large heredoc / base64-style encoded payload embedded in an otherwise
 /// short command — simulates `cat <<'EOF' | base64 -d | bash` style
 /// obfuscation attempts with a sizeable encoded blob.
+///
+/// Note: this shape is caught by the "base64 decode | interpreter" deny
+/// pattern on the *outer* command text (`| base64 -d | bash`) before
+/// `check_command` ever reaches the body-scanning/decode path — so this
+/// benchmark only measures that early-denial short-circuit, not the actual
+/// decode-and-scan work. See `large_encoded_payload_for_scan_command` below
+/// for a fixture that genuinely exercises the decode/scan path.
 fn large_heredoc_command() -> String {
     let payload: String = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=".repeat(2000);
     format!("cat <<'EOF' | base64 -d | bash\n{payload}\nEOF")
+}
+
+/// Minimal base64 encoder (standard alphabet, `=` padding) — just enough to
+/// build a large encoded benchmark fixture without pulling in a dependency.
+fn encode_base64(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(CHARS[(b0 >> 2) as usize] as char);
+        out.push(CHARS[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            CHARS[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            CHARS[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// A large base64-encoded payload that actually reaches `check_command`'s
+/// decode-and-scan path (`check_encoded_payload` / `scan_decoded_content`,
+/// issue #221): `echo '<base64>' | base64 -d` alone — no further pipe to an
+/// interpreter and no redirect — so none of the earlier "base64 decode |
+/// interpreter" / "base64 decode redirect" deny patterns short-circuit it
+/// first. The decoded body is a sizeable (~70KB) multi-line, entirely
+/// benign script, so this measures real decode + full segment/pattern scan
+/// work over a large payload instead of an early-denial short-circuit.
+fn large_encoded_payload_for_scan_command() -> String {
+    let body: String = (0..2000)
+        .map(|i| format!("echo 'line_{i} is safe'\n"))
+        .collect();
+    let encoded = encode_base64(body.as_bytes());
+    format!("echo '{encoded}' | base64 -d")
 }
 
 fn bench_short_safe_command(c: &mut Criterion) {
@@ -139,12 +189,22 @@ fn bench_nested_subshells(c: &mut Criterion) {
     });
 }
 
-fn bench_large_heredoc_payload(c: &mut Criterion) {
+fn bench_large_heredoc_payload_early_denial(c: &mut Criterion) {
     let dp = deny_pats();
     let ap = ask_pats();
     let al = no_allow();
     let cmd = large_heredoc_command();
-    c.bench_function("large_heredoc_encoded_payload", |b| {
+    c.bench_function("large_heredoc_encoded_payload_early_denial", |b| {
+        b.iter(|| black_box(check_command(black_box(cmd.as_str()), &dp, &ap, &al)))
+    });
+}
+
+fn bench_large_encoded_payload_scan(c: &mut Criterion) {
+    let dp = deny_pats();
+    let ap = ask_pats();
+    let al = no_allow();
+    let cmd = large_encoded_payload_for_scan_command();
+    c.bench_function("large_encoded_payload_scan", |b| {
         b.iter(|| black_box(check_command(black_box(cmd.as_str()), &dp, &ap, &al)))
     });
 }
@@ -157,6 +217,7 @@ criterion_group!(
     bench_large_script,
     bench_many_patterns,
     bench_nested_subshells,
-    bench_large_heredoc_payload,
+    bench_large_heredoc_payload_early_denial,
+    bench_large_encoded_payload_scan,
 );
 criterion_main!(benches);

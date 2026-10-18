@@ -759,6 +759,10 @@ fn maybe_append_ask_tip(reason: &str) -> String {
 
 // ─── Pattern ──────────────────────────────────────────────────────────────────
 
+/// A single compiled deny/ask/allow rule: a human-readable `label` (used in
+/// decision output) paired with the case-insensitive `Regex` used to test
+/// commands against it. Public so fuzz targets and benchmarks can construct
+/// and exercise patterns directly without going through the CLI.
 pub struct Pattern {
     label: String,
     re: Regex,
@@ -16199,7 +16203,8 @@ mod tests {
 #[cfg(test)]
 mod fuzz_properties {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
 
     const MAX_RUNTIME: Duration = Duration::from_secs(2);
 
@@ -16330,20 +16335,39 @@ mod fuzz_properties {
         check_subshells(cmd, dp, ap, al).map(|(d, _)| d.to_string())
     }
 
-    fn assert_bounded<T>(label: &str, f: impl FnOnce() -> T) -> T {
-        let start = Instant::now();
-        let result = f();
-        assert!(
-            start.elapsed() < MAX_RUNTIME,
-            "{label} did not complete within the bounded-runtime limit"
-        );
-        result
+    /// Run `f` on a dedicated thread and wait for it with a bounded timeout.
+    ///
+    /// The previous implementation only checked elapsed time *after* `f()`
+    /// returned, so a genuinely hanging closure defeated the bound entirely
+    /// (it would simply never return, and the `assert!` after it would never
+    /// run). Running `f` on a separate thread and waiting on a channel with
+    /// `recv_timeout` means a hang is detected and fails the assertion within
+    /// `MAX_RUNTIME`, instead of blocking the test suite forever.
+    ///
+    /// Note: if `f` truly hangs, the spawned thread is leaked (never joined) —
+    /// acceptable in a test binary that is about to fail/exit anyway.
+    fn assert_bounded<T: Send + 'static>(label: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(MAX_RUNTIME) {
+            Ok(result) => {
+                let _ = handle.join();
+                result
+            }
+            Err(_) => {
+                panic!("{label} did not complete within the bounded-runtime limit");
+            }
+        }
     }
 
     #[test]
     fn property_split_segments_never_panics_or_hangs() {
         for cmd in mutated_corpus() {
-            let segments = assert_bounded("split_segments", || split_segments(&cmd));
+            let cmd_for_thread = cmd.clone();
+            let segments =
+                assert_bounded("split_segments", move || split_segments(&cmd_for_thread));
             // Sanity bound: a splitter should never amplify the input into
             // vastly more segments than the input could plausibly contain.
             assert!(
@@ -16357,14 +16381,17 @@ mod fuzz_properties {
     #[test]
     fn property_strip_safe_pipes_never_panics_or_hangs() {
         for cmd in mutated_corpus() {
-            let _ = assert_bounded("strip_safe_pipes", || strip_safe_pipes(&cmd));
+            let _ = assert_bounded("strip_safe_pipes", move || strip_safe_pipes(&cmd));
         }
     }
 
     #[test]
     fn property_extract_script_path_never_panics_or_hangs() {
         for cmd in mutated_corpus() {
-            let path = assert_bounded("extract_script_path", || extract_script_path(&cmd));
+            let cmd_for_thread = cmd.clone();
+            let path = assert_bounded("extract_script_path", move || {
+                extract_script_path(&cmd_for_thread)
+            });
             if let Some(p) = path {
                 assert!(
                     !p.is_empty(),
@@ -16378,7 +16405,9 @@ mod fuzz_properties {
     fn property_check_fetch_then_exec_never_panics_or_hangs() {
         for cmd in mutated_corpus() {
             let segments = split_segments(&cmd);
-            let _ = assert_bounded("check_fetch_then_exec", || check_fetch_then_exec(&segments));
+            let _ = assert_bounded("check_fetch_then_exec", move || {
+                check_fetch_then_exec(&segments)
+            });
         }
     }
 
@@ -16386,7 +16415,7 @@ mod fuzz_properties {
     fn property_check_assign_then_exec_never_panics_or_hangs() {
         for cmd in mutated_corpus() {
             let segments = split_segments(&cmd);
-            let _ = assert_bounded("check_assign_then_exec", || {
+            let _ = assert_bounded("check_assign_then_exec", move || {
                 check_assign_then_exec(&segments)
             });
         }
@@ -16394,12 +16423,18 @@ mod fuzz_properties {
 
     #[test]
     fn property_check_subshells_never_panics_or_hangs_and_returns_valid_decision() {
-        let dp = builtin_deny();
-        let ap = builtin_ask();
-        let al: Vec<Pattern> = vec![];
+        let dp = Arc::new(builtin_deny());
+        let ap = Arc::new(builtin_ask());
+        let al: Arc<Vec<Pattern>> = Arc::new(vec![]);
         for cmd in mutated_corpus() {
-            let decision =
-                assert_bounded("check_subshells", || check_subshells(&cmd, &dp, &ap, &al));
+            let cmd_for_thread = cmd.clone();
+            let dp = Arc::clone(&dp);
+            let ap = Arc::clone(&ap);
+            let al = Arc::clone(&al);
+            let decision = assert_bounded("check_subshells", move || {
+                check_subshells(&cmd_for_thread, &dp, &ap, &al)
+                    .map(|(tag, reason)| (tag.to_string(), reason))
+            });
             if let Some((tag, _reason)) = decision {
                 assert!(
                     tag == "deny" || tag == "ask",
@@ -16411,11 +16446,18 @@ mod fuzz_properties {
 
     #[test]
     fn property_check_command_never_panics_or_hangs_and_returns_valid_decision() {
-        let dp = builtin_deny();
-        let ap = builtin_ask();
-        let al: Vec<Pattern> = vec![];
+        let dp = Arc::new(builtin_deny());
+        let ap = Arc::new(builtin_ask());
+        let al: Arc<Vec<Pattern>> = Arc::new(vec![]);
         for cmd in mutated_corpus() {
-            let decision = assert_bounded("check_command", || check_command(&cmd, &dp, &ap, &al));
+            let cmd_for_thread = cmd.clone();
+            let dp = Arc::clone(&dp);
+            let ap = Arc::clone(&ap);
+            let al = Arc::clone(&al);
+            let decision = assert_bounded("check_command", move || {
+                check_command(&cmd_for_thread, &dp, &ap, &al)
+                    .map(|(tag, reason)| (tag.to_string(), reason))
+            });
             if let Some((tag, _reason)) = decision {
                 assert!(
                     tag == "deny" || tag == "ask",
