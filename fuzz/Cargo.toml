@@ -1,0 +1,63 @@
+[package]
+name = "clawband-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.clawband]
+path = ".."
+
+[[bin]]
+name = "fuzz_split_segments"
+path = "fuzz_targets/fuzz_split_segments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_strip_safe_pipes"
+path = "fuzz_targets/fuzz_strip_safe_pipes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_check_command"
+path = "fuzz_targets/fuzz_check_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_check_subshells"
+path = "fuzz_targets/fuzz_check_subshells.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_extract_script_path"
+path = "fuzz_targets/fuzz_extract_script_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_check_fetch_then_exec"
+path = "fuzz_targets/fuzz_check_fetch_then_exec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_check_assign_then_exec"
+path = "fuzz_targets/fuzz_check_assign_then_exec.rs"
+test = false
+doc = false
+bench = false
