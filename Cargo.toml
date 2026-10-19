@@ -1,11 +1,27 @@
 [package]
 name = "clawband"
-version = "3.25.1"
+version = "3.26.0"
 
 edition = "2021"
 description = "Claude Code PreToolUse hook that guards against destructive shell commands and unsafe file-write content"
 repository = "https://github.com/jamessoubry/clawband"
 license = "MIT"
+
+[lib]
+name = "clawband"
+path = "src/main.rs"
+# The lib target exists solely so `fuzz/` (a `cargo-fuzz` crate, see its own
+# Cargo.toml) can link against `check_command()` and friends as library
+# functions. It is not a second user-facing artifact, so skip building a
+# dedicated test/doctest harness for it — the bin target's own
+# `#[cfg(test)] mod tests` (same source file) already runs those tests once;
+# without this, `cargo test` built and ran that whole suite a second time
+# under the lib target's test binary, which observed anomalous runaway CPU
+# usage (likely from an e2e test that shells out expecting to find itself at
+# a real "clawband" binary path/argv0, a precondition that doesn't hold for
+# the lib target's synthetic test binary).
+test = false
+doctest = false
 
 [[bin]]
 name = "clawband"
@@ -26,7 +42,12 @@ streaming-iterator = "0.1"
 sha2 = "0.10"
 
 [dev-dependencies]
+criterion = "0.8.2"
 tempfile = "3"
+
+[[bench]]
+name = "check_command_bench"
+harness = false
 
 [profile.release]
 strip = true
