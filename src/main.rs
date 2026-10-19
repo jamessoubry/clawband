@@ -2607,10 +2607,12 @@ fn mask_quoted_separators(s: &str) -> String {
     out
 }
 
-/// Splits `cmd` into its top-level shell segments on `;`, `&&`, `||`, and
-/// `|`, respecting quoting/escaping so separators inside strings aren't
-/// treated as segment boundaries. Public so fuzz targets can exercise it
-/// directly.
+/// Splits `cmd` into its top-level shell segments on `;`, `&&`, `||`, bare
+/// `&`, and newline, respecting quoting/escaping so separators inside
+/// strings aren't treated as segment boundaries. A single `|` does *not*
+/// split a segment — `printf hello | cat` stays one segment, since a
+/// pipeline is a single logical command for pattern-matching purposes.
+/// Public so fuzz targets can exercise it directly.
 pub fn split_segments(cmd: &str) -> Vec<String> {
     const ESC_SEMI: &str = "\x01S\x01";
     const ESC_PIPE: &str = "\x01P\x01";
