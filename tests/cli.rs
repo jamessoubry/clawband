@@ -6293,13 +6293,20 @@ fn e2e_ast_receipt_unsupported_extension_never_consulted() {
         .to_string_lossy()
         .into_owned();
     let hash = {
-        use std::process::Command;
-        let out = Command::new("sha256sum").arg(&helper).output().unwrap();
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .to_string()
+        // Compute the digest in-process via the `sha2` crate (already a
+        // regular dependency, so available to this integration test too)
+        // rather than shelling out to `sha256sum` — that binary doesn't
+        // exist on macOS by default, which would panic this test on that
+        // platform even though macOS is a supported target (Greptile
+        // review, PR #323).
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(&helper).unwrap();
+        let digest = Sha256::digest(&bytes);
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        hex
     };
     std::fs::write(
         home.join(".clawband/ast-receipts.jsonl"),
