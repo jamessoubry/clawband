@@ -859,6 +859,9 @@ fn with_suggestion(reason: String, label: &str) -> String {
 
 // ─── Built-in deny patterns ───────────────────────────────────────────────────
 
+/// Built-in deny-tier patterns: commands matching any of these are blocked
+/// outright, never reaching the ask tier. Public so fuzz targets and
+/// benchmarks can exercise the deny patterns directly.
 pub fn builtin_deny() -> Vec<Pattern> {
     let specs: &[(&str, &str)] = &[
         // File system destruction — handles any flag ordering: -rf, -fr, -r -f, -f -r
@@ -1222,6 +1225,9 @@ fn git_argument_injection_ask_patterns() -> &'static [(&'static str, &'static st
     ]
 }
 
+/// Built-in ask-tier patterns: commands matching any of these prompt for
+/// confirmation (unless overridden by an allow pattern). Public so fuzz
+/// targets and benchmarks can exercise the ask patterns directly.
 pub fn builtin_ask() -> Vec<Pattern> {
     let specs: &[(&str, &str)] = &[
         // eval — executes arbitrary strings; subshell-only idioms like
@@ -1920,6 +1926,10 @@ fn path_basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Extracts the script-file path from a command that invokes a known
+/// interpreter (bash/sh/python/node/etc.) against a file argument, e.g.
+/// `bash /tmp/x.sh` → `Some("/tmp/x.sh")`. Returns `None` when the command
+/// doesn't match that shape. Public so fuzz targets can exercise it directly.
 pub fn extract_script_path(command: &str) -> Option<String> {
     let interp =
         r"(?i)(?:sudo\s+)?(?:\S*/)?(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua[0-9.]*)";
@@ -2501,6 +2511,11 @@ fn check_force_push(cmd: &str) -> Option<String> {
 // Remove  | python3 -c "..."  and  | python3 -m mod  before pipe checks.
 // These are visible inline code, not supply-chain risks.
 
+/// Strips `| python3 -c "..."` and `| python3 -m mod` (and `node` equivalents)
+/// pipe segments out of `cmd` before downstream pipe-to-interpreter checks
+/// run, since inline code passed this way is visible in the command string
+/// and not a supply-chain risk. Public so fuzz targets can exercise it
+/// directly.
 pub fn strip_safe_pipes(cmd: &str) -> String {
     let c = Regex::new(r"(?i)\|\s*(python3?|node)\s+-c\s+[^|;&`$]*").unwrap();
     let m = Regex::new(r"(?i)\|\s*(python3?|node)\s+-m\s+\S+").unwrap();
@@ -2592,6 +2607,10 @@ fn mask_quoted_separators(s: &str) -> String {
     out
 }
 
+/// Splits `cmd` into its top-level shell segments on `;`, `&&`, `||`, and
+/// `|`, respecting quoting/escaping so separators inside strings aren't
+/// treated as segment boundaries. Public so fuzz targets can exercise it
+/// directly.
 pub fn split_segments(cmd: &str) -> Vec<String> {
     const ESC_SEMI: &str = "\x01S\x01";
     const ESC_PIPE: &str = "\x01P\x01";
@@ -6216,6 +6235,10 @@ fn try_scan_heredoc_content(
 // Returns true when a fetched filename matches an interpreter argument in a
 // later segment (basename-compared, so `/tmp/x.sh` → exec `bash x.sh` fires).
 
+/// Detects a fetch-then-exec pattern across `segments`: a file downloaded in
+/// one segment (e.g. `curl -o x.sh ...`) whose basename is then passed to an
+/// interpreter in a later segment (e.g. `bash x.sh`). Public so fuzz targets
+/// can exercise it directly.
 pub fn check_fetch_then_exec(segments: &[String]) -> bool {
     if segments.len() < 2 {
         return false;
@@ -6285,6 +6308,11 @@ pub fn check_fetch_then_exec(segments: &[String]) -> bool {
 // This avoids the false-positive problem of the old broad regex ask-pattern
 // which fired on `$EDITOR file.txt`, `$PAGER log.txt`, `$SHELL -l`, etc.
 
+/// Detects a variable-assign-then-exec pattern across `segments`: a
+/// dangerous value assigned to a variable in one segment that's then
+/// executed via that variable in a later segment, narrower than the old
+/// broad regex ask-pattern this replaced. Public so fuzz targets can
+/// exercise it directly.
 pub fn check_assign_then_exec(segments: &[String]) -> bool {
     if segments.len() < 2 {
         return false;
@@ -6417,6 +6445,10 @@ fn extract_dollar_parens(s: &str) -> (Vec<String>, Vec<String>, String) {
     (inner_cmds, arithmetic_bodies, stripped)
 }
 
+/// Extracts and recursively checks `$(...)` / backtick command substitutions
+/// and `((...))` arithmetic expansions inside `command` against the same
+/// deny/ask/allow patterns used for top-level segments. Public so fuzz
+/// targets can exercise it directly.
 pub fn check_subshells(
     command: &str,
     deny_pats: &[Pattern],
@@ -6962,6 +6994,11 @@ fn segment_is_allowed(segment: &str, forms: &[&str], allow_pats: &[Pattern]) -> 
 // Returns Some(("deny"|"ask", reason)) or None for pass.
 // Does NOT perform script-file scanning (requires filesystem) or subshell checks.
 // skipcq: RS-R1000
+/// Core pattern-matching entry point: checks `command` against the given
+/// deny/ask/allow pattern sets and returns `Some(("deny"|"ask", reason))` or
+/// `None` to pass. Does not perform script-file scanning (requires
+/// filesystem access) or subshell checks — see [`check_subshells`] for
+/// those. Public so fuzz targets and benchmarks can exercise it directly.
 pub fn check_command<'a>(
     command: &str,
     deny_pats: &'a [Pattern],
@@ -7429,6 +7466,9 @@ fn is_genuine_gradlew(path: &str) -> bool {
 // `main` as its entrypoint regardless of visibility, is unaffected either
 // way). Marking `main` `pub` restores `main()` as a reachability root for
 // both crate types, matching the bin build's dead-code behavior.
+/// CLI entrypoint: parses subcommands and `--mode`, reads the hook's JSON
+/// input from stdin for the default path, and dispatches to the
+/// check/stats/trust/etc. subcommand handlers.
 pub fn main() {
     // CLI subcommands — pull out any leading `--mode <val>` first so it doesn't
     // shadow subcommand matching, then hand the remainder to the subcommand.
