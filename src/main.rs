@@ -1944,8 +1944,7 @@ fn ast_receipts_path() -> PathBuf {
 fn record_ast_receipt(canonical_path: &str, content: &[u8]) {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let line = serde_json::json!({
         "path": canonical_path,
         "hash": sha256_hex(content),
