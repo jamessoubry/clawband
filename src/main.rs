@@ -2411,7 +2411,17 @@ fn scan_script_file(
             if chained_match.is_none() && is_chained_script_invocation(segment) {
                 let already_cleared = chained_script_target_path(segment).is_some_and(|target| {
                     let runtime_dir_ambiguous = line_changed_dir && !target.starts_with('/');
-                    !runtime_dir_ambiguous && ast_receipt_allows_skip(&target, deny_pats)
+                    // A different line *earlier in this same script file*
+                    // may rewrite the target before this line executes it
+                    // (e.g. `cat payload.txt > helper.py` on one line,
+                    // `python3 helper.py` on a later one) — the same
+                    // self-rewrite TOCTOU `command_may_rewrite_target`
+                    // guards against for a single compound Bash command,
+                    // just scoped to the whole file's text instead (third
+                    // Claude review round on PR #323).
+                    !runtime_dir_ambiguous
+                        && !command_may_rewrite_target(&content, &target)
+                        && ast_receipt_allows_skip(&target, deny_pats)
                 });
                 if !already_cleared {
                     chained_match = Some(raw_line.trim().to_string());
@@ -10382,6 +10392,45 @@ mod tests {
             "python3 helper.py",
             "helper.py"
         ));
+    }
+
+    #[test]
+    fn scan_chained_script_self_rewrite_within_file_not_skipped_despite_receipt() {
+        // Third Claude review round on PR #323: the self-rewrite TOCTOU
+        // guard was wired into the compound-Bash-command path
+        // (`try_scan_heredoc_content`) but not into `scan_script_file`'s own
+        // chained-invocation check. A *script file* can perform the same
+        // rewrite-then-exec shape across two of its own lines — e.g.
+        // `cat payload.txt > helper.py` on one line, `python3 helper.py` on
+        // a later one — and a receipt taken from helper.py's state before
+        // the wrapper script ran must not suppress that ask either.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_file_self_rewrite");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            let helper_content = b"print('hi')\n";
+            fs::write(&helper, helper_content).unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+
+            let payload = tmp.join("payload.txt");
+            fs::write(&payload, b"print('owned')\n").unwrap();
+
+            let script = format!(
+                "#!/bin/bash\ncat {} > {}\npython3 {}\n",
+                payload.to_str().unwrap(),
+                helper.to_str().unwrap(),
+                helper.to_str().unwrap(),
+            );
+            let r = scan_content_decision("ch_receipt_file_self_rewrite", "sh", &script);
+            assert_eq!(
+                r.as_ref().map(|(d, _)| d.as_str()),
+                Some("ask"),
+                "a script that rewrites its own chained target on an earlier line must not be \
+                 cleared by a stale receipt: {r:?}"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
