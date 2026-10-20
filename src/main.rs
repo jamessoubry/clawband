@@ -10333,11 +10333,19 @@ mod tests {
         let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_cd_ambiguous");
         with_fake_home(&fake_home, || {
-            // Receipt for a `helper.py` resolved relative to *this process's*
-            // cwd (not "other/"), matching what `chained_script_target_path`
-            // would naively resolve to if it ignored the preceding `cd`.
+            // Receipt for a file resolved relative to *this process's* cwd
+            // (not "other/"), matching what `chained_script_target_path`
+            // would naively resolve to if it ignored the preceding `cd`. Use
+            // a name unique to this test (rather than a generic
+            // `helper.py`) — other, unlocked tests in this same binary also
+            // resolve a bare relative `helper.py` against the real process
+            // cwd, and `HOME` is a process-global env var that `with_fake_home`
+            // briefly overrides, so a receipt recorded here under a shared
+            // name could otherwise be observed by one of those tests running
+            // concurrently on another thread and change its outcome.
+            let helper_name = format!("cb_cd_ambiguous_helper_{}.py", std::process::id());
             let helper_content = b"print('hi')\n";
-            let cwd_helper = std::env::current_dir().unwrap().join("helper.py");
+            let cwd_helper = std::env::current_dir().unwrap().join(&helper_name);
             let wrote_cwd_helper = !cwd_helper.exists();
             if wrote_cwd_helper {
                 fs::write(&cwd_helper, helper_content).unwrap();
@@ -10345,8 +10353,8 @@ mod tests {
             let canonical = canonicalize_lenient(cwd_helper.to_str().unwrap()).unwrap();
             record_ast_receipt(&canonical, helper_content);
 
-            let script = "#!/bin/bash\ncd other && python3 helper.py\n";
-            let r = scan_content_decision("ch_receipt_cd", "sh", script);
+            let script = format!("#!/bin/bash\ncd other && python3 {helper_name}\n");
+            let r = scan_content_decision("ch_receipt_cd", "sh", &script);
             assert_eq!(
                 r.as_ref().map(|(d, _)| d.as_str()),
                 Some("ask"),
