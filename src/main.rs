@@ -2254,19 +2254,34 @@ fn detect_interpreter(content: &str) -> Option<&'static str> {
     }
 }
 
-/// Returns `true` if `line` (already trimmed) is a comment and should be
-/// skipped during pattern scanning.  Updates `in_block_comment` in place for
-/// multi-line block comment tracking.
+/// Returns `true` if `line` (already trimmed) is *entirely* a comment and
+/// should be skipped during pattern scanning. Updates `in_block_comment` in
+/// place for multi-line block comment tracking.
+///
+/// A block comment that opens and closes on the same line (JS `/* ... */`,
+/// Lua `--[[ ... ]]`) may be followed by real executable code on that same
+/// line (e.g. `/* note */ fs.rmSync(...)`). In that case this must return
+/// `false` ("not a comment line") rather than `true`, even though the line
+/// *starts* with a comment opener — otherwise callers skip the trailing code
+/// entirely and a destructive call hides behind a leading comment. Returning
+/// `false` here just means the caller scans the full raw line (comment text
+/// included) against deny/ask patterns, which is a safe direction to err in:
+/// comment text spuriously tripping a pattern is a false-positive ask, never
+/// a missed deny (Greptile review, PR #323 round 3).
 fn is_comment_line(line: &str, is_js: bool, is_lua: bool, in_block_comment: &mut bool) -> bool {
     if is_js {
         if *in_block_comment {
-            if line.contains("*/") {
+            if let Some(idx) = line.find("*/") {
                 *in_block_comment = false;
+                return line[idx + 2..].trim().is_empty();
             }
             return true;
         }
         if line.starts_with("/*") {
-            *in_block_comment = !line.contains("*/");
+            if let Some(idx) = line.find("*/") {
+                return line[idx + 2..].trim().is_empty();
+            }
+            *in_block_comment = true;
             return true;
         }
         if line.starts_with("//") || line.starts_with('*') {
@@ -2276,13 +2291,17 @@ fn is_comment_line(line: &str, is_js: bool, is_lua: bool, in_block_comment: &mut
 
     if is_lua {
         if *in_block_comment {
-            if line.contains("]]") {
+            if let Some(idx) = line.find("]]") {
                 *in_block_comment = false;
+                return line[idx + 2..].trim().is_empty();
             }
             return true;
         }
         if line.starts_with("--[[") {
-            *in_block_comment = !line.contains("]]");
+            if let Some(idx) = line.find("]]") {
+                return line[idx + 2..].trim().is_empty();
+            }
+            *in_block_comment = true;
             return true;
         }
         if line.starts_with("--") {
@@ -10376,6 +10395,40 @@ mod tests {
     }
 
     #[test]
+    fn content_matches_deny_pattern_catches_code_trailing_inline_block_comment() {
+        // Greptile review, PR #323 round 3: `/* note */ fs.rmSync(...)` must
+        // not be swallowed whole just because the line starts with a block
+        // comment opener — the destructive call after the comment closes on
+        // the same line has to be scanned.
+        assert!(content_matches_deny_pattern(
+            "helper.js",
+            "const fs = require('fs');\n/* note */ fs.rmSync('/tmp/important', {recursive: true});\n",
+            &deny_pats()
+        ));
+    }
+
+    #[test]
+    fn content_matches_deny_pattern_still_ignores_pure_block_comment_line() {
+        // Regression guard: a line that really is just a comment (nothing
+        // trailing after the close) must still be skipped.
+        assert!(!content_matches_deny_pattern(
+            "helper.js",
+            "/* this is just a comment, nothing else */\nconsole.log('hi');\n",
+            &deny_pats()
+        ));
+    }
+
+    #[test]
+    fn content_matches_deny_pattern_catches_code_trailing_lua_inline_block_comment() {
+        // Lua equivalent of the JS inline-block-comment bypass.
+        assert!(content_matches_deny_pattern(
+            "helper.lua",
+            "--[[ note ]] os.execute('rm -rf /')\n",
+            &deny_pats()
+        ));
+    }
+
+    #[test]
     fn scan_chained_destructive_helper_still_asks_despite_receipt() {
         // End-to-end: a receipt exists and the hash matches, but the
         // receipted file's content matches an existing deny pattern
@@ -10616,6 +10669,35 @@ mod tests {
         assert_eq!(
             scan_no_ext("#!/usr/bin/lua\n--[[ rm -rf / ]]\nprint('hi')\n"),
             None
+        );
+    }
+
+    #[test]
+    fn scan_js_catches_code_trailing_inline_block_comment() {
+        // Greptile review, PR #323 round 3: this is `scan_script_file`'s
+        // version of the same trailing-code-after-inline-comment bypass
+        // fixed in `content_matches_deny_pattern` — a `node helper.js`
+        // invocation must still ask when the destructive call hides behind
+        // a same-line block comment.
+        assert_eq!(
+            scan_content(
+                "js_inline_comment_trailing_code",
+                "js",
+                "/* note */ eval('rm -rf /')\n"
+            ),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn scan_lua_catches_code_trailing_inline_block_comment() {
+        assert_eq!(
+            scan_content(
+                "lua_inline_comment_trailing_code",
+                "lua",
+                "--[[ note ]] os.execute('rm -rf /')\n"
+            ),
+            Some("deny".into())
         );
     }
 
