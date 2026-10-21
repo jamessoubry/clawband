@@ -6327,3 +6327,51 @@ fn e2e_ast_receipt_unsupported_extension_never_consulted() {
     );
     assert!(out.contains("chains to another script"), "{out}");
 }
+
+#[test]
+fn e2e_ast_receipt_edit_scans_full_file_not_just_edited_snippet() {
+    // Greptile review, PR #323: the Edit hook must scan the *reconstructed
+    // full post-edit file*, not just the edited `new_string` snippet, before
+    // deciding whether to record an ast-receipt. Otherwise a harmless edit to
+    // one part of a file could clear a receipt for the whole file even
+    // though a dangerous call elsewhere in the file -- untouched by this
+    // edit -- was never actually scanned.
+    let home = fake_home_for_ast_receipt("edit-full-scan");
+    let h = home.to_str().unwrap();
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let dir = scratch.path();
+
+    // helper.py already contains a dangerous call that ast_guard flags, plus
+    // an unrelated harmless line we're about to edit.
+    let helper = dir.join("helper.py");
+    std::fs::write(&helper, "exec(input())\nx = 1\n").unwrap();
+
+    // Edit touches only the harmless `x = 1` line -- the edited snippet
+    // itself (`new_string`) is clean on its own, but the full file still
+    // contains the untouched `exec(input())` call.
+    let edit_json = format!(
+        r#"{{"tool_name":"Edit","tool_input":{{"file_path":{:?},"old_string":"x = 1","new_string":"x = 2"}}}}"#,
+        helper.to_str().unwrap()
+    );
+    let out = run_in_dir(&edit_json, &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "an edit must ask when the full post-edit file still contains a flagged call, \
+         even if the edited snippet alone is clean: {out}"
+    );
+
+    // Apply the edit on disk as the agent normally would, then confirm no
+    // receipt was recorded that would let a later chained Bash command skip
+    // asking about the still-present exec(input()) call.
+    std::fs::write(&helper, "exec(input())\nx = 2\n").unwrap();
+    let wrapper = dir.join("wrapper.sh");
+    std::fs::write(&wrapper, "#!/bin/bash\npython3 helper.py\n").unwrap();
+    let out = run_in_dir(&bash("bash wrapper.sh"), &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "no receipt must have been recorded for the unscanned dangerous content: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}

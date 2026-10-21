@@ -2006,17 +2006,38 @@ fn lookup_ast_receipt_hash(canonical_path: &str) -> Option<String> {
 }
 
 /// True when `content` (the current on-disk content of a chained-script
-/// target) matches any of clawband's own deny patterns. `ast_guard::scan`'s
-/// rule coverage is intentionally narrower than the deny-pattern regex set
-/// (e.g. it doesn't flag `shutil.rmtree(...)` in Python even though the
-/// deny patterns do) — so a receipt saying "ast_guard found nothing" must
-/// never be read as "nothing dangerous here" on its own. This re-runs the
-/// same deny-pattern check used elsewhere for script content before a
-/// receipt is allowed to suppress an ask (Greptile review, PR #323).
-fn content_matches_deny_pattern(content: &str, deny_pats: &[Pattern]) -> bool {
+/// target at `path`) matches any of clawband's own deny patterns.
+/// `ast_guard::scan`'s rule coverage is intentionally narrower than the
+/// deny-pattern regex set (e.g. it doesn't flag `shutil.rmtree(...)` in
+/// Python even though the deny patterns do) — so a receipt saying
+/// "ast_guard found nothing" must never be read as "nothing dangerous here"
+/// on its own. This re-runs the same deny-pattern check used elsewhere for
+/// script content before a receipt is allowed to suppress an ask (Greptile
+/// review, PR #323).
+///
+/// Comment lines are skipped using the same language-aware logic as
+/// `scan_script_file` (`is_comment_line`), so a deny-pattern-looking string
+/// inside a `#`/`//`/`--` comment doesn't spuriously defeat a receipt that
+/// the primary scanner would have happily cleared (Greptile review, PR #323).
+fn content_matches_deny_pattern(path: &str, content: &str, deny_pats: &[Pattern]) -> bool {
+    let shebang_interp = detect_interpreter(content);
+    let is_js = shebang_interp.map_or_else(
+        || {
+            path.ends_with(".js")
+                || path.ends_with(".mjs")
+                || path.ends_with(".ts")
+                || path.ends_with(".tsx")
+        },
+        |interp| interp == "node",
+    );
+    let is_lua = shebang_interp.map_or_else(|| path.ends_with(".lua"), |interp| interp == "lua");
+    let mut in_block_comment = false;
     for raw_line in content.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if is_comment_line(line, is_js, is_lua, &mut in_block_comment) {
             continue;
         }
         let clean = strip_safe_pipes(line);
@@ -2054,7 +2075,7 @@ fn ast_receipt_allows_skip(path: &str, deny_pats: &[Pattern]) -> bool {
         return false;
     }
     let text = String::from_utf8_lossy(&content);
-    !content_matches_deny_pattern(&text, deny_pats)
+    !content_matches_deny_pattern(path, &text, deny_pats)
 }
 
 // ─── Script file scanning ────────────────────────────────────────────────────
@@ -8028,7 +8049,48 @@ pub fn main() {
             .or_else(|| v["tool_input"]["new_string"].as_str());
         if let Some(content) = content {
             if let Some(lang) = ast_guard::detect_language(raw_path) {
-                let findings = ast_guard::scan(content, lang);
+                // Reconstruct the full post-write content *before* scanning,
+                // not just before recording the receipt: for `Edit`,
+                // `content` is only `new_string` (the edited snippet), and
+                // scanning just that snippet while a dangerous call sits
+                // untouched elsewhere in the file would clear an `ast-ask`
+                // on a sliver of the file, then record a receipt claiming
+                // the *entire* file was scanned clean — letting a later
+                // chained command skip asking about content that was never
+                // actually scanned (Greptile review, PR #323). The scan and
+                // the receipt must always cover the same bytes.
+                //
+                // The lookup side (`ast_receipt_allows_skip`) always hashes
+                // the *complete current file*, so the recorded hash must
+                // also cover the complete post-write content. For `Write`,
+                // `content` already is the whole file. For `Edit`, `content`
+                // is only `new_string` (the edited snippet) — reconstruct
+                // the full post-edit content from the pre-edit on-disk file
+                // plus old_string/new_string instead.
+                let full_content: std::borrow::Cow<'_, [u8]> = if tool_name == "Edit" {
+                    let old_string = v["tool_input"]["old_string"].as_str();
+                    let replace_all = v["tool_input"]["replace_all"].as_bool().unwrap_or(false);
+                    match (fs::read_to_string(&abs_path), old_string) {
+                        (Ok(pre_edit), Some(old)) if !old.is_empty() => {
+                            let post_edit = if replace_all {
+                                pre_edit.replace(old, content)
+                            } else {
+                                pre_edit.replacen(old, content, 1)
+                            };
+                            std::borrow::Cow::Owned(post_edit.into_bytes())
+                        }
+                        // Can't reconstruct the full file (unreadable, or no
+                        // old_string to anchor on) — fall back to the
+                        // snippet alone for both the scan and the receipt;
+                        // worst case this just costs a redundant ask later
+                        // when the hash doesn't match.
+                        _ => std::borrow::Cow::Borrowed(content.as_bytes()),
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_bytes())
+                };
+                let scan_target = String::from_utf8_lossy(&full_content);
+                let findings = ast_guard::scan(&scan_target, lang);
                 if !findings.is_empty() {
                     // Dedup identical `[rule] reason` lines before joining:
                     // a single Write can trip two different rule *matches*
@@ -8061,37 +8123,6 @@ pub fn main() {
                 // of re-deriving the same "nothing here" conclusion from
                 // scratch. Canonicalize leniently since the file may not
                 // exist on disk yet (this hook runs before the write).
-                //
-                // The lookup side (`ast_receipt_allows_skip`) always hashes
-                // the *complete current file*, so the recorded hash must
-                // also cover the complete post-write content. For `Write`,
-                // `content` already is the whole file. For `Edit`, `content`
-                // is only `new_string` (the edited snippet) — hash that
-                // alone and a later full-file hash can never match, so Edit
-                // would never benefit from a receipt. Reconstruct the full
-                // post-edit content from the pre-edit on-disk file plus
-                // old_string/new_string instead (Greptile review, PR #323).
-                let full_content: std::borrow::Cow<'_, [u8]> = if tool_name == "Edit" {
-                    let old_string = v["tool_input"]["old_string"].as_str();
-                    let replace_all = v["tool_input"]["replace_all"].as_bool().unwrap_or(false);
-                    match (fs::read_to_string(&abs_path), old_string) {
-                        (Ok(pre_edit), Some(old)) if !old.is_empty() => {
-                            let post_edit = if replace_all {
-                                pre_edit.replace(old, content)
-                            } else {
-                                pre_edit.replacen(old, content, 1)
-                            };
-                            std::borrow::Cow::Owned(post_edit.into_bytes())
-                        }
-                        // Can't reconstruct the full file (unreadable, or no
-                        // old_string to anchor on) — fall back to the
-                        // snippet alone; worst case this just costs a
-                        // redundant ask later when the hash doesn't match.
-                        _ => std::borrow::Cow::Borrowed(content.as_bytes()),
-                    }
-                } else {
-                    std::borrow::Cow::Borrowed(content.as_bytes())
-                };
                 if let Some(canonical) = canonicalize_lenient(&abs_path) {
                     record_ast_receipt(&canonical, &full_content);
                 }
@@ -10304,6 +10335,44 @@ mod tests {
             );
         });
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ast_receipt_comment_only_deny_text_allows_skip() {
+        // Greptile review, PR #323: `content_matches_deny_pattern` must
+        // ignore comment text the same way the primary scanner
+        // (`scan_script_file` / `is_comment_line`) does. A helper whose
+        // only "dangerous-looking" text is inside a `#` comment is not
+        // actually dangerous and must not lose its receipt-based skip.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_comment_only");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            let helper_content = b"# shutil.rmtree('/') is dangerous\nprint('hi')\n";
+            fs::write(&helper, helper_content).unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+            assert!(
+                ast_receipt_allows_skip(helper.to_str().unwrap(), &deny_pats()),
+                "deny-pattern text that only ever appears inside a comment must not block the skip"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn content_matches_deny_pattern_ignores_comment_but_flags_live_code() {
+        // Same dangerous call: flagged as live code, ignored as a comment.
+        assert!(!content_matches_deny_pattern(
+            "helper.py",
+            "# shutil.rmtree('/') is dangerous\nprint('hi')\n",
+            &deny_pats()
+        ));
+        assert!(content_matches_deny_pattern(
+            "helper.py",
+            "import shutil\nshutil.rmtree('/')\n",
+            &deny_pats()
+        ));
     }
 
     #[test]
