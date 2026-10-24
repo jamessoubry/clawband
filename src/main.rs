@@ -1911,6 +1911,173 @@ fn strip_sqz(cmd: &str) -> String {
     sqz.replace(cmd, "").into_owned()
 }
 
+// ─── AST-receipt bridge (issue #300) ─────────────────────────────────────────
+// `ast_guard::scan` runs in the Write/Edit/MultiEdit/NotebookEdit hook, but
+// each PreToolUse hook invocation is a fresh process with no memory of prior
+// ones. Without a bridge, a later Bash call that chains to a file ast_guard
+// already cleared (e.g. `python3 foo.py` after `foo.py` was just written and
+// found clean) can't see that — the chained-script checks below have no way
+// to know the file was already vetted, so they fall back to a generic ask.
+//
+// This appends a small JSONL receipt whenever `ast_guard::scan` finds nothing
+// for a file it can parse, and lets the chained-script checks consult it
+// before falling back to that generic ask — but only when (a) the extension
+// is one `ast_guard::detect_language` actually parses (unsupported
+// extensions, e.g. `.sh`/`.bash`, must never consult this: clawband's own
+// regex/text checks remain sole authority there), and (b) a hash of the
+// file's current on-disk content still matches the hash recorded at scan
+// time (TOCTOU guard — if the file changed since, the hash won't match and
+// it falls back to asking). This can only ever remove a redundant `ask`:
+// the underlying deny/ask pattern matching on the Bash segment runs
+// independently of this check and is never gated by it, so a real deny/ask
+// match still fires regardless of what this returns.
+
+fn ast_receipts_path() -> PathBuf {
+    config_dir().join("ast-receipts.jsonl")
+}
+
+/// Appends a receipt recording that `ast_guard::scan` found nothing for
+/// `content` at `canonical_path`. Best-effort: this is an optimization
+/// cache, not a security control, so a failure to create the config dir or
+/// write the line is silently ignored — losing a receipt only costs a
+/// redundant ask later, it never causes a missed deny/ask.
+fn record_ast_receipt(canonical_path: &str, content: &[u8]) {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let line = serde_json::json!({
+        "path": canonical_path,
+        "hash": sha256_hex(content),
+        "decision": "allow",
+        "timestamp": timestamp,
+    })
+    .to_string();
+    let path = ast_receipts_path();
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Canonicalizes `path` the same lenient way `edit_candidates` does for
+/// write targets: if it already exists, canonicalize it directly; otherwise
+/// canonicalize its parent and re-join the filename, so a file that doesn't
+/// exist on disk yet (e.g. the first write of a new file) still gets a
+/// stable canonical key. Returns `None` if even the parent can't be
+/// resolved.
+fn canonicalize_lenient(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    let canon = if p.exists() {
+        fs::canonicalize(p).ok()
+    } else {
+        p.parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            .and_then(|canon_parent| p.file_name().map(|name| canon_parent.join(name)))
+    };
+    canon.map(|c| c.to_string_lossy().into_owned())
+}
+
+/// Returns the hash recorded by the last `decision: "allow"` receipt for
+/// `canonical_path`, or `None` if there isn't one. The log is append-only
+/// and unbounded (not pruned/rotated — out of scope for issue #300), so this
+/// reads every line and keeps the last match: a later entry for the same
+/// path supersedes an earlier one.
+fn lookup_ast_receipt_hash(canonical_path: &str) -> Option<String> {
+    let data = fs::read_to_string(ast_receipts_path()).ok()?;
+    let mut found: Option<String> = None;
+    for line in data.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["path"].as_str() == Some(canonical_path) && v["decision"].as_str() == Some("allow") {
+            if let Some(hash) = v["hash"].as_str() {
+                found = Some(hash.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// True when `content` (the current on-disk content of a chained-script
+/// target at `path`) matches any of clawband's own deny patterns.
+/// `ast_guard::scan`'s rule coverage is intentionally narrower than the
+/// deny-pattern regex set (e.g. it doesn't flag `shutil.rmtree(...)` in
+/// Python even though the deny patterns do) — so a receipt saying
+/// "ast_guard found nothing" must never be read as "nothing dangerous here"
+/// on its own. This re-runs the same deny-pattern check used elsewhere for
+/// script content before a receipt is allowed to suppress an ask (Greptile
+/// review, PR #323).
+///
+/// Comment lines are skipped using the same language-aware logic as
+/// `scan_script_file` (`is_comment_line`), so a deny-pattern-looking string
+/// inside a `#`/`//`/`--` comment doesn't spuriously defeat a receipt that
+/// the primary scanner would have happily cleared (Greptile review, PR #323).
+fn content_matches_deny_pattern(path: &str, content: &str, deny_pats: &[Pattern]) -> bool {
+    let shebang_interp = detect_interpreter(content);
+    let is_js = shebang_interp.map_or_else(
+        || {
+            path.ends_with(".js")
+                || path.ends_with(".mjs")
+                || path.ends_with(".ts")
+                || path.ends_with(".tsx")
+        },
+        |interp| interp == "node",
+    );
+    let is_lua = shebang_interp.map_or_else(|| path.ends_with(".lua"), |interp| interp == "lua");
+    let mut in_block_comment = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if is_comment_line(line, is_js, is_lua, &mut in_block_comment) {
+            continue;
+        }
+        let clean = strip_safe_pipes(line);
+        for segment in &split_segments(&clean) {
+            if deny_pats.iter().any(|p| p.matches(segment)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when a prior `ast_guard::scan` already cleared the file currently at
+/// `path`, nothing has changed since, and the file's content still doesn't
+/// match any of clawband's own deny patterns (see `content_matches_deny_pattern`).
+/// Fails safe (returns `false`, i.e. "don't skip the ask") in every
+/// direction: unsupported extension (never consulted — `ast_guard` never had
+/// a chance to clear it), no receipt, unreadable file, a hash mismatch (file
+/// changed since it was scanned), or a deny-pattern match the ast_guard
+/// receipt alone wouldn't have caught.
+fn ast_receipt_allows_skip(path: &str, deny_pats: &[Pattern]) -> bool {
+    if ast_guard::detect_language(path).is_none() {
+        return false;
+    }
+    let Some(canonical) = canonicalize_lenient(path) else {
+        return false;
+    };
+    let Some(expected_hash) = lookup_ast_receipt_hash(&canonical) else {
+        return false;
+    };
+    let Ok(content) = fs::read(&canonical) else {
+        return false;
+    };
+    if sha256_hex(&content) != expected_hash {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&content);
+    !content_matches_deny_pattern(path, &text, deny_pats)
+}
+
 // ─── Script file scanning ────────────────────────────────────────────────────
 // When an interpreter runs a script file, read it and check each line against
 // deny/ask patterns. Handles shell, Python, JS/TS, Perl, and Lua files.
@@ -2087,19 +2254,34 @@ fn detect_interpreter(content: &str) -> Option<&'static str> {
     }
 }
 
-/// Returns `true` if `line` (already trimmed) is a comment and should be
-/// skipped during pattern scanning.  Updates `in_block_comment` in place for
-/// multi-line block comment tracking.
+/// Returns `true` if `line` (already trimmed) is *entirely* a comment and
+/// should be skipped during pattern scanning. Updates `in_block_comment` in
+/// place for multi-line block comment tracking.
+///
+/// A block comment that opens and closes on the same line (JS `/* ... */`,
+/// Lua `--[[ ... ]]`) may be followed by real executable code on that same
+/// line (e.g. `/* note */ fs.rmSync(...)`). In that case this must return
+/// `false` ("not a comment line") rather than `true`, even though the line
+/// *starts* with a comment opener — otherwise callers skip the trailing code
+/// entirely and a destructive call hides behind a leading comment. Returning
+/// `false` here just means the caller scans the full raw line (comment text
+/// included) against deny/ask patterns, which is a safe direction to err in:
+/// comment text spuriously tripping a pattern is a false-positive ask, never
+/// a missed deny (Greptile review, PR #323 round 3).
 fn is_comment_line(line: &str, is_js: bool, is_lua: bool, in_block_comment: &mut bool) -> bool {
     if is_js {
         if *in_block_comment {
-            if line.contains("*/") {
+            if let Some(idx) = line.find("*/") {
                 *in_block_comment = false;
+                return line[idx + 2..].trim().is_empty();
             }
             return true;
         }
         if line.starts_with("/*") {
-            *in_block_comment = !line.contains("*/");
+            if let Some(idx) = line.find("*/") {
+                return line[idx + 2..].trim().is_empty();
+            }
+            *in_block_comment = true;
             return true;
         }
         if line.starts_with("//") || line.starts_with('*') {
@@ -2109,13 +2291,17 @@ fn is_comment_line(line: &str, is_js: bool, is_lua: bool, in_block_comment: &mut
 
     if is_lua {
         if *in_block_comment {
-            if line.contains("]]") {
+            if let Some(idx) = line.find("]]") {
                 *in_block_comment = false;
+                return line[idx + 2..].trim().is_empty();
             }
             return true;
         }
         if line.starts_with("--[[") {
-            *in_block_comment = !line.contains("]]");
+            if let Some(idx) = line.find("]]") {
+                return line[idx + 2..].trim().is_empty();
+            }
+            *in_block_comment = true;
             return true;
         }
         if line.starts_with("--") {
@@ -2199,6 +2385,15 @@ fn scan_script_file(
 
         // Reuse compound-command splitting so `foo && rm -rf /` is caught
         let clean = strip_safe_pipes(line);
+        // Tracks whether an earlier segment *on this same line* changed the
+        // working directory (`cd`/`pushd`). A relative chained-script target
+        // appearing after such a segment resolves against that new
+        // directory at runtime, not against the hook process's cwd — so the
+        // receipt lookup below (which canonicalizes against the hook's own
+        // cwd) could silently clear the wrong file of the same name. Fail
+        // safe by never consulting the receipt in that case (Greptile
+        // review, PR #323).
+        let mut line_changed_dir = false;
         for segment in &split_segments(&clean) {
             if allow_pats.iter().any(|p| p.matches(segment)) {
                 continue;
@@ -2248,9 +2443,32 @@ fn scan_script_file(
                 }
             }
             // Chained-script detection: record first match but keep scanning
-            // so deny/ask patterns on later lines still take priority.
+            // so deny/ask patterns on later lines still take priority. Issue
+            // #300: before recording it, check whether ast_guard already
+            // cleared the chained-to file in an earlier Write/Edit hook call
+            // and nothing has changed since — if so, this is a redundant
+            // ask and can be skipped.
             if chained_match.is_none() && is_chained_script_invocation(segment) {
-                chained_match = Some(raw_line.trim().to_string());
+                let already_cleared = chained_script_target_path(segment).is_some_and(|target| {
+                    let runtime_dir_ambiguous = line_changed_dir && !target.starts_with('/');
+                    // A different line *earlier in this same script file*
+                    // may rewrite the target before this line executes it
+                    // (e.g. `cat payload.txt > helper.py` on one line,
+                    // `python3 helper.py` on a later one) — the same
+                    // self-rewrite TOCTOU `command_may_rewrite_target`
+                    // guards against for a single compound Bash command,
+                    // just scoped to the whole file's text instead (third
+                    // Claude review round on PR #323).
+                    !runtime_dir_ambiguous
+                        && !command_may_rewrite_target(&content, &target)
+                        && ast_receipt_allows_skip(&target, deny_pats)
+                });
+                if !already_cleared {
+                    chained_match = Some(raw_line.trim().to_string());
+                }
+            }
+            if segment_changes_directory(segment) {
+                line_changed_dir = true;
             }
         }
     }
@@ -2264,6 +2482,18 @@ fn scan_script_file(
         ));
     }
     None
+}
+
+/// Returns true if `segment` changes the shell's working directory (`cd` or
+/// `pushd`). Used to detect when a later relative chained-script target on
+/// the same line would resolve against a different directory at runtime
+/// than the one the hook process itself is running in (Greptile review, PR
+/// #323 — see `line_changed_dir` in `scan_script_file`).
+fn segment_changes_directory(segment: &str) -> bool {
+    use std::sync::OnceLock;
+    static CD_RE: OnceLock<Regex> = OnceLock::new();
+    let cd_re = CD_RE.get_or_init(|| Regex::new(r"(?i)^\s*(?:cd|pushd)\b").unwrap());
+    cd_re.is_match(segment)
 }
 
 /// Returns true if `segment` looks like an invocation of another script file
@@ -2293,6 +2523,37 @@ fn is_chained_script_invocation(segment: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Extracts the target file path from a segment `is_chained_script_invocation`
+/// already matched, so the ast-receipt bridge (issue #300) can look it up.
+/// Mirrors that function's three shapes (interpreter + path, source/dot, and
+/// direct `./path` execution) but captures the path instead of just
+/// confirming the shape. Returns `None` if `segment` doesn't match any of
+/// them — callers only call this after `is_chained_script_invocation` has
+/// already returned `true` for the same segment, so this should not
+/// normally happen, but a safe fallback (no receipt lookup, fall through to
+/// the existing ask) costs nothing.
+fn chained_script_target_path(segment: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static INTERP_RE: OnceLock<Regex> = OnceLock::new();
+    static SOURCE_RE: OnceLock<Regex> = OnceLock::new();
+    static DIRECT_RE: OnceLock<Regex> = OnceLock::new();
+    let interp_re = INTERP_RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(?:bash|sh|zsh|python3?|ruby|perl|node)\s+([^-\s]\S*)").unwrap()
+    });
+    if let Some(caps) = interp_re.captures(segment) {
+        return Some(caps[1].trim_matches('"').trim_matches('\'').to_string());
+    }
+    let source_re = SOURCE_RE.get_or_init(|| Regex::new(r"(?i)^\s*(?:source|\.)\s+(\S+)").unwrap());
+    if let Some(caps) = source_re.captures(segment) {
+        return Some(caps[1].trim_matches('"').trim_matches('\'').to_string());
+    }
+    let direct_re = DIRECT_RE.get_or_init(|| Regex::new(r"(?i)^\s*(\./\S+)").unwrap());
+    if let Some(caps) = direct_re.captures(segment) {
+        return Some(caps[1].trim_matches('"').trim_matches('\'').to_string());
+    }
+    None
 }
 
 // ─── Git force push check ─────────────────────────────────────────────────────
@@ -6138,6 +6399,53 @@ fn check_write_then_execute(segments: &[String]) -> bool {
     })
 }
 
+/// True when `command` (a full, possibly-compound command string) both
+/// mentions `target`'s basename more than once and contains a write-like
+/// redirect or copy pointed at that same basename anywhere in the string.
+/// This is the conservative signal that the command may rewrite `target`
+/// after an earlier execution of it within the *same* command — e.g.
+/// `python3 helper.py; cat payload.txt > helper.py; python3 helper.py` — so
+/// a receipt taken from the file's state before the whole command ran can't
+/// be trusted: by the time a later segment executes the file, its content
+/// may no longer match what was scanned. Deliberately coarse (basename +
+/// "any write" rather than precisely ordering segments) per the Greptile
+/// review on PR #323 — false positives here only cost a redundant ask, so
+/// erring toward "may rewrite" is safe.
+fn command_may_rewrite_target(command: &str, target: &str) -> bool {
+    let target_base = path_basename(target);
+    if target_base.is_empty() {
+        return false;
+    }
+    if command.matches(target_base).count() < 2 {
+        return false;
+    }
+    // Split on `&&`/`||`/`;`/newline first (but not `|`) so a redirect
+    // target immediately followed by a separator — e.g. `> helper.py;` with
+    // no space — isn't swallowed into the captured filename by `\S+`.
+    let clean = strip_safe_pipes(command);
+    let segments = split_segments(&clean);
+    // Plain `>`/`>>` redirects, skipping fd-redirects like `2>/dev/null`
+    // (mirrors `check_write_then_execute`'s write_re).
+    let write_re = Regex::new(r"(?:[0-9&]>>?\s*\S+|>>?\s*(\S+))").unwrap();
+    // `cp <src> <target>` style copy-to-file.
+    let cp_re = Regex::new(r"(?i)\bcp\s+(?:-\S+\s+)*\S+\s+(\S+)").unwrap();
+    for segment in &segments {
+        for caps in write_re.captures_iter(segment) {
+            if let Some(m) = caps.get(1) {
+                if path_basename(m.as_str().trim_matches('"').trim_matches('\'')) == target_base {
+                    return true;
+                }
+            }
+        }
+        for caps in cp_re.captures_iter(segment) {
+            if path_basename(caps[1].trim_matches('"').trim_matches('\'')) == target_base {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ─── Heredoc content scanning (issue #216) ───────────────────────────────────
 
 /// Try to extract and scan the body of a heredoc within a write-then-exec command.
@@ -6157,7 +6465,23 @@ fn try_scan_heredoc_content(
     // Match << or <<- followed by optional quotes and a word delimiter.
     let heredoc_re = HEREDOC_RE.get_or_init(|| Regex::new(r#"<<-?\s*['"]?(\w+)['"]?"#).unwrap());
 
+    // Issue #300: before falling back to the generic "content cannot be
+    // scanned" ask, check whether ast_guard already cleared the executed
+    // file in an earlier Write/Edit hook call and nothing has changed since
+    // — the heredoc body isn't visible here, but if the file's current
+    // on-disk content still matches what was scanned when it was written,
+    // this ask would be redundant. `extract_script_path` recovers the
+    // executed file's path from the full compound command the same way the
+    // top-level script-scan path does.
     let fallback = || {
+        let already_cleared = extract_script_path(command).is_some_and(|target| {
+            variable_name_from_path(&target).is_none()
+                && !command_may_rewrite_target(command, &target)
+                && ast_receipt_allows_skip(&target, deny_pats)
+        });
+        if already_cleared {
+            return None;
+        }
         Some((
             "ask",
             "Compound command writes to a script file then executes it — \
@@ -7744,7 +8068,48 @@ pub fn main() {
             .or_else(|| v["tool_input"]["new_string"].as_str());
         if let Some(content) = content {
             if let Some(lang) = ast_guard::detect_language(raw_path) {
-                let findings = ast_guard::scan(content, lang);
+                // Reconstruct the full post-write content *before* scanning,
+                // not just before recording the receipt: for `Edit`,
+                // `content` is only `new_string` (the edited snippet), and
+                // scanning just that snippet while a dangerous call sits
+                // untouched elsewhere in the file would clear an `ast-ask`
+                // on a sliver of the file, then record a receipt claiming
+                // the *entire* file was scanned clean — letting a later
+                // chained command skip asking about content that was never
+                // actually scanned (Greptile review, PR #323). The scan and
+                // the receipt must always cover the same bytes.
+                //
+                // The lookup side (`ast_receipt_allows_skip`) always hashes
+                // the *complete current file*, so the recorded hash must
+                // also cover the complete post-write content. For `Write`,
+                // `content` already is the whole file. For `Edit`, `content`
+                // is only `new_string` (the edited snippet) — reconstruct
+                // the full post-edit content from the pre-edit on-disk file
+                // plus old_string/new_string instead.
+                let full_content: std::borrow::Cow<'_, [u8]> = if tool_name == "Edit" {
+                    let old_string = v["tool_input"]["old_string"].as_str();
+                    let replace_all = v["tool_input"]["replace_all"].as_bool().unwrap_or(false);
+                    match (fs::read_to_string(&abs_path), old_string) {
+                        (Ok(pre_edit), Some(old)) if !old.is_empty() => {
+                            let post_edit = if replace_all {
+                                pre_edit.replace(old, content)
+                            } else {
+                                pre_edit.replacen(old, content, 1)
+                            };
+                            std::borrow::Cow::Owned(post_edit.into_bytes())
+                        }
+                        // Can't reconstruct the full file (unreadable, or no
+                        // old_string to anchor on) — fall back to the
+                        // snippet alone for both the scan and the receipt;
+                        // worst case this just costs a redundant ask later
+                        // when the hash doesn't match.
+                        _ => std::borrow::Cow::Borrowed(content.as_bytes()),
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_bytes())
+                };
+                let scan_target = String::from_utf8_lossy(&full_content);
+                let findings = ast_guard::scan(&scan_target, lang);
                 if !findings.is_empty() {
                     // Dedup identical `[rule] reason` lines before joining:
                     // a single Write can trip two different rule *matches*
@@ -7769,6 +8134,16 @@ pub fn main() {
                     }
                     output("ask", &reason);
                     return;
+                }
+                // Issue #300: ast_guard found nothing to flag — record a
+                // receipt so a later, separate Bash hook invocation that
+                // chains to this same file (and can't see its content
+                // inline in the command) can skip a redundant ask instead
+                // of re-deriving the same "nothing here" conclusion from
+                // scratch. Canonicalize leniently since the file may not
+                // exist on disk yet (this hook runs before the write).
+                if let Some(canonical) = canonicalize_lenient(&abs_path) {
+                    record_ast_receipt(&canonical, &full_content);
                 }
             }
         }
@@ -9801,6 +10176,454 @@ mod tests {
         );
     }
 
+    // ── AST-receipt bridge (issue #300) ───────────────────────────────────────
+
+    /// Creates an isolated `$HOME` with an empty `.clawband/` dir so receipt
+    /// reads/writes in a test don't touch the real `~/.clawband` or leak
+    /// between tests. Returns the temp dir (keep alive until the test ends)
+    /// and the fake home path.
+    fn fresh_fake_home(name: &str) -> (PathBuf, PathBuf) {
+        let tmp = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let fake_home = tmp.join("home");
+        fs::create_dir_all(fake_home.join(".clawband")).unwrap();
+        (tmp, fake_home)
+    }
+
+    #[test]
+    fn ast_receipt_roundtrip_matches_hash() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_roundtrip");
+        with_fake_home(&fake_home, || {
+            let target = tmp.join("cleared.py");
+            fs::write(&target, b"print('hi')\n").unwrap();
+            let canonical = canonicalize_lenient(target.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, b"print('hi')\n");
+            assert!(
+                ast_receipt_allows_skip(target.to_str().unwrap(), &deny_pats()),
+                "unmodified file with a matching receipt must allow skipping the ask"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ast_receipt_hash_mismatch_falls_back() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_mismatch");
+        with_fake_home(&fake_home, || {
+            let target = tmp.join("changed.py");
+            fs::write(&target, b"print('hi')\n").unwrap();
+            let canonical = canonicalize_lenient(target.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, b"print('hi')\n");
+            // File changes on disk after the receipt was recorded (TOCTOU).
+            fs::write(&target, b"import os\nos.system('rm -rf /')\n").unwrap();
+            assert!(
+                !ast_receipt_allows_skip(target.to_str().unwrap(), &deny_pats()),
+                "a file that changed since it was scanned must fall back to asking"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ast_receipt_missing_entry_falls_back() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_missing");
+        with_fake_home(&fake_home, || {
+            let target = tmp.join("never_scanned.py");
+            fs::write(&target, b"print('hi')\n").unwrap();
+            assert!(
+                !ast_receipt_allows_skip(target.to_str().unwrap(), &deny_pats()),
+                "no receipt at all must fall back to asking"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ast_receipt_unsupported_extension_never_consulted() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_unsupported_ext");
+        with_fake_home(&fake_home, || {
+            // .sh is not an ast_guard-supported extension (detect_language
+            // returns None). Even a stale receipt whose hash *does* match
+            // current content must never be consulted for it — clawband's
+            // regex/text checks remain sole authority for extensions
+            // ast_guard can't parse.
+            let target = tmp.join("script.sh");
+            fs::write(&target, b"echo hi\n").unwrap();
+            let canonical = canonicalize_lenient(target.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, b"echo hi\n");
+            assert!(
+                !ast_receipt_allows_skip(target.to_str().unwrap(), &deny_pats()),
+                "unsupported extensions must never consult a receipt, even a matching one"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn chained_script_target_path_extracts_interpreter_form() {
+        assert_eq!(
+            chained_script_target_path("python3 helper.py"),
+            Some("helper.py".to_string())
+        );
+    }
+
+    #[test]
+    fn chained_script_target_path_extracts_source_form() {
+        assert_eq!(
+            chained_script_target_path("source ./env.sh"),
+            Some("./env.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn chained_script_target_path_extracts_direct_exec_form() {
+        assert_eq!(
+            chained_script_target_path("./deploy.sh"),
+            Some("./deploy.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn scan_chained_python3_skips_when_receipt_matches() {
+        // End-to-end through scan_script_file: a chained `python3 <path>`
+        // invocation is NOT flagged when ast_guard already cleared that
+        // exact, unmodified file content in an earlier Write/Edit hook call.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_chained_skip");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            let helper_content = b"print('hi')\n";
+            fs::write(&helper, helper_content).unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+
+            let script = format!("#!/bin/bash\npython3 {}\n", helper.to_str().unwrap());
+            let r = scan_content_decision("ch_receipt_skip", "sh", &script);
+            assert_eq!(
+                r, None,
+                "a chained invocation of an already-cleared, unmodified file must not ask"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_chained_python3_asks_when_receipt_stale() {
+        // Same shape as above, but the file changes after the receipt was
+        // recorded — the hash mismatch must fall back to the normal ask.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_chained_stale");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            fs::write(&helper, b"print('hi')\n").unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, b"print('hi')\n");
+            // File modified after the receipt — stale.
+            fs::write(&helper, b"print('changed')\n").unwrap();
+
+            let script = format!("#!/bin/bash\npython3 {}\n", helper.to_str().unwrap());
+            let r = scan_content_decision("ch_receipt_stale", "sh", &script);
+            assert_eq!(r.as_ref().map(|(d, _)| d.as_str()), Some("ask"));
+            assert!(r.unwrap().1.contains("chains to another script"));
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ast_receipt_destructive_helper_content_denies_skip() {
+        // Greptile review, PR #323: ast_guard's structural scan doesn't flag
+        // `shutil.rmtree('/')`, but clawband's own deny-pattern regex set
+        // does. A receipt saying "ast_guard found nothing" must never be
+        // enough on its own to skip the ask when the content also matches
+        // an existing deny pattern.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_destructive");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            let helper_content = b"import shutil\nshutil.rmtree('/')\n";
+            fs::write(&helper, helper_content).unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+            assert!(
+                !ast_receipt_allows_skip(helper.to_str().unwrap(), &deny_pats()),
+                "a matching deny pattern must block the receipt skip even when the hash matches"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ast_receipt_comment_only_deny_text_allows_skip() {
+        // Greptile review, PR #323: `content_matches_deny_pattern` must
+        // ignore comment text the same way the primary scanner
+        // (`scan_script_file` / `is_comment_line`) does. A helper whose
+        // only "dangerous-looking" text is inside a `#` comment is not
+        // actually dangerous and must not lose its receipt-based skip.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_comment_only");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            let helper_content = b"# shutil.rmtree('/') is dangerous\nprint('hi')\n";
+            fs::write(&helper, helper_content).unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+            assert!(
+                ast_receipt_allows_skip(helper.to_str().unwrap(), &deny_pats()),
+                "deny-pattern text that only ever appears inside a comment must not block the skip"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn content_matches_deny_pattern_ignores_comment_but_flags_live_code() {
+        // Same dangerous call: flagged as live code, ignored as a comment.
+        assert!(!content_matches_deny_pattern(
+            "helper.py",
+            "# shutil.rmtree('/') is dangerous\nprint('hi')\n",
+            &deny_pats()
+        ));
+        assert!(content_matches_deny_pattern(
+            "helper.py",
+            "import shutil\nshutil.rmtree('/')\n",
+            &deny_pats()
+        ));
+    }
+
+    #[test]
+    fn content_matches_deny_pattern_catches_code_trailing_inline_block_comment() {
+        // Greptile review, PR #323 round 3: `/* note */ fs.rmSync(...)` must
+        // not be swallowed whole just because the line starts with a block
+        // comment opener — the destructive call after the comment closes on
+        // the same line has to be scanned.
+        assert!(content_matches_deny_pattern(
+            "helper.js",
+            "const fs = require('fs');\n/* note */ fs.rmSync('/tmp/important', {recursive: true});\n",
+            &deny_pats()
+        ));
+    }
+
+    #[test]
+    fn content_matches_deny_pattern_still_ignores_pure_block_comment_line() {
+        // Regression guard: a line that really is just a comment (nothing
+        // trailing after the close) must still be skipped.
+        assert!(!content_matches_deny_pattern(
+            "helper.js",
+            "/* this is just a comment, nothing else */\nconsole.log('hi');\n",
+            &deny_pats()
+        ));
+    }
+
+    #[test]
+    fn content_matches_deny_pattern_catches_code_trailing_lua_inline_block_comment() {
+        // Lua equivalent of the JS inline-block-comment bypass.
+        assert!(content_matches_deny_pattern(
+            "helper.lua",
+            "--[[ note ]] os.execute('rm -rf /')\n",
+            &deny_pats()
+        ));
+    }
+
+    #[test]
+    fn scan_chained_destructive_helper_still_asks_despite_receipt() {
+        // End-to-end: a receipt exists and the hash matches, but the
+        // receipted file's content matches an existing deny pattern
+        // (`shutil.rmtree`) that ast_guard itself never flagged — the
+        // chained-script ask must still fire.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_destructive_chain");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            let helper_content = b"import shutil\nshutil.rmtree('/')\n";
+            fs::write(&helper, helper_content).unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+
+            let script = format!("#!/bin/bash\npython3 {}\n", helper.to_str().unwrap());
+            let r = scan_content_decision("ch_receipt_destructive", "sh", &script);
+            assert_eq!(
+                r.as_ref().map(|(d, _)| d.as_str()),
+                Some("ask"),
+                "a receipt must not suppress the ask when the content matches a deny pattern: {r:?}"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_chained_target_after_cd_not_skipped_despite_receipt() {
+        // Greptile review, PR #323: a relative chained-script target that
+        // follows a `cd` on the same line resolves against the directory
+        // the script actually changes into at runtime, not against the
+        // hook process's own cwd. A receipt recorded for a same-named file
+        // that happens to live in the hook's cwd must NOT be consulted —
+        // doing so could clear the wrong file entirely.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_cd_ambiguous");
+        with_fake_home(&fake_home, || {
+            // Receipt for a file resolved relative to *this process's* cwd
+            // (not "other/"), matching what `chained_script_target_path`
+            // would naively resolve to if it ignored the preceding `cd`. Use
+            // a name unique to this test (rather than a generic
+            // `helper.py`) — other, unlocked tests in this same binary also
+            // resolve a bare relative `helper.py` against the real process
+            // cwd, and `HOME` is a process-global env var that `with_fake_home`
+            // briefly overrides, so a receipt recorded here under a shared
+            // name could otherwise be observed by one of those tests running
+            // concurrently on another thread and change its outcome.
+            let helper_name = format!("cb_cd_ambiguous_helper_{}.py", std::process::id());
+            let helper_content = b"print('hi')\n";
+            let cwd_helper = std::env::current_dir().unwrap().join(&helper_name);
+            let wrote_cwd_helper = !cwd_helper.exists();
+            if wrote_cwd_helper {
+                fs::write(&cwd_helper, helper_content).unwrap();
+            }
+            let canonical = canonicalize_lenient(cwd_helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+
+            let script = format!("#!/bin/bash\ncd other && python3 {helper_name}\n");
+            let r = scan_content_decision("ch_receipt_cd", "sh", &script);
+            assert_eq!(
+                r.as_ref().map(|(d, _)| d.as_str()),
+                Some("ask"),
+                "a cd before the chained target must fall back to ask, not a stale receipt: {r:?}"
+            );
+
+            if wrote_cwd_helper {
+                let _ = fs::remove_file(&cwd_helper);
+            }
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn command_may_rewrite_target_detects_self_overwrite() {
+        assert!(command_may_rewrite_target(
+            "python3 helper.py; cat payload.txt > helper.py; python3 helper.py",
+            "helper.py"
+        ));
+    }
+
+    #[test]
+    fn command_may_rewrite_target_false_for_single_invocation() {
+        assert!(!command_may_rewrite_target(
+            "python3 helper.py",
+            "helper.py"
+        ));
+    }
+
+    #[test]
+    fn scan_chained_script_self_rewrite_within_file_not_skipped_despite_receipt() {
+        // Third Claude review round on PR #323: the self-rewrite TOCTOU
+        // guard was wired into the compound-Bash-command path
+        // (`try_scan_heredoc_content`) but not into `scan_script_file`'s own
+        // chained-invocation check. A *script file* can perform the same
+        // rewrite-then-exec shape across two of its own lines — e.g.
+        // `cat payload.txt > helper.py` on one line, `python3 helper.py` on
+        // a later one — and a receipt taken from helper.py's state before
+        // the wrapper script ran must not suppress that ask either.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_file_self_rewrite");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            let helper_content = b"print('hi')\n";
+            fs::write(&helper, helper_content).unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+
+            let payload = tmp.join("payload.txt");
+            fs::write(&payload, b"print('owned')\n").unwrap();
+
+            let script = format!(
+                "#!/bin/bash\ncat {} > {}\npython3 {}\n",
+                payload.to_str().unwrap(),
+                helper.to_str().unwrap(),
+                helper.to_str().unwrap(),
+            );
+            let r = scan_content_decision("ch_receipt_file_self_rewrite", "sh", &script);
+            assert_eq!(
+                r.as_ref().map(|(d, _)| d.as_str()),
+                Some("ask"),
+                "a script that rewrites its own chained target on an earlier line must not be \
+                 cleared by a stale receipt: {r:?}"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_then_exec_compound_self_rewrite_not_skipped_despite_receipt() {
+        // Greptile review, PR #323: a compound command that executes a
+        // target, then overwrites it, then executes it again must not have
+        // its ask suppressed by a receipt taken from the file's state
+        // before the whole command ran — the command invalidates its own
+        // precondition partway through.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_self_rewrite");
+        with_fake_home(&fake_home, || {
+            let helper = tmp.join("helper.py");
+            let helper_content = b"print('hi')\n";
+            fs::write(&helper, helper_content).unwrap();
+            let canonical = canonicalize_lenient(helper.to_str().unwrap()).unwrap();
+            record_ast_receipt(&canonical, helper_content);
+
+            let payload = tmp.join("payload.txt");
+            fs::write(&payload, b"print('owned')\n").unwrap();
+
+            let command = format!(
+                "python3 {0}; cat {1} > {0}; python3 {0}",
+                helper.to_str().unwrap(),
+                payload.to_str().unwrap()
+            );
+            let (deny, ask, allow) = (deny_pats(), ask_pats(), no_allow());
+            let r = check_command(&command, &deny, &ask, &allow);
+            assert_eq!(
+                r.as_ref().map(|(d, _)| *d),
+                Some("ask"),
+                "a self-rewriting compound command must not be cleared by a stale receipt: {r:?}"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn edit_receipt_records_full_post_edit_file_hash() {
+        // Greptile review, PR #323: the Edit-tool guard must hash the
+        // complete post-edit file content (pre-edit file with old_string
+        // replaced by new_string), not just the new_string snippet alone —
+        // otherwise the later full-file hash lookup can never match.
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, fake_home) = fresh_fake_home("cb_ast_receipt_edit_full_file");
+        with_fake_home(&fake_home, || {
+            let target = tmp.join("helper.py");
+            fs::write(&target, b"print('before')\nprint('hi')\n").unwrap();
+
+            let old_string = "print('before')\n";
+            let new_string = "print('after')\n";
+            let pre_edit = fs::read_to_string(&target).unwrap();
+            let post_edit = pre_edit.replacen(old_string, new_string, 1);
+
+            let canonical = canonicalize_lenient(target.to_str().unwrap()).unwrap();
+            // Simulate what the Edit-tool guard now records: the full
+            // reconstructed post-edit content, not just `new_string`.
+            record_ast_receipt(&canonical, post_edit.as_bytes());
+
+            // Apply the edit to disk, mirroring what Claude Code's Edit tool
+            // actually does after the hook allows it.
+            fs::write(&target, &post_edit).unwrap();
+
+            assert!(
+                ast_receipt_allows_skip(target.to_str().unwrap(), &deny_pats()),
+                "a receipt hashed over the full post-edit file must match the full on-disk file"
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     // ── shebang-based interpreter detection ───────────────────────────────────
 
     fn scan_no_ext(content: &str) -> Option<String> {
@@ -9846,6 +10669,35 @@ mod tests {
         assert_eq!(
             scan_no_ext("#!/usr/bin/lua\n--[[ rm -rf / ]]\nprint('hi')\n"),
             None
+        );
+    }
+
+    #[test]
+    fn scan_js_catches_code_trailing_inline_block_comment() {
+        // Greptile review, PR #323 round 3: this is `scan_script_file`'s
+        // version of the same trailing-code-after-inline-comment bypass
+        // fixed in `content_matches_deny_pattern` — a `node helper.js`
+        // invocation must still ask when the destructive call hides behind
+        // a same-line block comment.
+        assert_eq!(
+            scan_content(
+                "js_inline_comment_trailing_code",
+                "js",
+                "/* note */ eval('rm -rf /')\n"
+            ),
+            Some("deny".into())
+        );
+    }
+
+    #[test]
+    fn scan_lua_catches_code_trailing_inline_block_comment() {
+        assert_eq!(
+            scan_content(
+                "lua_inline_comment_trailing_code",
+                "lua",
+                "--[[ note ]] os.execute('rm -rf /')\n"
+            ),
+            Some("deny".into())
         );
     }
 

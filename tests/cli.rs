@@ -6168,3 +6168,210 @@ fn e2e_ast_guard_ignores_html_script_local_src() {
     let out = run(json, &[]);
     assert_eq!(decision(&out), None, "{out}");
 }
+
+// ── issue #300: ast-receipt bridge ─────────────────────────────────────────
+// Bridges ast_guard verdicts across separate hook invocations: a file
+// ast_guard already cleared when it was written (via the Write hook) can be
+// chained to later (a separate Bash hook invocation) without a redundant
+// generic "contents not scanned" ask -- but only while the file's on-disk
+// content still matches exactly what was cleared.
+
+fn fake_home_for_ast_receipt(tag: &str) -> std::path::PathBuf {
+    let home =
+        std::env::temp_dir().join(format!("cb_ast_receipt_e2e_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".clawband")).unwrap();
+    home
+}
+
+#[test]
+fn e2e_ast_receipt_skips_redundant_chained_ask_when_unmodified() {
+    let home = fake_home_for_ast_receipt("skip");
+    let h = home.to_str().unwrap();
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let dir = scratch.path();
+
+    // 1. Write hook clears helper.py (no ast_guard findings) -- this must
+    //    record a receipt.
+    let helper = dir.join("helper.py");
+    let write_json = format!(
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":{:?},"content":"print('hi')\n"}}}}"#,
+        helper.to_str().unwrap()
+    );
+    let out = run_in_dir(&write_json, &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        None,
+        "clean write should not be flagged: {out}"
+    );
+    std::fs::write(&helper, "print('hi')\n").unwrap();
+
+    // 2. A wrapper script chains to helper.py; scanning the wrapper itself
+    //    would normally hit the generic "chains to another script" ask.
+    let wrapper = dir.join("wrapper.sh");
+    std::fs::write(&wrapper, "#!/bin/bash\npython3 helper.py\n").unwrap();
+    let out = run_in_dir(&bash("bash wrapper.sh"), &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        None,
+        "chaining to an unmodified, already-cleared file must not ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_ast_receipt_falls_back_to_ask_when_file_changed_since_scan() {
+    let home = fake_home_for_ast_receipt("stale");
+    let h = home.to_str().unwrap();
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let dir = scratch.path();
+
+    let helper = dir.join("helper.py");
+    let write_json = format!(
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":{:?},"content":"print('hi')\n"}}}}"#,
+        helper.to_str().unwrap()
+    );
+    let out = run_in_dir(&write_json, &[("HOME", h)], dir);
+    assert_eq!(decision(&out), None, "{out}");
+    // The actual on-disk content changes AFTER the receipt was recorded --
+    // the hash no longer matches (TOCTOU guard). Use a benign but
+    // different-from-scanned body so this test doesn't trip clawband's own
+    // guard against itself when editing this test file.
+    std::fs::write(&helper, "print('totally different now')\n").unwrap();
+
+    let wrapper = dir.join("wrapper.sh");
+    std::fs::write(&wrapper, "#!/bin/bash\npython3 helper.py\n").unwrap();
+    let out = run_in_dir(&bash("bash wrapper.sh"), &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "a file that changed since the receipt was recorded must still ask: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}
+
+#[test]
+fn e2e_ast_receipt_falls_back_to_ask_when_no_receipt_exists() {
+    let home = fake_home_for_ast_receipt("none");
+    let h = home.to_str().unwrap();
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let dir = scratch.path();
+
+    // helper.py exists but was never cleared via the Write hook -- no receipt.
+    let helper = dir.join("helper.py");
+    std::fs::write(&helper, "print('hi')\n").unwrap();
+
+    let wrapper = dir.join("wrapper.sh");
+    std::fs::write(&wrapper, "#!/bin/bash\npython3 helper.py\n").unwrap();
+    let out = run_in_dir(&bash("bash wrapper.sh"), &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "no receipt at all must still ask: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}
+
+#[test]
+fn e2e_ast_receipt_unsupported_extension_never_consulted() {
+    // .sh is not an ast_guard-parsed extension -- even if a file at that path
+    // happens to have an entry in ast-receipts.jsonl (shouldn't normally
+    // happen, since the Write hook only records receipts for extensions
+    // ast_guard::detect_language supports), it must never be consulted.
+    let home = fake_home_for_ast_receipt("unsupported-ext");
+    let h = home.to_str().unwrap();
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let dir = scratch.path();
+
+    let helper = dir.join("helper.sh");
+    std::fs::write(&helper, "echo hi\n").unwrap();
+    // Plant a stale/forged receipt directly -- the Write hook itself would
+    // never write one for a .sh file, but this proves the lookup path
+    // itself is extension-gated, not just "nothing ever populates it".
+    let canonical = helper
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let hash = {
+        // Compute the digest in-process via the `sha2` crate (already a
+        // regular dependency, so available to this integration test too)
+        // rather than shelling out to `sha256sum` — that binary doesn't
+        // exist on macOS by default, which would panic this test on that
+        // platform even though macOS is a supported target (Greptile
+        // review, PR #323).
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(&helper).unwrap();
+        let digest = Sha256::digest(&bytes);
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        hex
+    };
+    std::fs::write(
+        home.join(".clawband/ast-receipts.jsonl"),
+        format!(
+            "{{\"path\":{:?},\"hash\":{:?},\"decision\":\"allow\",\"timestamp\":0}}\n",
+            canonical, hash
+        ),
+    )
+    .unwrap();
+
+    let wrapper = dir.join("wrapper.sh");
+    std::fs::write(&wrapper, "#!/bin/bash\nsource helper.sh\n").unwrap();
+    let out = run_in_dir(&bash("bash wrapper.sh"), &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "unsupported extensions must never consult a receipt, even a matching one: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}
+
+#[test]
+fn e2e_ast_receipt_edit_scans_full_file_not_just_edited_snippet() {
+    // Greptile review, PR #323: the Edit hook must scan the *reconstructed
+    // full post-edit file*, not just the edited `new_string` snippet, before
+    // deciding whether to record an ast-receipt. Otherwise a harmless edit to
+    // one part of a file could clear a receipt for the whole file even
+    // though a dangerous call elsewhere in the file -- untouched by this
+    // edit -- was never actually scanned.
+    let home = fake_home_for_ast_receipt("edit-full-scan");
+    let h = home.to_str().unwrap();
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let dir = scratch.path();
+
+    // helper.py already contains a dangerous call that ast_guard flags, plus
+    // an unrelated harmless line we're about to edit.
+    let helper = dir.join("helper.py");
+    std::fs::write(&helper, "exec(input())\nx = 1\n").unwrap();
+
+    // Edit touches only the harmless `x = 1` line -- the edited snippet
+    // itself (`new_string`) is clean on its own, but the full file still
+    // contains the untouched `exec(input())` call.
+    let edit_json = format!(
+        r#"{{"tool_name":"Edit","tool_input":{{"file_path":{:?},"old_string":"x = 1","new_string":"x = 2"}}}}"#,
+        helper.to_str().unwrap()
+    );
+    let out = run_in_dir(&edit_json, &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "an edit must ask when the full post-edit file still contains a flagged call, \
+         even if the edited snippet alone is clean: {out}"
+    );
+
+    // Apply the edit on disk as the agent normally would, then confirm no
+    // receipt was recorded that would let a later chained Bash command skip
+    // asking about the still-present exec(input()) call.
+    std::fs::write(&helper, "exec(input())\nx = 2\n").unwrap();
+    let wrapper = dir.join("wrapper.sh");
+    std::fs::write(&wrapper, "#!/bin/bash\npython3 helper.py\n").unwrap();
+    let out = run_in_dir(&bash("bash wrapper.sh"), &[("HOME", h)], dir);
+    assert_eq!(
+        decision(&out),
+        Some("ask"),
+        "no receipt must have been recorded for the unscanned dangerous content: {out}"
+    );
+    assert!(out.contains("chains to another script"), "{out}");
+}
