@@ -6600,10 +6600,7 @@ fn try_scan_heredoc_content(
         // inspected. Clarify the wording in that case; keep the original
         // wording for the (rarer) case where the target already exists on
         // disk, since that's a genuinely different scenario.
-        let target_missing = target
-            .as_deref()
-            .map(|t| fs::metadata(t).is_err())
-            .unwrap_or(true);
+        let target_missing = target.as_deref().map_or(true, |t| fs::metadata(t).is_err());
         let reason = if target_missing {
             "Compound command writes to a script file then executes it — \
              the target doesn't exist yet (it will be created by this \
