@@ -6446,6 +6446,113 @@ fn command_may_rewrite_target(command: &str, target: &str) -> bool {
     false
 }
 
+// ─── head/tail extraction content scanning (issue #304) ─────────────────────
+
+/// Detects `head -n N SOURCE > TARGET` / `tail -n N SOURCE > TARGET` (and the
+/// legacy `head -N` / `tail -N` shorthand) where `SOURCE` is a literal,
+/// existing, readable path and `N` is a literal positive integer. This shape
+/// is simple enough to read-only reconstruct exactly what the real command
+/// would write to `TARGET` — just reading the first/last `N` lines of
+/// `SOURCE`, no side effects — then scan that reconstructed content the same
+/// way heredoc bodies are scanned.
+///
+/// Returns `None` when the shape doesn't match, or when `N`/`SOURCE` can't be
+/// resolved to literals at hook-eval time (e.g. `N` is a shell variable or
+/// `$((...))` arithmetic, or `SOURCE` doesn't exist/isn't readable) — the
+/// caller falls through to the generic ask fallback in that case, never
+/// guesses. Deliberately excludes `sed`/`awk`/`cut`/arbitrary pipelines:
+/// simulating those risks scanning the wrong content and giving a false
+/// sense of safety worse than just asking, so they're explicitly out of
+/// scope and always fall through to the ask fallback.
+///
+/// When the shape DOES match, returns the inner scan outcome:
+/// `Some(Some(("deny"|"ask", reason)))` when the reconstructed content was
+/// flagged, `Some(None)` when it was clean (allow through).
+fn try_scan_head_tail_extraction(
+    command: &str,
+    deny_pats: &[Pattern],
+    ask_pats: &[Pattern],
+    allow_pats: &[Pattern],
+) -> Option<Option<(&'static str, String)>> {
+    use std::sync::OnceLock;
+    static HEAD_TAIL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = HEAD_TAIL_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(head|tail)\s+-n\s*(-?\d+)\s+(\S+)\s*>>?\s*(\S+)|\b(head|tail)\s+-(\d+)\s+(\S+)\s*>>?\s*(\S+)"#,
+        )
+        .unwrap()
+    });
+    let caps = re.captures(command)?;
+    let (is_tail, n_str, source_raw, target_raw) = if caps.get(1).is_some() {
+        (
+            caps[1].eq_ignore_ascii_case("tail"),
+            caps[2].to_string(),
+            caps[3].to_string(),
+            caps[4].to_string(),
+        )
+    } else {
+        (
+            caps[5].eq_ignore_ascii_case("tail"),
+            caps[6].to_string(),
+            caps[7].to_string(),
+            caps[8].to_string(),
+        )
+    };
+    let n: i64 = n_str.parse().ok()?;
+    if n <= 0 {
+        // `-n -5` ("all but the last 5 lines") and similar aren't the simple
+        // "first/last N lines" shape this handles — fall through to ask.
+        return None;
+    }
+    let n = n as usize;
+    let source = source_raw.trim_matches('"').trim_matches('\'');
+    let target = target_raw.trim_matches('"').trim_matches('\'');
+    // Not a literal path — a shell variable, command substitution, or
+    // arithmetic expression means N or SOURCE can't be resolved here.
+    if source.contains('$') || variable_name_from_path(source).is_some() {
+        return None;
+    }
+    let _ = target; // TARGET isn't needed for the reconstruction itself.
+    let source_content = fs::read_to_string(source).ok()?;
+    let src_lines: Vec<&str> = source_content.lines().collect();
+    let selected: Vec<&str> = if is_tail {
+        let start = src_lines.len().saturating_sub(n);
+        src_lines[start..].to_vec()
+    } else {
+        src_lines.into_iter().take(n).collect()
+    };
+    let mut body = selected.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+
+    let temp_path = std::env::temp_dir().join(format!(
+        "clawband_headtail_{}_{:x}.sh",
+        std::process::id(),
+        {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            command.hash(&mut hasher);
+            hasher.finish()
+        }
+    ));
+    if fs::write(&temp_path, &body).is_err() {
+        return Some(None);
+    }
+    let path_str = temp_path.to_string_lossy().into_owned();
+    let result = scan_script_file(&path_str, deny_pats, ask_pats, allow_pats);
+    let _ = fs::remove_file(&temp_path); // best-effort cleanup
+
+    Some(result.map(|(decision, reason)| {
+        if decision == "deny" {
+            ("deny", reason)
+        } else {
+            ("ask", reason)
+        }
+    }))
+}
+
 // ─── Heredoc content scanning (issue #216) ───────────────────────────────────
 
 /// Try to extract and scan the body of a heredoc within a write-then-exec command.
@@ -6474,21 +6581,54 @@ fn try_scan_heredoc_content(
     // executed file's path from the full compound command the same way the
     // top-level script-scan path does.
     let fallback = || {
-        let already_cleared = extract_script_path(command).is_some_and(|target| {
-            variable_name_from_path(&target).is_none()
-                && !command_may_rewrite_target(command, &target)
-                && ast_receipt_allows_skip(&target, deny_pats)
+        let target = extract_script_path(command);
+        let already_cleared = target.as_ref().is_some_and(|target| {
+            variable_name_from_path(target).is_none()
+                && !command_may_rewrite_target(command, target)
+                && ast_receipt_allows_skip(target, deny_pats)
         });
         if already_cleared {
             return None;
         }
-        Some((
-            "ask",
+        // Issue #304: the original wording ("content cannot be scanned
+        // before execution") reads as if it's describing some intrinsic
+        // property of the target file, which is misleading when that file
+        // doesn't exist yet — it's about to be *created* by this very
+        // command, so of course nothing can be read from it yet. The real
+        // reason is that the *source* material feeding the write (e.g. a
+        // `grep`/`head`/`sed` pipeline over another file) couldn't be
+        // inspected. Clarify the wording in that case; keep the original
+        // wording for the (rarer) case where the target already exists on
+        // disk, since that's a genuinely different scenario.
+        let target_missing = target
+            .as_deref()
+            .map(|t| fs::metadata(t).is_err())
+            .unwrap_or(true);
+        let reason = if target_missing {
+            "Compound command writes to a script file then executes it — \
+             the target doesn't exist yet (it will be created by this \
+             command) and its source content couldn't be inspected before \
+             execution."
+                .to_string()
+        } else {
             "Compound command writes to a script file then executes it — \
              content cannot be scanned before execution."
-                .to_string(),
-        ))
+                .to_string()
+        };
+        Some(("ask", reason))
     };
+
+    // Issue #304: before the heredoc search, try the narrow `head -n N
+    // SOURCE > TARGET` / `tail -n N SOURCE > TARGET` extraction shape — a
+    // common non-heredoc way scripts generate a file to then execute. This
+    // intentionally does NOT attempt `sed`/`awk`/`cut`/arbitrary pipelines
+    // or a computed `N` (shell arithmetic/command substitution) — simulating
+    // those risks scanning the wrong content and giving false confidence,
+    // worse than just asking. See `try_scan_head_tail_extraction` for the
+    // exact scope.
+    if let Some(result) = try_scan_head_tail_extraction(command, deny_pats, ask_pats, allow_pats) {
+        return result;
+    }
 
     let lines: Vec<&str> = command.lines().collect();
 
@@ -9783,6 +9923,119 @@ mod tests {
             decision("curl http://example.com/s > /tmp/run.sh && bash /tmp/run.sh"),
             Some("ask".into())
         );
+    }
+
+    // ── head/tail extraction content scanning (issue #304) ────────────────────
+
+    /// Writes `content` to a fresh literal temp file and returns its path
+    /// string, for tests exercising `try_scan_head_tail_extraction`'s
+    /// "SOURCE must be a literal, existing, readable path" requirement.
+    fn head_tail_source_file(name: &str, content: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        fs::write(&path, content).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn head_tail_extraction_dangerous_source_asks_with_content_reason() {
+        // `head -n N SOURCE > TARGET` where SOURCE contains something
+        // ast_guard flags must ask with content-based reasoning — not the
+        // generic "content cannot be scanned" fallback.
+        let source = head_tail_source_file(
+            "cb_headtail_dangerous",
+            b"print('safe')\nimport os\nos.system('rm -rf /tmp/x')\n",
+        );
+        let cmd = format!(
+            "head -n 3 {source} > /tmp/cb_headtail_extracted.py && python3 /tmp/cb_headtail_extracted.py"
+        );
+        let (dp, ap, al) = (deny_pats(), ask_pats(), allow_pats());
+        let (decision_tier, reason) = check_command(&cmd, &dp, &ap, &al).unwrap();
+        assert_eq!(decision_tier, "ask");
+        assert!(
+            !reason.contains("content cannot be scanned before execution"),
+            "must not fall back to the generic message when content WAS scanned: {reason}"
+        );
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn head_tail_extraction_clean_source_passes() {
+        // The reconstructed first-N-lines content is clean — no unnecessary
+        // ask/deny, same as a clean heredoc body.
+        let source = head_tail_source_file(
+            "cb_headtail_clean",
+            b"print('hello')\nprint('world')\nprint('fine')\n",
+        );
+        let cmd =
+            format!("head -n 2 {source} > /tmp/cb_headtail_clean_out.py && python3 /tmp/cb_headtail_clean_out.py");
+        assert_eq!(decision(&cmd), None);
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn head_tail_extraction_tail_variant_dangerous_asks() {
+        let source = head_tail_source_file(
+            "cb_headtail_tail_dangerous",
+            b"print('safe')\nimport os\nos.system('rm -rf /tmp/x')\n",
+        );
+        let cmd =
+            format!("tail -n 2 {source} > /tmp/cb_headtail_tail_out.py && python3 /tmp/cb_headtail_tail_out.py");
+        assert_eq!(decision(&cmd), Some("ask".into()));
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn head_tail_extraction_legacy_dash_n_shorthand_dangerous_asks() {
+        // Legacy `head -N` (no `-n`) shorthand must be recognized too.
+        let source = head_tail_source_file(
+            "cb_headtail_legacy",
+            b"print('safe')\nimport os\nos.system('rm -rf /tmp/x')\n",
+        );
+        let cmd = format!(
+            "head -3 {source} > /tmp/cb_headtail_legacy_out.py && python3 /tmp/cb_headtail_legacy_out.py"
+        );
+        assert_eq!(decision(&cmd), Some("ask".into()));
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn head_tail_extraction_missing_source_falls_through_with_clarified_message() {
+        // SOURCE doesn't exist on disk — must fall through to the ask
+        // fallback (no crash, no guess), and TARGET also doesn't exist yet,
+        // so the message must say so instead of the old misleading wording.
+        let cmd = "head -n 2 /tmp/cb_headtail_never_exists.py > /tmp/cb_headtail_never_target.py && python3 /tmp/cb_headtail_never_target.py";
+        let (dp, ap, al) = (deny_pats(), ask_pats(), allow_pats());
+        let (decision_tier, reason) = check_command(cmd, &dp, &ap, &al).unwrap();
+        assert_eq!(decision_tier, "ask");
+        assert!(
+            reason.contains("doesn't exist yet"),
+            "message must clarify the target doesn't exist yet: {reason}"
+        );
+    }
+
+    #[test]
+    fn head_tail_extraction_computed_n_falls_through_to_ask_fallback() {
+        // N is a shell arithmetic expression, not a literal — must not
+        // attempt to evaluate it; falls through to the ask fallback exactly
+        // like the original issue #304 example.
+        let source = head_tail_source_file("cb_headtail_computed_n", b"line1\nline2\nline3\n");
+        let cmd = format!(
+            "END_LINE=$(grep -n line2 {source} | head -1 | cut -d: -f1); head -n $((END_LINE - 1)) {source} > /tmp/cb_headtail_computed_out.sh; bash /tmp/cb_headtail_computed_out.sh"
+        );
+        assert_eq!(decision(&cmd), Some("ask".into()));
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn sed_extraction_remains_out_of_scope_falls_through_to_ask() {
+        // sed/awk/cut piped output is explicitly out of scope — must still
+        // correctly ask via the fallback, never silently allowed or crashed.
+        let source = head_tail_source_file("cb_sed_out_of_scope", b"line1\nline2\nline3\n");
+        let cmd = format!(
+            "sed -n '1,2p' {source} > /tmp/cb_sed_extracted.sh && bash /tmp/cb_sed_extracted.sh"
+        );
+        assert_eq!(decision(&cmd), Some("ask".into()));
+        let _ = fs::remove_file(&source);
     }
 
     // ── heredoc-to-interpreter false positive on file extensions ──────────────
