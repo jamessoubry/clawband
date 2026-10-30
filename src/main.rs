@@ -6597,7 +6597,7 @@ fn try_scan_head_tail_extraction(
         // Exclusively-created temp file (O_EXCL): refuses to follow or
         // truncate an existing file/symlink already at the chosen path.
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = std::collections::hash_map::DefaultHasher::default();
         command.hash(&mut hasher);
         target.hash(&mut hasher);
         let base_hash = hasher.finish();
