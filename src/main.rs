@@ -6450,24 +6450,45 @@ fn command_may_rewrite_target(command: &str, target: &str) -> bool {
 
 /// Detects `head -n N SOURCE > TARGET` / `tail -n N SOURCE > TARGET` (and the
 /// legacy `head -N` / `tail -N` shorthand) where `SOURCE` is a literal,
-/// existing, readable path and `N` is a literal positive integer. This shape
-/// is simple enough to read-only reconstruct exactly what the real command
+/// existing, readable, regular file within the script-scan size cap, `N` is
+/// a literal positive integer, and `TARGET` is the file the compound command
+/// actually goes on to execute (per `extract_script_path`). This shape is
+/// simple enough to read-only reconstruct exactly what the real command
 /// would write to `TARGET` — just reading the first/last `N` lines of
 /// `SOURCE`, no side effects — then scan that reconstructed content the same
 /// way heredoc bodies are scanned.
 ///
-/// Returns `None` when the shape doesn't match, or when `N`/`SOURCE` can't be
-/// resolved to literals at hook-eval time (e.g. `N` is a shell variable or
-/// `$((...))` arithmetic, or `SOURCE` doesn't exist/isn't readable) — the
-/// caller falls through to the generic ask fallback in that case, never
-/// guesses. Deliberately excludes `sed`/`awk`/`cut`/arbitrary pipelines:
-/// simulating those risks scanning the wrong content and giving a false
-/// sense of safety worse than just asking, so they're explicitly out of
-/// scope and always fall through to the ask fallback.
+/// Returns `None` when the shape doesn't match, when `N`/`SOURCE` can't be
+/// resolved to literals at hook-eval time, or when the matched extraction's
+/// `TARGET` isn't the file that's actually executed — the caller falls
+/// through to the generic ask fallback in every such case, never guesses.
+/// (Greptile review on PR #324, finding 1: a command can contain more than
+/// one `head`/`tail` extraction — e.g. one clean one feeding an unrelated
+/// file, and a second, dangerous one feeding the file that's actually run —
+/// so every candidate match in the command is checked against the real
+/// executed path; a clean scan of the wrong file must never clear the ask.)
 ///
-/// When the shape DOES match, returns the inner scan outcome:
-/// `Some(Some(("deny"|"ask", reason)))` when the reconstructed content was
-/// flagged, `Some(None)` when it was clean (allow through).
+/// Append (`>>`) is intentionally NOT matched: the reconstructed content
+/// would only cover the newly-written lines, not any pre-existing content
+/// already in `TARGET`, so a dangerous existing file with a benign append
+/// would wrongly read as clean (finding 2). Only truncating `>` is in scope.
+///
+/// `SOURCE` must be a regular file no larger than `SCRIPT_SCAN_MAX_BYTES` —
+/// checked via `fs::metadata` (which `stat`s, not `open`s, so it can't hang)
+/// before any read — so a FIFO/device/socket or oversized file can never
+/// cause an unbounded blocking read or excessive allocation (finding 5,
+/// mirrors the same guard `scan_script_file` already applies).
+///
+/// The reconstructed content is written to a fresh, exclusively-created
+/// temp file (`O_EXCL` via `create_new`) rather than a predictable path
+/// opened with a plain write, so this can't follow or truncate an existing
+/// file (including a symlink) that happens to already occupy the chosen
+/// name (finding 6). A failed write falls through to the ask fallback
+/// rather than ever being treated as a clean scan (finding 4).
+///
+/// When a verified candidate's reconstructed content is scanned, returns the
+/// inner scan outcome: `Some(Some(("deny"|"ask", reason)))` when flagged,
+/// `Some(None)` when clean (allow through).
 fn try_scan_head_tail_extraction(
     command: &str,
     deny_pats: &[Pattern],
@@ -6476,81 +6497,156 @@ fn try_scan_head_tail_extraction(
 ) -> Option<Option<(&'static str, String)>> {
     use std::sync::OnceLock;
     static HEAD_TAIL_RE: OnceLock<Regex> = OnceLock::new();
+    // Only `>` (truncate) is matched — see "Append" note above for why `>>`
+    // must stay out of scope.
     let re = HEAD_TAIL_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b(head|tail)\s+-n\s*(-?\d+)\s+(\S+)\s*>\s*(\S+)|\b(head|tail)\s+-(\d+)\s+(\S+)\s*>\s*(\S+)"#)
+            .unwrap()
+    });
+
+    // The basename(s) this compound command actually executes later in the
+    // string — every candidate extraction below is checked against this set,
+    // not just whichever match the regex happens to find first. Deliberately
+    // NOT `extract_script_path`: that helper anchors its patterns to the
+    // very start of the command (`^\s*`), so it can never find an
+    // interpreter call that comes after a leading `head`/`tail` segment and
+    // `&&`/`;` — exactly the shape every real write-then-exec command has.
+    // Mirrors `check_write_then_execute`'s own `exec_re`, which does not
+    // anchor to the string start for the same reason.
+    static EXEC_RE: OnceLock<Regex> = OnceLock::new();
+    let exec_re = EXEC_RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b(head|tail)\s+-n\s*(-?\d+)\s+(\S+)\s*>>?\s*(\S+)|\b(head|tail)\s+-(\d+)\s+(\S+)\s*>>?\s*(\S+)"#,
+            r"(?i)(?:(?:^|\s)(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua)\s+<?|^\s*(?:sudo\s+)?\./)(\S+)",
         )
         .unwrap()
     });
-    let caps = re.captures(command)?;
-    let (is_tail, n_str, source_raw, target_raw) = if caps.get(1).is_some() {
-        (
-            caps[1].eq_ignore_ascii_case("tail"),
-            caps[2].to_string(),
-            caps[3].to_string(),
-            caps[4].to_string(),
-        )
-    } else {
-        (
-            caps[5].eq_ignore_ascii_case("tail"),
-            caps[6].to_string(),
-            caps[7].to_string(),
-            caps[8].to_string(),
-        )
-    };
-    let n: i64 = n_str.parse().ok()?;
-    if n <= 0 {
-        // `-n -5` ("all but the last 5 lines") and similar aren't the simple
-        // "first/last N lines" shape this handles — fall through to ask.
+    let executed_bases: std::collections::HashSet<String> = exec_re
+        .captures_iter(command)
+        .filter_map(|c| c.get(1).map(|m| path_basename(m.as_str()).to_string()))
+        .collect();
+    if executed_bases.is_empty() {
         return None;
     }
-    let n = n as usize;
-    let source = source_raw.trim_matches('"').trim_matches('\'');
-    let target = target_raw.trim_matches('"').trim_matches('\'');
-    // Not a literal path — a shell variable, command substitution, or
-    // arithmetic expression means N or SOURCE can't be resolved here.
-    if source.contains('$') || variable_name_from_path(source).is_some() {
-        return None;
-    }
-    let _ = target; // TARGET isn't needed for the reconstruction itself.
-    let source_content = fs::read_to_string(source).ok()?;
-    let src_lines: Vec<&str> = source_content.lines().collect();
-    let selected: Vec<&str> = if is_tail {
-        let start = src_lines.len().saturating_sub(n);
-        src_lines[start..].to_vec()
-    } else {
-        src_lines.into_iter().take(n).collect()
-    };
-    let mut body = selected.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
 
-    let temp_path = std::env::temp_dir().join(format!(
-        "clawband_headtail_{}_{:x}.sh",
-        std::process::id(),
-        {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            command.hash(&mut hasher);
-            hasher.finish()
-        }
-    ));
-    if fs::write(&temp_path, &body).is_err() {
-        return Some(None);
-    }
-    let path_str = temp_path.to_string_lossy().into_owned();
-    let result = scan_script_file(&path_str, deny_pats, ask_pats, allow_pats);
-    let _ = fs::remove_file(&temp_path); // best-effort cleanup
-
-    Some(result.map(|(decision, reason)| {
-        if decision == "deny" {
-            ("deny", reason)
+    for caps in re.captures_iter(command) {
+        let (is_tail, n_str, source_raw, target_raw) = if caps.get(1).is_some() {
+            (
+                caps[1].eq_ignore_ascii_case("tail"),
+                caps[2].to_string(),
+                caps[3].to_string(),
+                caps[4].to_string(),
+            )
         } else {
-            ("ask", reason)
+            (
+                caps[5].eq_ignore_ascii_case("tail"),
+                caps[6].to_string(),
+                caps[7].to_string(),
+                caps[8].to_string(),
+            )
+        };
+
+        let target = target_raw.trim_matches('"').trim_matches('\'');
+        if !executed_bases.contains(path_basename(target)) {
+            // This extraction writes to a different file than any of the
+            // ones actually executed — irrelevant to this decision, and
+            // critically must NOT be treated as having cleared anything.
+            continue;
         }
-    }))
+
+        let Ok(n) = n_str.parse::<i64>() else {
+            continue;
+        };
+        if n <= 0 {
+            // `-n -5` ("all but the last 5 lines") and similar aren't the
+            // simple "first/last N lines" shape this handles.
+            continue;
+        }
+        let n = n as usize;
+
+        let source = source_raw.trim_matches('"').trim_matches('\'');
+        // Not a literal path — a shell variable, command substitution, or
+        // arithmetic expression means N or SOURCE can't be resolved here.
+        if source.contains('$') || variable_name_from_path(source).is_some() {
+            continue;
+        }
+
+        let Ok(meta) = fs::metadata(source) else {
+            continue;
+        };
+        if !meta.file_type().is_file() || meta.len() > SCRIPT_SCAN_MAX_BYTES {
+            // Non-regular (FIFO/device/socket) or oversized — never read;
+            // this candidate can't be safely inspected.
+            continue;
+        }
+
+        let Ok(source_content) = fs::read_to_string(source) else {
+            continue;
+        };
+        let src_lines: Vec<&str> = source_content.lines().collect();
+        let selected: Vec<&str> = if is_tail {
+            let start = src_lines.len().saturating_sub(n);
+            src_lines[start..].to_vec()
+        } else {
+            src_lines.into_iter().take(n).collect()
+        };
+        let mut body = selected.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+
+        // Exclusively-created temp file (O_EXCL): refuses to follow or
+        // truncate an existing file/symlink already at the chosen path.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        command.hash(&mut hasher);
+        target.hash(&mut hasher);
+        let base_hash = hasher.finish();
+        let mut created: Option<std::path::PathBuf> = None;
+        for attempt in 0u32..4 {
+            let candidate = std::env::temp_dir().join(format!(
+                "clawband_headtail_{}_{:x}_{attempt}.sh",
+                std::process::id(),
+                base_hash
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(mut f) => {
+                    use std::io::Write as _;
+                    if f.write_all(body.as_bytes()).is_err() {
+                        drop(f);
+                        let _ = fs::remove_file(&candidate);
+                        return None;
+                    }
+                    created = Some(candidate);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        let Some(temp_path) = created else {
+            // Couldn't create a safe temp file — never treat this as clean.
+            return None;
+        };
+        let path_str = temp_path.to_string_lossy().into_owned();
+        let result = scan_script_file(&path_str, deny_pats, ask_pats, allow_pats);
+        let _ = fs::remove_file(&temp_path); // best-effort cleanup
+
+        return Some(result.map(|(decision, reason)| {
+            if decision == "deny" {
+                ("deny", reason)
+            } else {
+                ("ask", reason)
+            }
+        }));
+    }
+
+    // No candidate extraction's target matched the executed file (or none
+    // of the candidates could be safely resolved) — unhandled, fall through
+    // to the ask fallback.
+    None
 }
 
 // ─── Heredoc content scanning (issue #216) ───────────────────────────────────
@@ -6598,19 +6694,25 @@ fn try_scan_heredoc_content(
         // reason is that the *source* material feeding the write (e.g. a
         // `grep`/`head`/`sed` pipeline over another file) couldn't be
         // inspected. Clarify the wording in that case; keep the original
-        // wording for the (rarer) case where the target already exists on
-        // disk, since that's a genuinely different scenario.
-        let target_missing = target.as_deref().map_or(true, |t| fs::metadata(t).is_err());
-        let reason = if target_missing {
-            "Compound command writes to a script file then executes it — \
-             the target doesn't exist yet (it will be created by this \
-             command) and its source content couldn't be inspected before \
-             execution."
-                .to_string()
-        } else {
-            "Compound command writes to a script file then executes it — \
-             content cannot be scanned before execution."
-                .to_string()
+        // wording for the case where the target already exists on disk,
+        // since that's a genuinely different scenario. When `target` is
+        // `None` — `extract_script_path` couldn't resolve a path at all
+        // (e.g. the command starts with `sed`, which it doesn't recognise)
+        // — neither claim applies: don't call an unknown, possibly-existing
+        // file "missing" (Greptile review on PR #324, finding 7); use
+        // neutral wording instead.
+        let reason = match target.as_deref().map(|t| fs::metadata(t).is_err()) {
+            Some(true) => "Compound command writes to a script file then executes it — \
+                 the target doesn't exist yet (it will be created by this \
+                 command) and its source content couldn't be inspected before \
+                 execution."
+                .to_string(),
+            Some(false) => "Compound command writes to a script file then executes it — \
+                 content cannot be scanned before execution."
+                .to_string(),
+            None => "Compound command writes to a script file then executes it — \
+                 its source content couldn't be inspected before execution."
+                .to_string(),
         };
         Some(("ask", reason))
     };
@@ -9970,6 +10072,47 @@ mod tests {
     }
 
     #[test]
+    fn head_tail_extraction_decoy_first_target_does_not_clear_real_payload() {
+        // Greptile PR #324 finding 1: a compound command with TWO head/tail
+        // extractions where only the SECOND one's target is actually
+        // executed. The first (clean, irrelevant) extraction must not be
+        // mistaken for having cleared the whole command — the dangerous
+        // second target must still be scanned and ask.
+        let decoy_source = head_tail_source_file("cb_headtail_decoy_src", b"print('fine')\n");
+        let payload_source = head_tail_source_file(
+            "cb_headtail_payload_src",
+            b"print('safe')\nimport os\nos.system('rm -rf /tmp/x')\n",
+        );
+        let cmd = format!(
+            "head -n 1 {decoy_source} > /tmp/cb_headtail_decoy_out.py && head -n 3 {payload_source} > /tmp/cb_headtail_payload_out.py && python3 /tmp/cb_headtail_payload_out.py"
+        );
+        let (dp, ap, al) = (deny_pats(), ask_pats(), allow_pats());
+        let (decision_tier, reason) = check_command(&cmd, &dp, &ap, &al).unwrap();
+        assert_eq!(decision_tier, "ask");
+        assert!(
+            !reason.contains("content cannot be scanned before execution"),
+            "the decoy extraction must not clear review of the real executed target: {reason}"
+        );
+        let _ = fs::remove_file(&decoy_source);
+        let _ = fs::remove_file(&payload_source);
+    }
+
+    #[test]
+    fn head_tail_extraction_append_redirect_out_of_scope() {
+        // Greptile PR #324 finding: `>>` (append) must stay out of scope —
+        // reconstructing only the newly-appended lines would miss any
+        // pre-existing dangerous content already in TARGET. Must fall
+        // through to the ask fallback, never be matched by the head/tail
+        // regex at all.
+        let source = head_tail_source_file("cb_headtail_append_src", b"print('fine')\n");
+        let cmd = format!(
+            "head -n 1 {source} >> /tmp/cb_headtail_append_out.py && python3 /tmp/cb_headtail_append_out.py"
+        );
+        assert_eq!(decision(&cmd), Some("ask".into()));
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
     fn head_tail_extraction_tail_variant_dangerous_asks() {
         let source = head_tail_source_file(
             "cb_headtail_tail_dangerous",
@@ -9998,15 +10141,20 @@ mod tests {
     #[test]
     fn head_tail_extraction_missing_source_falls_through_with_clarified_message() {
         // SOURCE doesn't exist on disk — must fall through to the ask
-        // fallback (no crash, no guess), and TARGET also doesn't exist yet,
-        // so the message must say so instead of the old misleading wording.
+        // fallback (no crash, no guess). The command's own exec call isn't
+        // at the start of the string (it follows `head ... && `), so
+        // `extract_script_path` — anchored to the string start — can't
+        // resolve TARGET either; the message must use the neutral "unknown
+        // path" wording rather than incorrectly asserting the target is
+        // missing (Greptile PR #324 finding 7: don't call an unresolvable
+        // path "missing").
         let cmd = "head -n 2 /tmp/cb_headtail_never_exists.py > /tmp/cb_headtail_never_target.py && python3 /tmp/cb_headtail_never_target.py";
         let (dp, ap, al) = (deny_pats(), ask_pats(), allow_pats());
         let (decision_tier, reason) = check_command(cmd, &dp, &ap, &al).unwrap();
         assert_eq!(decision_tier, "ask");
         assert!(
-            reason.contains("doesn't exist yet"),
-            "message must clarify the target doesn't exist yet: {reason}"
+            reason.contains("couldn't be inspected before execution"),
+            "message must use the neutral unresolvable-path wording: {reason}"
         );
     }
 
