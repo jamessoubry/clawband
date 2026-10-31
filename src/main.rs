@@ -6522,7 +6522,12 @@ fn try_scan_head_tail_extraction(
     });
     let executed_bases: std::collections::HashSet<String> = exec_re
         .captures_iter(command)
-        .filter_map(|c| c.get(1).map(|m| path_basename(m.as_str()).to_string()))
+        .filter_map(|c| {
+            c.get(1).map(|m| {
+                let trimmed = m.as_str().trim_matches('"').trim_matches('\'');
+                path_basename(trimmed).to_string()
+            })
+        })
         .collect();
     if executed_bases.is_empty() {
         return None;
@@ -10095,6 +10100,21 @@ mod tests {
         );
         let _ = fs::remove_file(&decoy_source);
         let _ = fs::remove_file(&payload_source);
+    }
+
+    #[test]
+    fn head_tail_extraction_quoted_exec_target_still_matches() {
+        // Greptile PR #324 finding: when the interpreter argument is quoted
+        // (e.g. `python3 '/tmp/run.py'`), the executed-basename set must
+        // strip the quote before comparing against the head/tail target's
+        // basename — otherwise a trailing quote mismatch sends clean content
+        // through the ask fallback instead of being scanned and passed.
+        let source = head_tail_source_file("cb_headtail_quoted", b"print('fine')\n");
+        let cmd = format!(
+            "head -n 1 {source} > '/tmp/cb_headtail_quoted_out.py' && python3 '/tmp/cb_headtail_quoted_out.py'"
+        );
+        assert_eq!(decision(&cmd), None);
+        let _ = fs::remove_file(&source);
     }
 
     #[test]
