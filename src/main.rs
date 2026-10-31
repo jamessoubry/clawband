@@ -6497,11 +6497,21 @@ fn try_scan_head_tail_extraction(
 ) -> Option<Option<(&'static str, String)>> {
     use std::sync::OnceLock;
     static HEAD_TAIL_RE: OnceLock<Regex> = OnceLock::new();
+    // Path tokens use a quote-aware atom (quoted string OR bareword) instead
+    // of a bare `\S+` — a plain `\S+` truncates a quoted path containing a
+    // space (e.g. `'run payload.py'`) at the first space, yielding `'run`.
+    // Trimming quotes from that truncated fragment produces `run`, which can
+    // collide with an unrelated file's basename and wrongly let a clean
+    // extraction clear review of a completely different executed file
+    // (Greptile finding on PR #324, follow-up to the executed_bases fix).
+    const QPATH: &str = r#"(?:"[^"]*"|'[^']*'|\S+)"#;
     // Only `>` (truncate) is matched — see "Append" note above for why `>>`
     // must stay out of scope.
     let re = HEAD_TAIL_RE.get_or_init(|| {
-        Regex::new(r#"(?i)\b(head|tail)\s+-n\s*(-?\d+)\s+(\S+)\s*>\s*(\S+)|\b(head|tail)\s+-(\d+)\s+(\S+)\s*>\s*(\S+)"#)
-            .unwrap()
+        Regex::new(&format!(
+            r#"(?i)\b(head|tail)\s+-n\s*(-?\d+)\s+({QPATH})\s*>\s*({QPATH})|\b(head|tail)\s+-(\d+)\s+({QPATH})\s*>\s*({QPATH})"#
+        ))
+        .unwrap()
     });
 
     // The basename(s) this compound command actually executes later in the
@@ -6515,9 +6525,9 @@ fn try_scan_head_tail_extraction(
     // anchor to the string start for the same reason.
     static EXEC_RE: OnceLock<Regex> = OnceLock::new();
     let exec_re = EXEC_RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:(?:^|\s)(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua)\s+<?|^\s*(?:sudo\s+)?\./)(\S+)",
-        )
+        Regex::new(&format!(
+            r"(?i)(?:(?:^|\s)(?:bash|sh|zsh|dash|python3?|node|deno|perl|ruby|lua)\s+<?|^\s*(?:sudo\s+)?\./)({QPATH})"
+        ))
         .unwrap()
     });
     let executed_bases: std::collections::HashSet<String> = exec_re
@@ -10115,6 +10125,32 @@ mod tests {
         );
         assert_eq!(decision(&cmd), None);
         let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn head_tail_extraction_quoted_path_with_space_does_not_collide() {
+        // Greptile PR #324 follow-up finding: a bare `\S+` capture truncates
+        // a quoted path containing a space at the first space (e.g.
+        // `'run payload.py'` captures only `'run`). Quote-trimming that
+        // truncated fragment yields `run`, which could collide with an
+        // unrelated file's basename and wrongly let a clean extraction clear
+        // review of a *different* executed file. Both the head/tail target
+        // capture and the executed-basename capture must read the full
+        // quoted token (including embedded spaces), not just up to the
+        // first whitespace.
+        let decoy_source = head_tail_source_file("cb_headtail_space_decoy", b"print('fine')\n");
+        let cmd = format!("head -n 1 {decoy_source} > 'run copy.py' && python3 'run payload.py'");
+        let (dp, ap, al) = (deny_pats(), ask_pats(), allow_pats());
+        let result = check_command(&cmd, &dp, &ap, &al);
+        assert_eq!(
+            result.map(|(d, _)| d),
+            Some("ask"),
+            "a quoted target with an embedded space must never be confused with a \
+             differently-named quoted exec argument via basename truncation"
+        );
+        let _ = fs::remove_file(&decoy_source);
+        let _ = fs::remove_file("run copy.py");
+        let _ = fs::remove_file("run payload.py");
     }
 
     #[test]
