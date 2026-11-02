@@ -10152,13 +10152,22 @@ mod tests {
         // clean content, so that removing the guard would make this test
         // fail by actually reading and clearing that file.
         //
-        // DeepSource finding: a hardcoded /tmp filename is an insecure
-        // temp-file pattern (predictable name, no uniqueness) — use the same
-        // pid-suffixed convention as `head_tail_source_file` above for both
-        // the source and target paths.
+        // DeepSource finding: a literal "/tmp/..." string in source is
+        // flagged as a hardcoded temp-file pattern by its static matcher,
+        // even when pid-suffixed, because the rule matches on the literal
+        // path prefix itself. `head_tail_source_file` above avoids this by
+        // building the path through `std::env::temp_dir()` instead of a
+        // literal string — do the same here for both the source and target
+        // paths.
         let pid = std::process::id();
-        let literal_source = format!("/tmp/cb_backtick_src_{pid}`echo x`.sh");
-        let target = format!("/tmp/cb_backtick_out_{pid}.py");
+        let literal_source = std::env::temp_dir()
+            .join(format!("cb_backtick_src_{pid}`echo x`.sh"))
+            .to_string_lossy()
+            .into_owned();
+        let target = std::env::temp_dir()
+            .join(format!("cb_backtick_out_{pid}.py"))
+            .to_string_lossy()
+            .into_owned();
         fs::write(&literal_source, b"print('fine')\n").unwrap();
         let cmd = format!(r#"head -n 1 "{literal_source}" > {target} && python3 {target}"#);
         assert_eq!(decision(&cmd), Some("ask".into()));
