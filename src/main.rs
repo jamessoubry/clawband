@@ -10142,8 +10142,22 @@ mod tests {
         // quotes is not necessarily the file actually read. Treating it as
         // a literal path to scan could clear review of content that was
         // never inspected. Must fall through to the ask fallback instead.
-        let cmd = r#"head -n 1 "/tmp/cb_backtick_src`echo x`.sh" > /tmp/cb_backtick_out.py && python3 /tmp/cb_backtick_out.py"#;
-        assert_eq!(decision(cmd), Some("ask".into()));
+        //
+        // Greptile follow-up finding: the original version of this test
+        // never created the literal (unexpanded) source path, so it passed
+        // for the wrong reason — `fs::metadata` simply failed to find a
+        // nonexistent file and fell through to ask regardless of whether
+        // the backtick guard existed at all. Create a real fixture at the
+        // literal, un-expanded path (including the backtick characters) with
+        // clean content, so that removing the guard would make this test
+        // fail by actually reading and clearing that file.
+        let literal_source = "/tmp/cb_backtick_src`echo x`.sh";
+        fs::write(literal_source, b"print('fine')\n").unwrap();
+        let cmd = format!(
+            r#"head -n 1 "{literal_source}" > /tmp/cb_backtick_out.py && python3 /tmp/cb_backtick_out.py"#
+        );
+        assert_eq!(decision(&cmd), Some("ask".into()));
+        let _ = fs::remove_file(literal_source);
     }
 
     #[test]
