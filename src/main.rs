@@ -6579,9 +6579,16 @@ fn try_scan_head_tail_extraction(
         let n = n as usize;
 
         let source = source_raw.trim_matches('"').trim_matches('\'');
-        // Not a literal path — a shell variable, command substitution, or
-        // arithmetic expression means N or SOURCE can't be resolved here.
-        if source.contains('$') || variable_name_from_path(source).is_some() {
+        // Not a literal path — a shell variable, command substitution
+        // (`$(...)` or backtick), or arithmetic expression means SOURCE
+        // can't be resolved here. A double-quoted string containing a
+        // backtick or `$` undergoes shell expansion before `head`/`tail`
+        // ever sees it, so the literal text inside the quotes is NOT
+        // necessarily the file actually read — scanning it as if it were
+        // could clear review of a file that was never inspected (Greptile
+        // PR #324 finding: "Quoted sources scan different files").
+        if source.contains('$') || source.contains('`') || variable_name_from_path(source).is_some()
+        {
             continue;
         }
 
@@ -10128,6 +10135,18 @@ mod tests {
     }
 
     #[test]
+    fn head_tail_extraction_quoted_source_with_backtick_falls_through() {
+        // Greptile PR #324 finding: a double-quoted SOURCE containing a
+        // backtick (or `$`) undergoes shell command/variable substitution
+        // before `head`/`tail` ever sees it, so the literal text inside the
+        // quotes is not necessarily the file actually read. Treating it as
+        // a literal path to scan could clear review of content that was
+        // never inspected. Must fall through to the ask fallback instead.
+        let cmd = r#"head -n 1 "/tmp/cb_backtick_src`echo x`.sh" > /tmp/cb_backtick_out.py && python3 /tmp/cb_backtick_out.py"#;
+        assert_eq!(decision(cmd), Some("ask".into()));
+    }
+
+    #[test]
     fn head_tail_extraction_quoted_path_with_space_does_not_collide() {
         // Greptile PR #324 follow-up finding: a bare `\S+` capture truncates
         // a quoted path containing a space at the first space (e.g.
@@ -10148,9 +10167,11 @@ mod tests {
             "a quoted target with an embedded space must never be confused with a \
              differently-named quoted exec argument via basename truncation"
         );
+        // `check_command` only inspects the command string — it never runs
+        // `head`/`python3` — so "run copy.py" / "run payload.py" are never
+        // created by this test. Do not delete them: a developer's own
+        // unrelated files with those exact names would be destroyed.
         let _ = fs::remove_file(&decoy_source);
-        let _ = fs::remove_file("run copy.py");
-        let _ = fs::remove_file("run payload.py");
     }
 
     #[test]
