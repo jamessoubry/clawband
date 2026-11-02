@@ -10151,13 +10151,18 @@ mod tests {
         // literal, un-expanded path (including the backtick characters) with
         // clean content, so that removing the guard would make this test
         // fail by actually reading and clearing that file.
-        let literal_source = "/tmp/cb_backtick_src`echo x`.sh";
-        fs::write(literal_source, b"print('fine')\n").unwrap();
-        let cmd = format!(
-            r#"head -n 1 "{literal_source}" > /tmp/cb_backtick_out.py && python3 /tmp/cb_backtick_out.py"#
-        );
+        //
+        // DeepSource finding: a hardcoded /tmp filename is an insecure
+        // temp-file pattern (predictable name, no uniqueness) — use the same
+        // pid-suffixed convention as `head_tail_source_file` above for both
+        // the source and target paths.
+        let pid = std::process::id();
+        let literal_source = format!("/tmp/cb_backtick_src_{pid}`echo x`.sh");
+        let target = format!("/tmp/cb_backtick_out_{pid}.py");
+        fs::write(&literal_source, b"print('fine')\n").unwrap();
+        let cmd = format!(r#"head -n 1 "{literal_source}" > {target} && python3 {target}"#);
         assert_eq!(decision(&cmd), Some("ask".into()));
-        let _ = fs::remove_file(literal_source);
+        let _ = fs::remove_file(&literal_source);
     }
 
     #[test]
