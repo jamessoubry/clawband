@@ -887,89 +887,43 @@ fn rust_rules() -> Vec<(&'static str, &'static str, &'static str)> {
     ]
 }
 
-/// Finds `yaml.load(...)` calls (specifically `load`, never `safe_load` —
-/// the query constrains the attribute name so it can't match that) that lack
-/// a `Loader=` keyword argument naming a safe loader. Tree-sitter queries
-/// can't express "matches X but not if Y is also present" directly, so this
-/// matches the call generically and then walks its argument list in Rust
-/// code looking for a `Loader=` kwarg whose value mentions "Safe" (covers
-/// both `Loader=yaml.SafeLoader` and a bare `Loader=SafeLoader` import).
-fn python_yaml_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
+/// Shared implementation behind `python_yaml_load_findings`,
+/// `python_torch_load_findings`, and `python_numpy_load_findings` (CodeScene
+/// duplication review, issue #310): all three check a `<module>.load(...)`
+/// call's argument list in Rust for a specific keyword argument with a
+/// specific value, because tree-sitter queries can't express "matches X but
+/// not if Y is also present/absent" directly. They differ only in: which
+/// object name(s) the call's `object` must match, which keyword argument to
+/// look for, how to decide whether that argument's value counts as a match,
+/// whether the finding fires when a matching value is ABSENT (yaml/torch —
+/// the dangerous case is the safe kwarg being missing) or PRESENT (numpy —
+/// the dangerous case is the unsafe kwarg being set), and the finding's
+/// `reason` text — so those are the parameters here. `kwarg_value_matches`
+/// and `fire_when_matched` are deliberately named around "matches" rather
+/// than "safe"/"unsafe": for yaml/torch the matched value IS the safe one,
+/// but for numpy it's the unsafe one (`allow_pickle=True`) — naming the
+/// parameter `is_safe_value` would be misleading for that call site even
+/// though the boolean logic is identical either way.
+fn python_unsafe_load_findings(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    obj_pattern: &str,
+    kwarg_name: &str,
+    kwarg_value_matches: impl Fn(tree_sitter::Node) -> bool,
+    fire_when_matched: bool,
+    reason: &'static str,
+) -> Vec<Finding> {
     let ts_lang: TsLanguage = tree_sitter_python::LANGUAGE.into();
-    let query_src = r#"(call
+    let query_src = format!(
+        r#"(call
   function: (attribute
     object: (identifier) @obj
     attribute: (identifier) @method)
   arguments: (argument_list) @args
-  (#eq? @obj "yaml")
-  (#eq? @method "load"))"#;
-    let query = match Query::new(&ts_lang, query_src) {
-        Ok(q) => q,
-        Err(_) => return vec![],
-    };
-    let args_index = query
-        .capture_names()
-        .iter()
-        .position(|n| *n == "args")
-        .expect("query defines an @args capture");
-
-    let mut findings = Vec::new();
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
-    while let Some(m) = matches.next() {
-        for cap in m.captures {
-            if cap.index as usize != args_index {
-                continue;
-            }
-            let mut has_safe_loader = false;
-            let mut c = cap.node.walk();
-            for child in cap.node.named_children(&mut c) {
-                if child.kind() != "keyword_argument" {
-                    continue;
-                }
-                let name_ok = child
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    == Some("Loader");
-                let value_safe = child
-                    .child_by_field_name("value")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .is_some_and(|v| v.contains("Safe"));
-                if name_ok && value_safe {
-                    has_safe_loader = true;
-                    break;
-                }
-            }
-            if !has_safe_loader {
-                findings.push(Finding {
-                    rule: "insecure-deserialize",
-                    reason: "insecure deserialization — yaml.load() without a safe Loader can execute arbitrary code embedded in its input; use yaml.safe_load() or pass Loader=yaml.SafeLoader",
-                });
-            }
-        }
-    }
-    findings
-}
-
-/// Finds `torch.load(...)` calls (unsafe-deserialization gap review, issue
-/// #261) that lack a `weights_only=True` keyword argument. `torch.load`
-/// unpickles its input by default, so the absence of `weights_only=True` is
-/// the dangerous case — same "flag unless a specific safe kwarg is present"
-/// shape as `python_yaml_load_findings`'s `Loader=` check above, which a
-/// tree-sitter query can't express directly (a query matches a node's
-/// presence, not another node's absence), so this matches the call
-/// generically and walks its argument list in Rust looking for
-/// `weights_only=True`.
-fn python_torch_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
-    let ts_lang: TsLanguage = tree_sitter_python::LANGUAGE.into();
-    let query_src = r#"(call
-  function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method)
-  arguments: (argument_list) @args
-  (#eq? @obj "torch")
-  (#eq? @method "load"))"#;
-    let query = match Query::new(&ts_lang, query_src) {
+  (#match? @obj "{obj_pattern}")
+  (#eq? @method "load"))"#
+    );
+    let query = match Query::new(&ts_lang, &query_src) {
         Ok(q) => q,
         Err(_) => return vec![],
     };
@@ -986,7 +940,7 @@ fn python_torch_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Fi
             if cap.index as usize != args_index {
                 continue;
             }
-            let mut has_weights_only_true = false;
+            let mut has_matching_value = false;
             let mut c = cap.node.walk();
             for child in cap.node.named_children(&mut c) {
                 if child.kind() != "keyword_argument" {
@@ -995,24 +949,59 @@ fn python_torch_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Fi
                 let name_ok = child
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    == Some("weights_only");
-                let value_true = child
+                    == Some(kwarg_name);
+                let value_matches = child
                     .child_by_field_name("value")
-                    .is_some_and(|v| v.kind() == "true");
-                if name_ok && value_true {
-                    has_weights_only_true = true;
+                    .is_some_and(&kwarg_value_matches);
+                if name_ok && value_matches {
+                    has_matching_value = true;
                     break;
                 }
             }
-            if !has_weights_only_true {
+            if has_matching_value == fire_when_matched {
                 findings.push(Finding {
                     rule: "insecure-deserialize",
-                    reason: "insecure deserialization — torch.load() without weights_only=True can execute arbitrary code embedded in the checkpoint via pickle; pass weights_only=True unless you need to load non-tensor Python objects from a fully trusted source",
+                    reason,
                 });
             }
         }
     }
     findings
+}
+
+/// Finds `yaml.load(...)` calls (specifically `load`, never `safe_load` —
+/// the query constrains the attribute name so it can't match that) that lack
+/// a `Loader=` keyword argument naming a safe loader — covers both
+/// `Loader=yaml.SafeLoader` and a bare `Loader=SafeLoader` import, since the
+/// value check is a substring match on "Safe" rather than an exact node
+/// comparison. See `python_unsafe_load_findings` for the shared shape.
+fn python_yaml_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
+    python_unsafe_load_findings(
+        tree,
+        content,
+        "^yaml$",
+        "Loader",
+        |v| v.utf8_text(content.as_bytes()).is_ok_and(|v| v.contains("Safe")),
+        false,
+        "insecure deserialization — yaml.load() without a safe Loader can execute arbitrary code embedded in its input; use yaml.safe_load() or pass Loader=yaml.SafeLoader",
+    )
+}
+
+/// Finds `torch.load(...)` calls (unsafe-deserialization gap review, issue
+/// #261) that lack a `weights_only=True` keyword argument. `torch.load`
+/// unpickles its input by default, so the absence of `weights_only=True` is
+/// the dangerous case. See `python_unsafe_load_findings` for the shared
+/// shape.
+fn python_torch_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
+    python_unsafe_load_findings(
+        tree,
+        content,
+        "^torch$",
+        "weights_only",
+        |v| unwrap_parenthesized(v).kind() == "true",
+        false,
+        "insecure deserialization — torch.load() without weights_only=True can execute arbitrary code embedded in the checkpoint via pickle; pass weights_only=True unless you need to load non-tensor Python objects from a fully trusted source",
+    )
 }
 
 /// Unwraps a value node through any number of nested `parenthesized_expression`
@@ -1039,60 +1028,20 @@ fn unwrap_parenthesized(mut node: tree_sitter::Node) -> tree_sitter::Node {
 /// plain query into a post-match walk — see `unwrap_parenthesized`'s doc
 /// comment for why). `numpy.load` unpickles object arrays when
 /// `allow_pickle=True`, so presence of that kwarg with a truthy value
-/// (parenthesized or not) is the dangerous case.
+/// (parenthesized or not) is the dangerous case — unlike
+/// `python_yaml_load_findings`/`python_torch_load_findings`, this one fires
+/// when the value IS present rather than when a safe value is absent. See
+/// `python_unsafe_load_findings` for the shared shape.
 fn python_numpy_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Finding> {
-    let ts_lang: TsLanguage = tree_sitter_python::LANGUAGE.into();
-    let query_src = r#"(call
-  function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method)
-  arguments: (argument_list) @args
-  (#match? @obj "^(numpy|np)$")
-  (#eq? @method "load"))"#;
-    let query = match Query::new(&ts_lang, query_src) {
-        Ok(q) => q,
-        Err(_) => return vec![],
-    };
-    let args_index = match query.capture_names().iter().position(|n| *n == "args") {
-        Some(i) => i,
-        None => return vec![],
-    };
-
-    let mut findings = Vec::new();
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
-    while let Some(m) = matches.next() {
-        for cap in m.captures {
-            if cap.index as usize != args_index {
-                continue;
-            }
-            let mut has_allow_pickle_true = false;
-            let mut c = cap.node.walk();
-            for child in cap.node.named_children(&mut c) {
-                if child.kind() != "keyword_argument" {
-                    continue;
-                }
-                let name_ok = child
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    == Some("allow_pickle");
-                let value_true = child
-                    .child_by_field_name("value")
-                    .is_some_and(|v| unwrap_parenthesized(v).kind() == "true");
-                if name_ok && value_true {
-                    has_allow_pickle_true = true;
-                    break;
-                }
-            }
-            if has_allow_pickle_true {
-                findings.push(Finding {
-                    rule: "insecure-deserialize",
-                    reason: "insecure deserialization — numpy.load() with allow_pickle=True can execute arbitrary code embedded in the array file; only pass allow_pickle=True for fully trusted files",
-                });
-            }
-        }
-    }
-    findings
+    python_unsafe_load_findings(
+        tree,
+        content,
+        "^(numpy|np)$",
+        "allow_pickle",
+        |v| unwrap_parenthesized(v).kind() == "true",
+        true,
+        "insecure deserialization — numpy.load() with allow_pickle=True can execute arbitrary code embedded in the array file; only pass allow_pickle=True for fully trusted files",
+    )
 }
 
 /// Returns true if `args_node` (a call's `argument_list`) contains an
@@ -2196,6 +2145,22 @@ mod tests {
     fn python_flags_torch_load_with_weights_only_false() {
         let findings = scan("torch.load(path, weights_only=False)", Lang::Python);
         assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_torch_load_with_parenthesized_weights_only_true() {
+        // Second-opinion review on #310/#326's dedup PR: the shared helper's
+        // torch call site was passing `|v| v.kind() == "true"` without the
+        // `unwrap_parenthesized` wrap that numpy's call site already used,
+        // so `weights_only=(True)` had AST kind `parenthesized_expression`
+        // and fell through to "no safe value found" — a false positive on
+        // safe code. See `python_flags_numpy_load_with_parenthesized_allow_pickle_true`
+        // for the equivalent numpy-side regression coverage.
+        let findings = scan("torch.load(path, weights_only=(True))", Lang::Python);
+        assert!(
+            !has_insecure_deserialize_finding(&findings),
+            "torch.load with parenthesized weights_only=(True) must not be flagged"
+        );
     }
 
     // XXE-prone XML parsing: narrowed (issue #261 review round) to only fire
