@@ -4,3 +4,7 @@
 # Local agent/session tooling (not part of the project)
 .specstory/
 .claudeignore
+
+# Local agent/session tooling (not part of the project)
+.code-graph/
+.memory/
