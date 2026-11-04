@@ -894,18 +894,23 @@ fn rust_rules() -> Vec<(&'static str, &'static str, &'static str)> {
 /// specific value, because tree-sitter queries can't express "matches X but
 /// not if Y is also present/absent" directly. They differ only in: which
 /// object name(s) the call's `object` must match, which keyword argument to
-/// look for, how to decide whether that argument's value counts as "safe",
-/// whether the finding fires when the safe value is ABSENT (yaml/torch — the
-/// dangerous case is the safe kwarg being missing) or PRESENT (numpy — the
-/// dangerous case is the unsafe kwarg being set), and the finding's `reason`
-/// text — so those are the parameters here.
+/// look for, how to decide whether that argument's value counts as a match,
+/// whether the finding fires when a matching value is ABSENT (yaml/torch —
+/// the dangerous case is the safe kwarg being missing) or PRESENT (numpy —
+/// the dangerous case is the unsafe kwarg being set), and the finding's
+/// `reason` text — so those are the parameters here. `kwarg_value_matches`
+/// and `fire_when_matched` are deliberately named around "matches" rather
+/// than "safe"/"unsafe": for yaml/torch the matched value IS the safe one,
+/// but for numpy it's the unsafe one (`allow_pickle=True`) — naming the
+/// parameter `is_safe_value` would be misleading for that call site even
+/// though the boolean logic is identical either way.
 fn python_unsafe_load_findings(
     tree: &tree_sitter::Tree,
     content: &str,
     obj_pattern: &str,
     kwarg_name: &str,
-    is_safe_value: impl Fn(tree_sitter::Node) -> bool,
-    fire_when_safe_value_present: bool,
+    kwarg_value_matches: impl Fn(tree_sitter::Node) -> bool,
+    fire_when_matched: bool,
     reason: &'static str,
 ) -> Vec<Finding> {
     let ts_lang: TsLanguage = tree_sitter_python::LANGUAGE.into();
@@ -935,7 +940,7 @@ fn python_unsafe_load_findings(
             if cap.index as usize != args_index {
                 continue;
             }
-            let mut has_safe_value = false;
+            let mut has_matching_value = false;
             let mut c = cap.node.walk();
             for child in cap.node.named_children(&mut c) {
                 if child.kind() != "keyword_argument" {
@@ -945,15 +950,15 @@ fn python_unsafe_load_findings(
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(content.as_bytes()).ok())
                     == Some(kwarg_name);
-                let value_safe = child
+                let value_matches = child
                     .child_by_field_name("value")
-                    .is_some_and(&is_safe_value);
-                if name_ok && value_safe {
-                    has_safe_value = true;
+                    .is_some_and(&kwarg_value_matches);
+                if name_ok && value_matches {
+                    has_matching_value = true;
                     break;
                 }
             }
-            if has_safe_value == fire_when_safe_value_present {
+            if has_matching_value == fire_when_matched {
                 findings.push(Finding {
                     rule: "insecure-deserialize",
                     reason,
@@ -993,7 +998,7 @@ fn python_torch_load_findings(tree: &tree_sitter::Tree, content: &str) -> Vec<Fi
         content,
         "^torch$",
         "weights_only",
-        |v| v.kind() == "true",
+        |v| unwrap_parenthesized(v).kind() == "true",
         false,
         "insecure deserialization — torch.load() without weights_only=True can execute arbitrary code embedded in the checkpoint via pickle; pass weights_only=True unless you need to load non-tensor Python objects from a fully trusted source",
     )
@@ -2140,6 +2145,22 @@ mod tests {
     fn python_flags_torch_load_with_weights_only_false() {
         let findings = scan("torch.load(path, weights_only=False)", Lang::Python);
         assert!(has_insecure_deserialize_finding(&findings));
+    }
+
+    #[test]
+    fn python_ignores_torch_load_with_parenthesized_weights_only_true() {
+        // Second-opinion review on #310/#326's dedup PR: the shared helper's
+        // torch call site was passing `|v| v.kind() == "true"` without the
+        // `unwrap_parenthesized` wrap that numpy's call site already used,
+        // so `weights_only=(True)` had AST kind `parenthesized_expression`
+        // and fell through to "no safe value found" — a false positive on
+        // safe code. See `python_flags_numpy_load_with_parenthesized_allow_pickle_true`
+        // for the equivalent numpy-side regression coverage.
+        let findings = scan("torch.load(path, weights_only=(True))", Lang::Python);
+        assert!(
+            !has_insecure_deserialize_finding(&findings),
+            "torch.load with parenthesized weights_only=(True) must not be flagged"
+        );
     }
 
     // XXE-prone XML parsing: narrowed (issue #261 review round) to only fire
