@@ -7906,6 +7906,35 @@ fn is_global_clawband_dir_arg(raw: &str) -> bool {
 /// then flags any later write/tee/chmod/touch/cp operation targeting a bare
 /// `skip` filename (optionally prefixed by `./` or one of those tracked
 /// variables, e.g. `"$d/skip"`).
+/// Detects a *direct*-path write to `~/.clawband/skip` using a verb other
+/// than redirect/`tee` — `builtin_protected_ask()`'s "write to ~/.clawband/"
+/// pattern only matches the redirect (`>`/`>>`) and `tee` verb alternation,
+/// so `touch ~/.clawband/skip`, `cp anything ~/.clawband/skip`,
+/// `mv anything ~/.clawband/skip`, `install -m 600 anything ~/.clawband/skip`,
+/// `dd of=~/.clawband/skip ...`, `ln -s /dev/null ~/.clawband/skip`, and
+/// `chmod 600 ~/.clawband/skip` on an already-existing file all sailed through
+/// with *no* decision at all — not even a logged allow. This is distinct from
+/// `detect_clawband_skip_cd_bypass` above (which only covers the `cd`-into-dir
+/// then bare-filename class): here the full `.clawband/skip` substring is
+/// already present as a literal argument, so no directory/variable tracking
+/// is needed — just checking for the verb anywhere ahead of the literal path
+/// in the same segment.
+///
+/// Deliberately matches regardless of whether the path is the read or write
+/// operand of `cp`/`mv` (e.g. `cp ~/.clawband/skip /tmp/backup` also asks) —
+/// this mirrors the existing `.aws/credentials` pattern's documented
+/// rationale (prompting on both reads and writes of a security-relevant
+/// path is the intended, stricter behavior here, not a bug).
+fn detect_clawband_skip_direct_write(segments: &[&str]) -> bool {
+    let write_re =
+        Regex::new(r#"(?i)\b(?:touch|cp|mv|install|dd|ln|chmod)\b[^|;&\n]*\.clawband/skip\b"#)
+            .unwrap();
+    segments.iter().any(|seg| {
+        let seg_no_quotes: String = seg.replace(['"', '\''], "");
+        write_re.is_match(&seg_no_quotes)
+    })
+}
+
 fn detect_clawband_skip_cd_bypass(segments: &[&str]) -> bool {
     let cd_re = Regex::new(r#"(?i)^\s*cd\s+(\S+)\s*$"#).unwrap();
     let assign_re = Regex::new(r#"(?i)^\s*[A-Za-z_][A-Za-z0-9_]*=(\S+)\s*$"#).unwrap();
@@ -7995,6 +8024,18 @@ fn check_protected_ask(
                 ));
             }
         }
+    }
+    // Belt-and-braces: catch direct-path writes to ~/.clawband/skip via a
+    // verb other than redirect/tee (touch, cp, mv, install, dd, ln, chmod —
+    // see detect_clawband_skip_direct_write doc comment).
+    if detect_clawband_skip_direct_write(&kept_segments) {
+        return Some(format!(
+            "Review before running \u{2014} 'write to ~/.clawband/skip' matched in: {}\n\
+             This will prompt even in bypassPermissions (YOLO) mode.\n\
+             To always allow:\n  ! {} allow '<the underlying command>'\n",
+            command,
+            hook_command_string()
+        ));
     }
     // Belt-and-braces: catch `cd`-then-relative-write and variable-expansion
     // dodges of the `.clawband/` path-substring patterns above (see
@@ -17159,6 +17200,92 @@ mod tests {
     fn protected_ask_clawband_dir_bypasses_yolo() {
         let cmd = r#"echo '.*' > ~/.clawband/allow.patterns"#;
         assert_eq!(protected_decision(cmd), Some("protected-ask".to_string()));
+    }
+
+    // ─── Skip-flag direct-path write bypass (issue #327) ────────────────────
+    // `write to ~/.clawband/` only matches the redirect (`>`/`>>`)/`tee` verb
+    // alternation — touch, cp, mv, install, dd, ln, and chmod on the literal
+    // `~/.clawband/skip` path all sailed through with no decision at all.
+
+    #[test]
+    fn protected_ask_catches_touch_on_skip_file() {
+        let cmd = "touch ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "touch creating ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_cp_onto_skip_file() {
+        let cmd = "cp /etc/hostname ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "cp writing ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_mv_onto_skip_file() {
+        let cmd = "mv /tmp/x ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "mv writing ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_install_onto_skip_file() {
+        let cmd = "install -m 600 /tmp/x ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "install writing ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_dd_onto_skip_file() {
+        let cmd = "dd if=/dev/zero of=~/.clawband/skip bs=1 count=0";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "dd writing ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_ln_onto_skip_file() {
+        let cmd = "ln -s /dev/null ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "ln creating ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_chmod_on_skip_file() {
+        let cmd = "chmod 600 ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "chmod on ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_unrelated_touch_not_flagged() {
+        // Regression: touch on an ordinary, unrelated path must not be flagged.
+        let cmd = "touch ~/notes.txt";
+        assert_eq!(
+            protected_decision(cmd),
+            None,
+            "touch on an unrelated path must not be caught: {cmd}"
+        );
     }
 
     // ─── Skip-flag cd/variable-indirection bypass (second-opinion review on
