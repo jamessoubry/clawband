@@ -7911,27 +7911,97 @@ fn is_global_clawband_dir_arg(raw: &str) -> bool {
 /// pattern only matches the redirect (`>`/`>>`) and `tee` verb alternation,
 /// so `touch ~/.clawband/skip`, `cp anything ~/.clawband/skip`,
 /// `mv anything ~/.clawband/skip`, `install -m 600 anything ~/.clawband/skip`,
-/// `dd of=~/.clawband/skip ...`, `ln -s /dev/null ~/.clawband/skip`, and
-/// `chmod 600 ~/.clawband/skip` on an already-existing file all sailed through
-/// with *no* decision at all — not even a logged allow. This is distinct from
+/// `dd of=~/.clawband/skip ...`, `ln -s /dev/null ~/.clawband/skip`,
+/// `chmod 600 ~/.clawband/skip`, `truncate -s N ~/.clawband/skip`, and
+/// `rsync src ~/.clawband/skip` all sailed through with *no* decision at
+/// all — not even a logged allow. This is distinct from
 /// `detect_clawband_skip_cd_bypass` above (which only covers the `cd`-into-dir
-/// then bare-filename class): here the full `.clawband/skip` substring is
-/// already present as a literal argument, so no directory/variable tracking
-/// is needed — just checking for the verb anywhere ahead of the literal path
-/// in the same segment.
+/// then bare-filename class): here the full `.clawband/skip` path is already
+/// present as a literal argument, so no directory/variable tracking is
+/// needed — just checking whether the segment's command-position verb is
+/// one of the write-capable ones, and whether any of its arguments resolves
+/// to `.clawband/skip`.
 ///
+/// Two review rounds on PR #335 found real gaps in an earlier, naive version
+/// of this check that matched the verb anywhere in the segment text after a
+/// blanket `.replace(['"', '\''], "")`:
+/// - **False negative (confirmed live)**: `.replace` unmasks quote
+///   characters without removing the content they protected, so
+///   `install -m 600 '/tmp/a;b' ~/.clawband/skip` left a bare `;` sitting in
+///   the text, which the old regex's `[^|;&\n]*` then treated as a command
+///   boundary — the match never reached the real path, and the write sailed
+///   through with zero prompt and zero log line. Using
+///   [`strip_static_quoted_args`] instead (the same quote handling
+///   `is_data_command` callers rely on elsewhere) removes the quoted
+///   content outright rather than unmasking it, so a quoted `;`/`&` can
+///   never resurface as a bare separator.
+/// - **False positive**: matching the verb anywhere in the segment, rather
+///   than anchored to command position, meant `echo 'touch ~/.clawband/skip'`,
+///   `git commit -m "touch ~/.clawband/skip"`, and
+///   `git log --grep="touch ~/.clawband/skip"` all triggered the same
+///   never-suppressed-in-YOLO prompt as a real write, even though nothing
+///   in any of them touches the filesystem. Anchoring the verb regex to the
+///   start of the (quote-stripped) segment fixes this: none of those three
+///   examples *start* with one of the write verbs.
+/// - **Path-traversal false negative**: a plain `\.clawband/skip\b` substring
+///   match doesn't recognize `~/.clawband/./skip`, `~/.clawband//skip`, or
+///   `~/.clawband/sub/../skip` as the same path, even though the shell
+///   resolves all of them identically. [`path_targets_clawband_skip`]
+///   normalizes `.`/`..`/empty components textually (no filesystem access)
+///   before comparing.
+fn skip_write_verb_re() -> &'static Regex {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)^\s*(?:(?:sudo|env)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:touch|cp|mv|install|dd|ln|chmod|truncate|rsync)\b"#,
+        )
+        .unwrap()
+    })
+}
+
+/// Normalizes a `/`-separated path textually — collapsing empty (`//`) and
+/// `.` components, and popping the previous component on `..` — then
+/// reports whether the last two components are exactly `.clawband`/`skip`.
+/// This is deliberately *not* filesystem-aware (no symlink resolution, no
+/// check that intermediate components exist); it only needs to recognize
+/// the handful of shell-level path spellings that resolve to the same
+/// string, which is all a same-user bypass attempt can exploit here.
+fn path_targets_clawband_skip(path: &str) -> bool {
+    let mut components: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => continue,
+            ".." => {
+                components.pop();
+            }
+            c => components.push(c),
+        }
+    }
+    components.len() >= 2
+        && components[components.len() - 2] == ".clawband"
+        && components[components.len() - 1] == "skip"
+}
+
 /// Deliberately matches regardless of whether the path is the read or write
 /// operand of `cp`/`mv` (e.g. `cp ~/.clawband/skip /tmp/backup` also asks) —
 /// this mirrors the existing `.aws/credentials` pattern's documented
 /// rationale (prompting on both reads and writes of a security-relevant
 /// path is the intended, stricter behavior here, not a bug).
 fn detect_clawband_skip_direct_write(segments: &[&str]) -> bool {
-    let write_re =
-        Regex::new(r#"(?i)\b(?:touch|cp|mv|install|dd|ln|chmod)\b[^|;&\n]*\.clawband/skip\b"#)
-            .unwrap();
     segments.iter().any(|seg| {
-        let seg_no_quotes: String = seg.replace(['"', '\''], "");
-        write_re.is_match(&seg_no_quotes)
+        let stripped = strip_static_quoted_args(seg);
+        if !skip_write_verb_re().is_match(&stripped) {
+            return false;
+        }
+        stripped.split_whitespace().any(|tok| {
+            let tok = tok.trim_matches(|c| c == '"' || c == '\'');
+            // dd's `of=`/`if=` key=value form — take the part after the
+            // last `=` so plain path tokens (no `=` at all) pass through
+            // unchanged.
+            let tok = tok.rsplit('=').next().unwrap_or(tok);
+            tok.contains("clawband") && path_targets_clawband_skip(tok)
+        })
     })
 }
 
@@ -17285,6 +17355,120 @@ mod tests {
             protected_decision(cmd),
             None,
             "touch on an unrelated path must not be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_truncate_on_skip_file() {
+        let cmd = "truncate -s 1 ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "truncate writing ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_rsync_onto_skip_file() {
+        let cmd = "rsync /tmp/x ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "rsync writing ~/.clawband/skip must be caught: {cmd}"
+        );
+    }
+
+    // ─── Second/third-opinion review findings on PR #335 ────────────────────
+    // The original direct-write check matched its verb anywhere in the
+    // segment text after a blanket quote-char strip, which both missed real
+    // bypasses (a quoted `;`/`&` elsewhere in the line) and flagged safe
+    // commands (the path text appearing inside an echoed/committed string).
+
+    #[test]
+    fn protected_ask_catches_quoted_semicolon_bypass() {
+        // Second-opinion review, finding 1: `.replace(['"','\''], "")`
+        // unmasked the quoted `;` without removing the content it
+        // protected, so the regex's `[^|;&\n]*` stopped before reaching
+        // the real path. Confirmed live against the pre-fix binary (exit 0,
+        // no output) — must now ask.
+        let cmd = "install -m 600 '/tmp/a;b' ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "quoted ';' elsewhere in the line must not hide the skip write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_quoted_ampersand_bypass() {
+        // Same bypass shape as above, with `&` instead of `;`.
+        let cmd = "cp '/tmp/a&b' ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "quoted '&' elsewhere in the line must not hide the skip write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_echoed_skip_text_not_flagged() {
+        // Third-opinion review, finding 2: printed/quoted text mentioning
+        // the path is not a real write and must not prompt.
+        let cmd = "echo 'touch ~/.clawband/skip'";
+        assert_eq!(
+            protected_decision(cmd),
+            None,
+            "echoing text that mentions the skip path must not be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_commit_message_mentioning_skip_not_flagged() {
+        let cmd = r#"git commit -m "touch ~/.clawband/skip""#;
+        assert_eq!(
+            protected_decision(cmd),
+            None,
+            "a commit message mentioning the path must not be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_grep_pattern_mentioning_skip_not_flagged() {
+        let cmd = r#"git log --grep="touch ~/.clawband/skip""#;
+        assert_eq!(
+            protected_decision(cmd),
+            None,
+            "a --grep pattern mentioning the path must not be caught: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_dot_segment_traversal() {
+        let cmd = "touch ~/.clawband/./skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "a '.' path segment must not hide the skip write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_doubled_slash_traversal() {
+        let cmd = "touch ~/.clawband//skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "a doubled '/' must not hide the skip write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_dotdot_segment_traversal() {
+        let cmd = "touch ~/.clawband/sub/../skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "a '..' path segment must not hide the skip write: {cmd}"
         );
     }
 
