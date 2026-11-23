@@ -2519,10 +2519,7 @@ fn is_chained_script_invocation(segment: &str) -> bool {
     }
     // direct execution: ./path
     let direct_re = DIRECT_RE.get_or_init(|| Regex::new(r"(?i)^\s*\./\S+").unwrap());
-    if direct_re.is_match(segment) {
-        return true;
-    }
-    false
+    direct_re.is_match(segment)
 }
 
 /// Extracts the target file path from a segment `is_chained_script_invocation`
@@ -7169,10 +7166,7 @@ fn reads_claude_dir(cmd: &str) -> bool {
     }
     // Exclude rm/shred targeting ~/.claude/ (deletion, not a read)
     let destroy_re = Regex::new(r"(?i)\b(?:rm|shred)\b[^;&|\n]*(?:~|\$HOME)/\.claude/").unwrap();
-    if destroy_re.is_match(cmd) {
-        return false;
-    }
-    true
+    !destroy_re.is_match(cmd)
 }
 
 /// Returns true if any entry in `~/.claude/settings.json` `permissions.allow` plausibly
