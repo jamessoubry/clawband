@@ -5615,6 +5615,124 @@ fn e2e_protected_ask_ssh_config_prompts_in_yolo() {
 }
 
 #[test]
+fn e2e_protected_ask_skip_direct_write_prompts_in_yolo() {
+    // touch/cp/mv/install/dd/ln/chmod/truncate/rsync onto ~/.clawband/skip
+    // must ask even in YOLO mode — this is the issue #327 / PR #335 fix.
+    let out_yolo = run(&bash_yolo("touch ~/.clawband/skip"), &[]);
+    assert_eq!(
+        decision(&out_yolo),
+        Some("ask"),
+        "touch ~/.clawband/skip must ask in YOLO mode: {out_yolo}"
+    );
+}
+
+#[test]
+fn e2e_protected_ask_skip_quoted_semicolon_bypass_prompts_in_yolo() {
+    // Second-opinion review on PR #335, finding 1: a quoted `;` elsewhere in
+    // the line must not hide the write from the hook entrypoint end to end.
+    let out_yolo = run(
+        &bash_yolo("install -m 600 '/tmp/a;b' ~/.clawband/skip"),
+        &[],
+    );
+    assert_eq!(
+        decision(&out_yolo),
+        Some("ask"),
+        "quoted ';' bypass must still ask through the real hook entrypoint: {out_yolo}"
+    );
+}
+
+#[test]
+fn e2e_protected_ask_skip_echoed_text_not_flagged() {
+    // Third-opinion review on PR #335, finding 2: text that merely mentions
+    // the path (never written to disk) must not prompt.
+    let out = run(&bash("echo 'touch ~/.clawband/skip'"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "echoing text mentioning the skip path must not ask: {out}"
+    );
+}
+
+#[test]
+fn e2e_protected_ask_skip_path_traversal_prompts_in_yolo() {
+    // Path-traversal spellings of the same file must still be caught.
+    for cmd in [
+        "touch ~/.clawband/./skip",
+        "touch ~/.clawband//skip",
+        "touch ~/.clawband/sub/../skip",
+    ] {
+        let out_yolo = run(&bash_yolo(cmd), &[]);
+        assert_eq!(
+            decision(&out_yolo),
+            Some("ask"),
+            "path-traversal spelling must still ask in YOLO mode: {cmd} -> {out_yolo}"
+        );
+    }
+}
+
+#[test]
+fn e2e_protected_ask_skip_quoted_destination_prompts_in_yolo() {
+    // Third review round on PR #335: `strip_static_quoted_args` discards
+    // single-quoted content, so quoting the *destination* path itself
+    // (completely ordinary shell usage) made the old path-token scan see
+    // nothing to flag.
+    for cmd in [
+        "touch '~/.clawband/skip'",
+        "install -m 600 /tmp/a '~/.clawband/skip'",
+        "cp /tmp/a '~/.clawband/skip'",
+    ] {
+        let out_yolo = run(&bash_yolo(cmd), &[]);
+        assert_eq!(
+            decision(&out_yolo),
+            Some("ask"),
+            "quoting the destination path must still ask in YOLO mode: {cmd} -> {out_yolo}"
+        );
+    }
+}
+
+#[test]
+fn e2e_protected_ask_skip_full_path_and_wrapper_prompts_in_yolo() {
+    // Third review round on PR #335: a fully-qualified executable path or a
+    // `command` wrapper must not escape the verb-anchor check.
+    for cmd in [
+        "/usr/bin/touch ~/.clawband/skip",
+        "command touch ~/.clawband/skip",
+    ] {
+        let out_yolo = run(&bash_yolo(cmd), &[]);
+        assert_eq!(
+            decision(&out_yolo),
+            Some("ask"),
+            "a fully-qualified path / command wrapper must still ask in YOLO mode: {cmd} -> {out_yolo}"
+        );
+    }
+}
+
+#[test]
+fn e2e_protected_ask_skip_write_after_pipe_prompts_in_yolo() {
+    // Third review round on PR #335: `split_segments` does not split on `|`,
+    // so a write placed after a pipe in the same segment must still be
+    // caught by checking each pipe stage, not just the segment as a whole.
+    let out_yolo = run(&bash_yolo("printf x | touch ~/.clawband/skip"), &[]);
+    assert_eq!(
+        decision(&out_yolo),
+        Some("ask"),
+        "a write after a pipe must still ask in YOLO mode: {out_yolo}"
+    );
+}
+
+#[test]
+fn e2e_protected_ask_rsync_exclude_mentioning_skip_not_flagged() {
+    // Greptile review, round 4: an --exclude= filter value mentioning the
+    // path is not a write target and must not prompt.
+    let out = run(&bash("rsync --exclude='.clawband/skip' src/ dest/"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "an --exclude filter value mentioning the path must not ask: {out}"
+    );
+}
+
+#[test]
 fn e2e_regular_ask_suppressed_in_yolo() {
     // Sanity-check: a command that triggers regular ask (not protected-ask)
     // MUST be suppressed (no output) in YOLO mode.
