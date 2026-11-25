@@ -8012,6 +8012,15 @@ fn detect_clawband_skip_direct_write(segments: &[&str]) -> bool {
                 return false;
             }
             stage.split_whitespace().any(|tok| {
+                // A leading `-`/`--` marks an option flag (e.g. rsync's
+                // `--exclude='.clawband/skip'`), not a file argument — none
+                // of the verbs this check covers take their path operand as
+                // a dashed flag, so skip it rather than let the `=`-split
+                // below mistake a filter *value* for an actual write target
+                // (Greptile review, PR #335 round 4).
+                if tok.starts_with('-') {
+                    return false;
+                }
                 // dd's `of=`/`if=` key=value form — take the part after the
                 // last `=` so plain path tokens (no `=` at all) pass through
                 // unchanged. Must run *before* the quote trim below, so a
@@ -17560,6 +17569,19 @@ mod tests {
             protected_decision(cmd),
             Some("protected-ask".to_string()),
             "a quoted dd of= value must not hide the write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_rsync_exclude_mentioning_skip_not_flagged() {
+        // Greptile review, round 4: an `--exclude=` filter *value* is not a
+        // write target — only a dashed-flag false positive, not a bypass
+        // (the opposite direction of risk from the findings above).
+        let cmd = "rsync --exclude='.clawband/skip' src/ dest/";
+        assert_eq!(
+            protected_decision(cmd),
+            None,
+            "an --exclude filter value mentioning the path must not be caught: {cmd}"
         );
     }
 

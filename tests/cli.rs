@@ -5721,6 +5721,18 @@ fn e2e_protected_ask_skip_write_after_pipe_prompts_in_yolo() {
 }
 
 #[test]
+fn e2e_protected_ask_rsync_exclude_mentioning_skip_not_flagged() {
+    // Greptile review, round 4: an --exclude= filter value mentioning the
+    // path is not a write target and must not prompt.
+    let out = run(&bash("rsync --exclude='.clawband/skip' src/ dest/"), &[]);
+    assert_eq!(
+        decision(&out),
+        None,
+        "an --exclude filter value mentioning the path must not ask: {out}"
+    );
+}
+
+#[test]
 fn e2e_regular_ask_suppressed_in_yolo() {
     // Sanity-check: a command that triggers regular ask (not protected-ask)
     // MUST be suppressed (no output) in YOLO mode.
