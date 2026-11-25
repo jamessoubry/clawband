@@ -5671,6 +5671,56 @@ fn e2e_protected_ask_skip_path_traversal_prompts_in_yolo() {
 }
 
 #[test]
+fn e2e_protected_ask_skip_quoted_destination_prompts_in_yolo() {
+    // Third review round on PR #335: `strip_static_quoted_args` discards
+    // single-quoted content, so quoting the *destination* path itself
+    // (completely ordinary shell usage) made the old path-token scan see
+    // nothing to flag.
+    for cmd in [
+        "touch '~/.clawband/skip'",
+        "install -m 600 /tmp/a '~/.clawband/skip'",
+        "cp /tmp/a '~/.clawband/skip'",
+    ] {
+        let out_yolo = run(&bash_yolo(cmd), &[]);
+        assert_eq!(
+            decision(&out_yolo),
+            Some("ask"),
+            "quoting the destination path must still ask in YOLO mode: {cmd} -> {out_yolo}"
+        );
+    }
+}
+
+#[test]
+fn e2e_protected_ask_skip_full_path_and_wrapper_prompts_in_yolo() {
+    // Third review round on PR #335: a fully-qualified executable path or a
+    // `command` wrapper must not escape the verb-anchor check.
+    for cmd in [
+        "/usr/bin/touch ~/.clawband/skip",
+        "command touch ~/.clawband/skip",
+    ] {
+        let out_yolo = run(&bash_yolo(cmd), &[]);
+        assert_eq!(
+            decision(&out_yolo),
+            Some("ask"),
+            "a fully-qualified path / command wrapper must still ask in YOLO mode: {cmd} -> {out_yolo}"
+        );
+    }
+}
+
+#[test]
+fn e2e_protected_ask_skip_write_after_pipe_prompts_in_yolo() {
+    // Third review round on PR #335: `split_segments` does not split on `|`,
+    // so a write placed after a pipe in the same segment must still be
+    // caught by checking each pipe stage, not just the segment as a whole.
+    let out_yolo = run(&bash_yolo("printf x | touch ~/.clawband/skip"), &[]);
+    assert_eq!(
+        decision(&out_yolo),
+        Some("ask"),
+        "a write after a pipe must still ask in YOLO mode: {out_yolo}"
+    );
+}
+
+#[test]
 fn e2e_regular_ask_suppressed_in_yolo() {
     // Sanity-check: a command that triggers regular ask (not protected-ask)
     // MUST be suppressed (no output) in YOLO mode.

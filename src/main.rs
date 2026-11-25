@@ -7948,7 +7948,7 @@ fn skip_write_verb_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)^\s*(?:(?:sudo|env)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:touch|cp|mv|install|dd|ln|chmod|truncate|rsync)\b"#,
+            r#"(?i)^\s*(?:(?:sudo|env|command)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:[\w./-]*/)?(?:touch|cp|mv|install|dd|ln|chmod|truncate|rsync)\b"#,
         )
         .unwrap()
     })
@@ -7982,19 +7982,47 @@ fn path_targets_clawband_skip(path: &str) -> bool {
 /// this mirrors the existing `.aws/credentials` pattern's documented
 /// rationale (prompting on both reads and writes of a security-relevant
 /// path is the intended, stricter behavior here, not a bug).
+///
+/// A third review round on PR #335 found two more gaps:
+/// - **False negative (confirmed live)**: the path-token scan ran against
+///   `strip_static_quoted_args`'s output, but that helper *discards*
+///   single-quoted content outright (it's designed for neutralizing inert
+///   data arguments before deny-pattern matching, not for path detection).
+///   `touch '~/.clawband/skip'` — ordinary, unremarkable shell usage, not
+///   even adversarial — lost the quoted path text entirely, so the token
+///   scan found nothing to flag. Fixed by scanning tokens from the
+///   *original*, unstripped stage text instead (still trimming a leading/
+///   trailing quote char per token, same as before); `strip_static_quoted_args`
+///   is now used only for the verb-anchor check, where discarding quoted
+///   content is safe (and desired — it's what stops a quoted `;`/`&` in an
+///   unrelated argument from being misread as a command boundary).
+/// - **False negative**: anchoring the verb regex to the segment's start
+///   missed a full executable path (`/usr/bin/touch ...`), a `command`
+///   wrapper, and a write placed after a `|` in the same segment (e.g.
+///   `printf x | touch ...` — `split_segments` does not split on `|`, only
+///   `;`/`&`/`&&`/`||`/newline). Fixed by running the verb-anchor check
+///   against each `split_pipe_stages` stage of a segment, not just the
+///   segment as a whole, and by allowing an optional path prefix before the
+///   verb name in `skip_write_verb_re`.
 fn detect_clawband_skip_direct_write(segments: &[&str]) -> bool {
     segments.iter().any(|seg| {
-        let stripped = strip_static_quoted_args(seg);
-        if !skip_write_verb_re().is_match(&stripped) {
-            return false;
-        }
-        stripped.split_whitespace().any(|tok| {
-            let tok = tok.trim_matches(|c| c == '"' || c == '\'');
-            // dd's `of=`/`if=` key=value form — take the part after the
-            // last `=` so plain path tokens (no `=` at all) pass through
-            // unchanged.
-            let tok = tok.rsplit('=').next().unwrap_or(tok);
-            tok.contains("clawband") && path_targets_clawband_skip(tok)
+        split_pipe_stages(seg).iter().any(|stage| {
+            let verb_check = strip_static_quoted_args(stage);
+            if !skip_write_verb_re().is_match(&verb_check) {
+                return false;
+            }
+            stage.split_whitespace().any(|tok| {
+                // dd's `of=`/`if=` key=value form — take the part after the
+                // last `=` so plain path tokens (no `=` at all) pass through
+                // unchanged. Must run *before* the quote trim below, so a
+                // quoted value (`of='~/.clawband/skip'`) has its surrounding
+                // quotes stripped from the extracted value, not from the
+                // whole `of='...'` token (which would leave the trailing
+                // quote attached to "skip").
+                let tok = tok.rsplit('=').next().unwrap_or(tok);
+                let tok = tok.trim_matches(|c| c == '"' || c == '\'');
+                tok.contains("clawband") && path_targets_clawband_skip(tok)
+            })
         })
     })
 }
@@ -17463,6 +17491,75 @@ mod tests {
             protected_decision(cmd),
             Some("protected-ask".to_string()),
             "a '..' path segment must not hide the skip write: {cmd}"
+        );
+    }
+
+    // ─── Third review round on PR #335 ───────────────────────────────────────
+    // `strip_static_quoted_args` discards single-quoted content outright
+    // rather than masking it, which is correct for the verb-anchor check
+    // (a quoted ';'/'&' must never act as a separator) but wrong for the
+    // path-token scan: it threw away a quoted *destination* path before the
+    // scan ever saw it. And anchoring the verb check to the segment's start
+    // missed a full executable path, a `command` wrapper, or a write placed
+    // after a `|` in the same segment.
+
+    #[test]
+    fn protected_ask_catches_quoted_destination_path() {
+        let cmd = "touch '~/.clawband/skip'";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "quoting the destination path itself must not hide the write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_quoted_destination_with_unrelated_source() {
+        let cmd = "install -m 600 /tmp/a '~/.clawband/skip'";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "quoting the destination path itself must not hide the write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_full_path_verb() {
+        let cmd = "/usr/bin/touch ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "a fully-qualified executable path must not hide the write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_command_wrapper() {
+        let cmd = "command touch ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "the `command` wrapper must not hide the write: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_write_after_pipe() {
+        let cmd = "printf x | touch ~/.clawband/skip";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "a write placed after a pipe in the same segment must not hide it: {cmd}"
+        );
+    }
+
+    #[test]
+    fn protected_ask_catches_dd_quoted_of_value() {
+        let cmd = "dd if=/dev/null of='~/.clawband/skip'";
+        assert_eq!(
+            protected_decision(cmd),
+            Some("protected-ask".to_string()),
+            "a quoted dd of= value must not hide the write: {cmd}"
         );
     }
 
